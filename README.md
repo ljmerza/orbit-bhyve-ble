@@ -1,6 +1,6 @@
 # Orbit B-Hyve BLE — Home Assistant integration
 
-**Local BLE control for Orbit B-Hyve XD timers and Wi-Fi hubs.** Cloud is
+**Local BLE control for Orbit B-Hyve hose-tap and XD timers.** Cloud is
 contacted only at setup to discover devices and fetch network keys. After
 setup, every command and state poll is BLE-only — your timers keep working
 when the WAN goes down.
@@ -12,7 +12,6 @@ when the WAN goes down.
 | Hose-tap timer    | `HT25-0000`    | `0085`           | ✅ Actuated end-to-end                   |
 | Hose-tap timer    | `HT25-0000`    | `0041`           | ✅ Actuated end-to-end (per-device mesh-ID addressing) |
 | 4-port XD         | `HT34A-0001`   | `0107`           | ⚠️ Ported from upstream; not tested here|
-| Wi-Fi hub         | `BH1-0001`     | `0095`           | ℹ️ Connectivity diagnostics only         |
 
 > ⚠️ **Do NOT update your B-Hyve device firmware.** This integration was
 > reverse-engineered against the firmware versions above. A firmware update
@@ -40,20 +39,26 @@ when the WAN goes down.
 Per discovered sprinkler device:
 
 - **Valve** per physical station (HT25 = 1, HT34A = up to 4) — uses
-  `valve.open_valve` / `valve.close_valve`
+  `valve.open_valve` / `valve.close_valve`. Open/closed state is
+  **optimistic** (derived from the last command, not from a decoded
+  device status).
+- **Battery (%)** sensor — live, BLE-sourced. Decoded from the device's
+  info-ack frame on every poll, no cloud round-trip after setup.
+- **Battery voltage (mV)** sensor — same source as the percent sensor;
+  disabled by default, enable it from the entity's settings if you want
+  the raw reading.
+- **Default watering duration** (`number` entity, minutes) — per device.
+  The valve uses this when `start_watering` is called without an
+  explicit duration. Restored across HA restarts.
+- **Sync** button per device — forces a fresh BLE connect + init
+  handshake. Useful after a long idle, or to refresh the battery
+  reading on demand without waiting for the next poll.
 - Manufacturer / model / firmware / MAC are exposed via the device's
-  "Device info" panel (no separate sensor entities)
+  "Device info" panel.
 
-Hubs are filtered out at discovery — they don't actuate anything, so they
-don't appear in the device picker or the device registry.
-
-> **Battery and `is_watering` are intentionally not surfaced as live
-> entities yet.** The device exposes neither over BLE in any way we've
-> decoded so far. Battery percent is available via cloud snapshot but
-> drifts out of sync, so the sensor class is shipped but its
-> registration is commented out (`sensor.py:async_setup_entry`).
-> `is_watering` is currently optimistic — derived from the last
-> command, not from the device's real state.
+Hubs (`BH1-0001`) are filtered out at discovery — they don't actuate
+anything, so they don't appear in the device picker or the device
+registry.
 
 ## Services
 
@@ -92,28 +97,14 @@ inner plaintext formats and different magic bytes; the per-model device
 classes encode that. Adding a new model = drop a `devices/htXX.py` and
 register it.
 
-## Repo layout
+## Brand icons
 
-```
-custom_components/orbit_bhyve/   # the integration
-hacs.json                        # HACS metadata
-.github/workflows/validate.yaml  # HACS + hassfest validation on push
-LICENSE
-README.md
-```
-
-The reverse-engineering toolkit (decompiled APK, BLE captures, btsnoop logs,
-session handoffs, protocol docs, standalone CLI) lives in a separate private
-repo and is not shipped with the integration.
-
-## Migration from v1 (`orbit_bhyve_ble`)
-
-V1 was removed in 2026-05. If you upgraded from v1, the old `switch.*`
-entities will be marked unavailable; delete them from
-**Settings → Devices & Services → Entities**. Update any automations
-referencing the old `switch.b_hyve_*` IDs to use the new
-`valve.<device_name>` entities and `valve.open_valve` /
-`valve.close_valve` services.
+Source artwork lives in `assets/` and can be regenerated with
+`python3 assets/generate_icons.py`. The variants HACS and the HA UI
+actually display come from
+[home-assistant/brands](https://github.com/home-assistant/brands) under
+`custom_integrations/orbit_bhyve/` — until that PR is merged, HACS
+shows the default integration icon.
 
 ## Legal & ethical notice
 
