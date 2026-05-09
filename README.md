@@ -21,7 +21,7 @@ when the WAN goes down.
 ## Install via HACS (recommended)
 
 1. **HACS → Integrations → ⋮ menu → Custom repositories**
-2. URL: `https://github.com/ljmerza/bhyve-hack` — Category: **Integration**
+2. URL: `https://github.com/ljmerza/orbit-bhyve-ble` — Category: **Integration**
 3. Click **Install** on **Orbit B-Hyve BLE**
 4. Restart Home Assistant
 5. **Settings → Devices & Services → Add Integration → "Orbit B-Hyve BLE"**
@@ -96,15 +96,6 @@ phone-app traffic. Different hardware families (HT25 vs HT34A) use different
 inner plaintext formats and different magic bytes; the per-model device
 classes encode that. Adding a new model = drop a `devices/htXX.py` and
 register it.
-
-## Brand icons
-
-Source artwork lives in `assets/` and can be regenerated with
-`python3 assets/generate_icons.py`. The variants HACS and the HA UI
-actually display come from
-[home-assistant/brands](https://github.com/home-assistant/brands) under
-`custom_integrations/orbit_bhyve/` — until that PR is merged, HACS
-shows the default integration icon.
 
 ## Legal & ethical notice
 

@@ -21,10 +21,7 @@ start_watering:
 
 stop_all:
   name: Stop all
-  description: Stop all watering on the targeted device.
-  target:
-    device:
-      integration: orbit_bhyve
+  description: Stop all watering on every configured B-Hyve device.
 
 refresh_devices:
   name: Refresh devices from cloud
