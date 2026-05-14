@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 
 from ..connection import BHyveBleConnection
 from .base import BHyveBleDeviceBase
@@ -121,9 +122,12 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         _LOGGER.debug("%s: START got %d notifications", self.mac, len(notifs))
         self._stamp_command(f"start s={station} d={duration_sec}", len(notifs))
         if notifs:
+            now = datetime.now(timezone.utc)
             self.state.is_watering = True
             self.state.active_zone = station
             self.state.seconds_remaining = duration_sec
+            self.state.started_at = now
+            self.state.expected_off_at = now + timedelta(seconds=duration_sec)
         return bool(notifs)
 
     async def stop_watering(self, station: int | None = None) -> bool:
@@ -137,6 +141,8 @@ class BHyveHT25Device(BHyveBleDeviceBase):
             self.state.is_watering = False
             self.state.active_zone = None
             self.state.seconds_remaining = None
+            self.state.started_at = None
+            self.state.expected_off_at = None
         return bool(notifs)
 
     async def refresh_state(self):

@@ -25,6 +25,8 @@ class DeviceState:
     is_watering: bool = False
     active_zone: int | None = None
     seconds_remaining: int | None = None
+    started_at: datetime | None = None
+    expected_off_at: datetime | None = None
     last_command_at: datetime | None = None
     last_command_label: str | None = None
     is_connected: bool = False
