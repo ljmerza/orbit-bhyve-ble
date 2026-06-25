@@ -10,6 +10,7 @@ from .base import BHyveBleDeviceBase, DeviceState, UnsupportedModel
 from .hub import BHyveHubDevice
 from .ht25 import BHyveHT25Device
 from .ht25_fw0085 import BHyveHT25Fw0085Device
+from .ht25g2 import BHyveHT25G2Device
 from .ht34a import BHyveHT34ADevice
 
 __all__ = [
@@ -19,6 +20,7 @@ __all__ = [
     "BHyveHubDevice",
     "BHyveHT25Device",
     "BHyveHT25Fw0085Device",
+    "BHyveHT25G2Device",
     "BHyveHT34ADevice",
     "resolve_device_class",
     "build_device",
@@ -29,6 +31,13 @@ def resolve_device_class(*, hardware: str, firmware: str, type_: str) -> type[BH
     if type_ == "bridge":
         return BHyveHubDevice
     if (hardware or "").startswith("HT25"):
+        # Gen2 HT25G2 valves (fw0111) share the "HT25" hardware prefix but
+        # speak the protobuf protocol (frame magic 0x11) like the HT34A XD,
+        # NOT the d7-47 mesh protocol of the HT25-0000 hose timers. Route
+        # them away from the mesh classes before falling through. Match on
+        # the hardware suffix or fw so HT25-0000 (fw0041/0085) is untouched.
+        if (hardware or "").startswith("HT25G2") or firmware == "0111":
+            return BHyveHT25G2Device
         # fw0085 (Deck) keeps the pre-fix code path that empirically actuated
         # on 2026-05-03. fw0041 (Hill, Corner) and any future fw use the
         # parameterized BHyveHT25Device.
