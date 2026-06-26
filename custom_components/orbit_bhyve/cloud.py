@@ -15,6 +15,7 @@ from .const import (
     CLOUD_APP_ID,
     CLOUD_KEY_FIELDS,
     CLOUD_KEY_PATHS,
+    CLOUD_USER_AGENT,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -49,7 +50,11 @@ class OrbitCloudClient:
         return self._user_id
 
     def _headers(self, *, include_auth: bool = True) -> dict[str, str]:
-        h = {"orbit-app-id": CLOUD_APP_ID}
+        h = {
+            "orbit-app-id": CLOUD_APP_ID,
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": CLOUD_USER_AGENT,
+        }
         if include_auth and self._token:
             h["orbit-api-key"] = self._token
         return h
