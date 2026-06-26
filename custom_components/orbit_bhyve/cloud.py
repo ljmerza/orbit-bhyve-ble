@@ -15,6 +15,7 @@ from .const import (
     CLOUD_APP_ID,
     CLOUD_KEY_FIELDS,
     CLOUD_KEY_PATHS,
+    CLOUD_USER_AGENT,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -49,7 +50,17 @@ class OrbitCloudClient:
         return self._user_id
 
     def _headers(self, *, include_auth: bool = True) -> dict[str, str]:
-        h = {"orbit-app-id": CLOUD_APP_ID}
+        # Orbit's WAF returns 403 to requests whose User-Agent contains
+        # "HomeAssistant" — which is exactly what HA's shared aiohttp session
+        # (async_get_clientsession) stamps on every request. Without an
+        # override, every cloud call here is forbidden and config_flow
+        # mislabels it "invalid email or password". Send a browser User-Agent
+        # (matching the wider B-Hyve HA ecosystem's fix) so setup works.
+        h = {
+            "orbit-app-id": CLOUD_APP_ID,
+            "User-Agent": CLOUD_USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+        }
         if include_auth and self._token:
             h["orbit-api-key"] = self._token
         return h
