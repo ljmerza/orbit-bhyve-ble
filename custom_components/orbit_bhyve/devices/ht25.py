@@ -4,6 +4,8 @@ d7-47 protocol family. Verified against fw0085 (Deck) 2026-05-03 and
 fw0041 (Hill) 2026-05-05 — same protocol, the 2-byte frame prefix is the
 device's own mesh_device_id in little-endian (Deck's old "D747_MAGIC"
 constant was just Deck's mesh_id 18391 = 0x47D7 LE).
+
+Firmware variants subclass this and override _rebind_sid_delta only.
 """
 from __future__ import annotations
 
@@ -48,6 +50,11 @@ class BHyveHT25Device(BHyveBleDeviceBase):
     frame_magic = 0x10
     trailer_const = 0x10
 
+    # Session-id increment between the `bind` and `rebind` init steps.
+    # fw0041 (Hill) confirmed +2 via BTSnoop 2026-05-05. Firmware variants
+    # override this attribute in a subclass rather than branching in code.
+    _rebind_sid_delta: int = 2
+
     @property
     def mesh_address(self) -> bytes:
         """The 2-byte device-address prefix on every command frame.
@@ -64,7 +71,15 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         """The 2-byte hub-address embedded in the magic2 init step."""
         hub_id = self.hub_mesh_device_id
         if hub_id is None:
-            hub_id = _HUB_MESH_BY_NETWORK_KEY.get(self.network_key.lower(), 0)
+            hub_id = _HUB_MESH_BY_NETWORK_KEY.get(self.network_key.lower())
+            if hub_id is None:
+                _LOGGER.warning(
+                    "%s: hub_mesh_device_id unresolved (network_key not in fallback "
+                    "table); using 0x0000 in magic2. Init still completes with a "
+                    "placeholder hub id, but if START is dropped this is a suspect.",
+                    self.mac,
+                )
+                hub_id = 0
         return hub_id.to_bytes(2, "little")
 
     def _build(self, type_byte: int, seq: int, payload: bytes = b"") -> bytes:
@@ -84,11 +99,17 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         watering command without it produces a silent drop. Only `bind`,
         `status`, and `info` are confirmed required; the others may be
         prunable but are kept for safety until empirically tested."""
+        # Surface resolved addresses so a test run self-verifies the prefix is
+        # the device's own id and NOT the legacy hardcoded d747.
+        _LOGGER.debug(
+            "%s: frames mesh_address=%s hub_mesh_address=%s",
+            self.mac, self.mesh_address.hex(), self.hub_mesh_address.hex(),
+        )
+
         sid = os.urandom(2)
-        # fw0041 (Hill, BTSnoop 2026-05-05): bind sid=0x48fd → rebind sid=0x48ff = +2.
-        # fw0085 has its own pre-fix code path in ht25_fw0085.py — don't add
-        # firmware branching here.
-        sid2 = ((int.from_bytes(sid, "little") + 2) & 0xFFFF).to_bytes(2, "little")
+        # Rebind reuses the session id incremented by a firmware-specific delta
+        # (fw0041=+2; see _rebind_sid_delta / subclasses).
+        sid2 = ((int.from_bytes(sid, "little") + self._rebind_sid_delta) & 0xFFFF).to_bytes(2, "little")
 
         # magic1 payload: 0x01 || self mesh_id LE || 4 zero bytes
         # magic2 payload: 0x00 || hub  mesh_id LE || 4 zero bytes
@@ -118,6 +139,7 @@ class BHyveHT25Device(BHyveBleDeviceBase):
             return False
         # HT25 is single-station; `station` is a no-op placeholder for API parity.
         plaintext = self._build_start(0xB6, duration_sec)
+        _LOGGER.debug("%s: START tx pt=%s", self.mac, plaintext.hex())
         notifs = await self.connection.send(plaintext, drain_ms=1500)
         _LOGGER.debug("%s: START got %d notifications", self.mac, len(notifs))
         self._stamp_command(f"start s={station} d={duration_sec}", len(notifs))
@@ -134,6 +156,7 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         if self.connection is None:
             return False
         plaintext = self._build_stop(0xB7)
+        _LOGGER.debug("%s: STOP tx pt=%s", self.mac, plaintext.hex())
         notifs = await self.connection.send(plaintext, drain_ms=1500)
         _LOGGER.debug("%s: STOP got %d notifications", self.mac, len(notifs))
         self._stamp_command("stop", len(notifs))
