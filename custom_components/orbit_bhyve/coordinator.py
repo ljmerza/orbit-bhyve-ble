@@ -47,6 +47,16 @@ class BHyveDeviceCoordinator(DataUpdateCoordinator[DeviceState]):
             name=f"orbit_bhyve {device.name}",
             update_interval=timedelta(seconds=poll_idle_sec),
         )
+        # A device that learns its state out of band (e.g. an HT25 START/STOP
+        # ack notification) pokes us so the valve reflects it now and we switch
+        # to the watering cadence — instead of waiting up to poll_idle (5 min).
+        device.set_state_changed_callback(self._handle_device_state_change)
+
+    def _handle_device_state_change(self) -> None:
+        """Called from a device notification callback (event loop). Trigger an
+        immediate poll, which applies the tick/auto-close logic and resets the
+        cadence based on the freshly-armed timer."""
+        self.hass.add_job(self.async_request_refresh)
 
     async def _async_update_data(self) -> DeviceState:
         try:

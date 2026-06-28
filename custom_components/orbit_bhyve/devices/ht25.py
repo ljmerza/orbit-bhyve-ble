@@ -55,6 +55,13 @@ class BHyveHT25Device(BHyveBleDeviceBase):
     # override this attribute in a subclass rather than branching in code.
     _rebind_sid_delta: int = 2
 
+    # Duration/zone of the most recent START we sent, stashed so the device's
+    # async START-ack (f60d) can arm the off-timer even when the BLE
+    # write-response timed out (e.g. through an ESPHome proxy). See
+    # _observe_plaintext.
+    _pending_start_duration: int | None = None
+    _pending_start_zone: int | None = None
+
     @property
     def mesh_address(self) -> bytes:
         """The 2-byte device-address prefix on every command frame.
@@ -93,6 +100,51 @@ class BHyveHT25Device(BHyveBleDeviceBase):
 
     def _build_stop(self, type_byte: int) -> bytes:
         return self._build(type_byte, SEQ_WATER_CTRL, b"\x02\x00\x00\x00")
+
+    def _observe_plaintext(self, pt: bytes) -> None:
+        """Drive the local off-timer from the device's own command ack.
+
+        The watering command keeps the entity honest even when the GATT
+        write-response times out (e.g. an ESPHome proxy doesn't relay it): the
+        device still receives the frame and replies with an ack notification,
+        which arrives here independently of send(). Arming on the ack — not on
+        send()'s return — is what makes the duration-based off-timer reliable.
+
+        Frame: [mesh:2][type:1][seq:1][routing:1][payload:N]. A reply has the
+        0x40 bit set on the type byte; START is 0xB6 → ack 0xF6, STOP 0xB7 →
+        ack 0xF7, both on seq SEQ_WATER_CTRL. The START-ack echoes the accepted
+        duration as [0x04][dur_LE:2][...]."""
+        super()._observe_plaintext(pt)  # keep battery parsing
+        if len(pt) < 6 or pt[3] != SEQ_WATER_CTRL or pt[4] != D747_ROUTING:
+            return
+        if not (pt[2] & 0x40):
+            # TX echo (reply bit clear), not a device ack.
+            return
+        cmd = pt[2] & ~0x40
+        now = datetime.now(timezone.utc)
+        if cmd == 0xB6:  # START ack — device accepted watering
+            dur = None
+            if len(pt) >= 8 and pt[5] == 0x04:
+                dur = int.from_bytes(pt[6:8], "little")
+            dur = dur or self._pending_start_duration
+            if not dur:
+                return
+            self.state.is_watering = True
+            self.state.active_zone = self._pending_start_zone
+            self.state.started_at = now
+            self.state.expected_off_at = now + timedelta(seconds=dur)
+            self.state.seconds_remaining = dur
+            _LOGGER.debug("%s: START ack — armed off-timer for %ds", self.mac, dur)
+        elif cmd == 0xB7:  # STOP ack — device closed the valve
+            self.state.is_watering = False
+            self.state.active_zone = None
+            self.state.started_at = None
+            self.state.expected_off_at = None
+            self.state.seconds_remaining = None
+            _LOGGER.debug("%s: STOP ack — cleared off-timer", self.mac)
+        else:
+            return
+        self._notify_state_changed()
 
     async def _post_handshake(self, conn: BHyveBleConnection) -> None:
         """8-step init the phone runs after the AES handshake. Sending the
@@ -138,35 +190,44 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         if self.connection is None:
             return False
         # HT25 is single-station; `station` is a no-op placeholder for API parity.
+        # Stash before sending so the START-ack (which can arrive after a write
+        # timeout) can arm the off-timer in _observe_plaintext.
+        self._pending_start_duration = duration_sec
+        self._pending_start_zone = station
         plaintext = self._build_start(0xB6, duration_sec)
         _LOGGER.debug("%s: START tx pt=%s", self.mac, plaintext.hex())
-        notifs = await self.connection.send(plaintext, drain_ms=1500)
-        _LOGGER.debug("%s: START got %d notifications", self.mac, len(notifs))
+        notifs = await self._send_command(plaintext, "START")
         self._stamp_command(f"start s={station} d={duration_sec}", len(notifs))
-        if notifs:
-            now = datetime.now(timezone.utc)
-            self.state.is_watering = True
-            self.state.active_zone = station
-            self.state.seconds_remaining = duration_sec
-            self.state.started_at = now
-            self.state.expected_off_at = now + timedelta(seconds=duration_sec)
-        return bool(notifs)
+        # The off-timer is armed by the device's START-ack (_observe_plaintext),
+        # not by send()'s return — so this holds even when the write-response
+        # times out. Report whatever state the ack has produced by now.
+        return self.state.is_watering
 
     async def stop_watering(self, station: int | None = None) -> bool:
         if self.connection is None:
             return False
         plaintext = self._build_stop(0xB7)
         _LOGGER.debug("%s: STOP tx pt=%s", self.mac, plaintext.hex())
-        notifs = await self.connection.send(plaintext, drain_ms=1500)
-        _LOGGER.debug("%s: STOP got %d notifications", self.mac, len(notifs))
+        notifs = await self._send_command(plaintext, "STOP")
         self._stamp_command("stop", len(notifs))
-        if notifs:
-            self.state.is_watering = False
-            self.state.active_zone = None
-            self.state.seconds_remaining = None
-            self.state.started_at = None
-            self.state.expected_off_at = None
-        return bool(notifs)
+        return not self.state.is_watering
+
+    async def _send_command(self, plaintext: bytes, label: str) -> list[bytes]:
+        """Send a command frame, tolerating the ESPHome-proxy write-response
+        timeout. The device still receives the frame and acks via notification
+        (handled in _observe_plaintext), so a write timeout must not fail the
+        service call."""
+        try:
+            notifs = await self.connection.send(plaintext, drain_ms=1500)
+        except TimeoutError:
+            _LOGGER.warning(
+                "%s: %s write-response timed out; relying on the device ack to "
+                "confirm and drive the off-timer",
+                self.mac, label,
+            )
+            return []
+        _LOGGER.debug("%s: %s got %d notifications", self.mac, label, len(notifs))
+        return notifs
 
     async def refresh_state(self):
         """Probe the device for an idle/watering status. Best-effort: the
