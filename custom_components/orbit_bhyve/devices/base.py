@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import abc
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -63,6 +64,10 @@ class BHyveBleDeviceBase(abc.ABC):
         self.battery_mv: int | None = record.get("battery_mv")
         self.network_key: str = record["network_key"]
         self.state = DeviceState()
+        # Optional callback a coordinator registers so an out-of-band state
+        # change (e.g. a BLE notification ack) can refresh entities now instead
+        # of waiting for the next poll. See _notify_state_changed.
+        self._state_changed_cb: Callable[[], None] | None = None
 
         if self.network_key and self.mac:
             self.connection: BHyveBleConnection | None = BHyveBleConnection(
@@ -96,6 +101,15 @@ class BHyveBleDeviceBase(abc.ABC):
     async def async_unload(self) -> None:
         if self.connection is not None:
             await self.connection.disconnect()
+
+    def set_state_changed_callback(self, cb: Callable[[], None] | None) -> None:
+        """Register a callback fired when device state changes out of band
+        (outside the coordinator poll), e.g. from a notification ack."""
+        self._state_changed_cb = cb
+
+    def _notify_state_changed(self) -> None:
+        if self._state_changed_cb is not None:
+            self._state_changed_cb()
 
     async def _post_handshake(self, conn: BHyveBleConnection) -> None:
         """Override to send per-class init frames after the AES handshake."""
