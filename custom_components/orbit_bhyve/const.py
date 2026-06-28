@@ -20,6 +20,13 @@ SERVICE_UUID = "0000fe32-0000-1000-8000-00805f9b34fb"
 # Cloud API.
 CLOUD_API_BASE = "https://api.orbitbhyve.com/v1"
 CLOUD_APP_ID = "Bhyve-App"
+# Orbit's WAF 403s any request whose User-Agent contains "HomeAssistant"
+# (which HA's shared aiohttp session sets by default). Send a browser UA on
+# cloud calls so setup isn't rejected. See sebr/bhyve-home-assistant#427.
+CLOUD_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/72.0.3626.81 Safari/537.36"
+)
 CLOUD_KEY_PATHS = (
     "/meshes/{mesh_id}",
     "/network_topologies/{mesh_id}",
