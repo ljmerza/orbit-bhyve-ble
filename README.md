@@ -12,7 +12,8 @@ when the WAN goes down.
 | Hose-tap timer    | `HT25-0000`    | `0085`           | ✅ Actuated end-to-end                   |
 | Hose-tap timer    | `HT25-0000`    | `0041`           | ✅ Actuated end-to-end (per-device mesh-ID addressing) |
 | Hose-tap timer (Gen2) | `HT25G2-0001` | `0111`          | ✅ Actuated end-to-end (protobuf protocol) |
-| 4-port XD         | `HT34A-0001`   | `0107`           | ⚠️ Ported from upstream; not tested here|
+| 4-port XD         | `HT34A-0001`   | `0107`           | ⚠️ Protobuf control + battery/status decode; not tested here |
+| 4-port XD         | `HT34-0001`    | `0058`           | ⚠️ Shares the XD protobuf protocol; not tested here |
 
 > ⚠️ **Do NOT update your B-Hyve device firmware.** This integration was
 > reverse-engineered against the firmware versions above. A firmware update
@@ -39,7 +40,7 @@ when the WAN goes down.
 
 Per discovered sprinkler device:
 
-- **Valve** per physical station (HT25 = 1, HT34A = up to 4) — uses
+- **Valve** per physical station (HT25 = 1, HT34A/HT34 = up to 4) — uses
   `valve.open_valve` / `valve.close_valve`. Open/closed state is
   **optimistic** (derived from the last command, not from a decoded
   device status).
@@ -48,6 +49,12 @@ Per discovered sprinkler device:
 - **Battery voltage (mV)** sensor — same source as the percent sensor;
   disabled by default, enable it from the entity's settings if you want
   the raw reading.
+- **Signal strength (RSSI)** sensor — the BLE advertisement RSSI from
+  Home Assistant's bluetooth manager (works even while disconnected);
+  disabled by default.
+- **Connected** and **Watering** binary sensors — device connectivity
+  (diagnostic) and whether a station is currently running, for automations
+  and dashboards.
 - **Default watering duration** (`number` entity, minutes) — per device.
   The valve uses this when `start_watering` is called without an
   explicit duration. Restored across HA restarts.
@@ -87,9 +94,11 @@ registry.
    does an AES handshake, runs the model-specific init sequence on first
    connect, then sends one encrypted frame per command and reads back
    notifications
-3. **Reuse**: the connection stays open across commands until idle timeout;
-   subsequent commands skip the handshake and init, going directly to the
-   command frame
+3. **Reuse**: the connection stays open across commands until idle timeout.
+   Watering commands re-run the model init/bind first — the device silently
+   ignores a watering frame sent on a stale bind — while reads reuse the
+   pooled session directly. Marginal proxy links get a bounded handshake with
+   a few clean retries instead of a wedged connection.
 
 The cipher (AES-128-ECB used as a CTR-style keystream, frame trailer =
 `sum(plaintext) + magic + len`) was reverse-engineered against captured
@@ -97,6 +106,14 @@ phone-app traffic. Different hardware families (HT25 vs HT34A) use different
 inner plaintext formats and different magic bytes; the per-model device
 classes encode that. Adding a new model = drop a `devices/htXX.py` and
 register it.
+
+## Credits
+
+The marginal-link connection hardening (bounded handshake + retry, capped
+write-ack), the per-command re-bind for HT25 actuation, the RSSI and
+connectivity/watering sensors, and the HT34/HT34A battery + watering-status
+decode were ported from
+[@stuartdenne](https://github.com/stuartdenne/ha-orbit-bhyve-ble-old)'s fork.
 
 ## Legal & ethical notice
 
