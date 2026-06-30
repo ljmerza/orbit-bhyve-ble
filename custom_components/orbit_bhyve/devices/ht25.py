@@ -213,12 +213,14 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         return not self.state.is_watering
 
     async def _send_command(self, plaintext: bytes, label: str) -> list[bytes]:
-        """Send a command frame, tolerating the ESPHome-proxy write-response
-        timeout. The device still receives the frame and acks via notification
-        (handled in _observe_plaintext), so a write timeout must not fail the
-        service call."""
+        """Send a command frame via send_actuation, which re-runs the bind/init
+        first — this device acks but SILENTLY IGNORES a watering command on a
+        stale pooled bind, so a fresh bind per actuation is what makes it take.
+        Tolerates the ESPHome-proxy write-response timeout: the device still
+        receives the frame and acks via notification (handled in
+        _observe_plaintext), so a write timeout must not fail the service call."""
         try:
-            notifs = await self.connection.send(plaintext, drain_ms=1500)
+            notifs = await self.connection.send_actuation(plaintext, drain_ms=1500)
         except TimeoutError:
             _LOGGER.warning(
                 "%s: %s write-response timed out; relying on the device ack to "
