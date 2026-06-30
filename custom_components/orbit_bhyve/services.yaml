@@ -38,3 +38,44 @@ probe_status:
       example: "44:67:55:52:99:01"
       selector:
         text:
+
+probe_send:
+  name: Probe send frame (debug)
+  description: Send an arbitrary inner-plaintext frame to a device; decoded replies land in the HA log via connection._on_notify. For reverse-engineering only — connection.encrypt() adds the [magic][len]..[trailer] wrapper around the hex you supply.
+  fields:
+    mac:
+      name: MAC address
+      description: Device MAC, e.g. 44:67:55:52:99:01.
+      required: true
+      example: "44:67:55:52:99:01"
+      selector:
+        text:
+    plaintext:
+      name: Plaintext (hex)
+      description: Inner frame as hex, e.g. an HT34A protobuf query AA775A0F....
+      required: true
+      example: "aa775a0f02007a0012cd"
+      selector:
+        text:
+    magic:
+      name: Magic byte override
+      description: Optional. Override frame_magic/trailer_const (0-255); forces a reconnect so the new magic takes effect.
+      required: false
+      example: 17
+      selector:
+        number:
+          min: 0
+          max: 255
+          mode: box
+    drain_ms:
+      name: Drain window (ms)
+      description: How long to collect notification replies after the write.
+      required: false
+      default: 2000
+      example: 2000
+      selector:
+        number:
+          min: 100
+          max: 10000
+          unit_of_measurement: milliseconds
+          mode: box

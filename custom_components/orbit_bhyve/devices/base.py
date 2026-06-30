@@ -153,6 +153,18 @@ class BHyveBleDeviceBase(abc.ABC):
             self.state.is_connected = self.connection.is_connected
         return self.state
 
+    @property
+    def rssi(self) -> int | None:
+        """Latest RSSI from the bluetooth manager's most recent advertisement.
+        Works even while disconnected, and unlike bleak's BLEDevice.rssi (now
+        deprecated and always None) it actually returns a value."""
+        from homeassistant.components.bluetooth import async_last_service_info
+
+        if not self.mac:
+            return None
+        info = async_last_service_info(self.hass, self.mac, connectable=True)
+        return info.rssi if info is not None else None
+
     def _stamp_command(self, label: str, n_notifs: int) -> None:
         self.state.last_command_at = datetime.now(timezone.utc)
         self.state.last_command_label = label

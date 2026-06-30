@@ -37,7 +37,13 @@ from .devices import UnsupportedModel, build_device
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.VALVE, Platform.SENSOR, Platform.NUMBER, Platform.BUTTON]
+PLATFORMS: list[Platform] = [
+    Platform.VALVE,
+    Platform.SENSOR,
+    Platform.BINARY_SENSOR,
+    Platform.NUMBER,
+    Platform.BUTTON,
+]
 
 
 class EntryRuntime:
@@ -230,4 +236,51 @@ def _register_services(hass: HomeAssistant) -> None:
         "probe_status",
         probe_status,
         schema=vol.Schema({vol.Required("mac"): str}),
+    )
+
+    async def probe_send(call: ServiceCall) -> None:
+        """Debug-only: send an arbitrary inner-plaintext frame to a device and
+        let _on_notify decrypt+log the replies. For reverse-engineering — e.g.
+        a protobuf getDeviceInfo query to the quad. The `plaintext` hex is the
+        inner frame (for HT34A: AA775A0F + len + 00 + protobuf + CRC16);
+        connection.encrypt() adds the [magic][len]..[trailer] wrapper. Optional
+        `magic` overrides frame_magic/trailer_const (forces a reconnect). A
+        reply that decodes is logged as 'notif pt=...'; one with a mismatched
+        magic logs 'notif decrypt failed: bad frame magic raw=...', which
+        reveals the device's actual magic byte."""
+        mac = call.data["mac"].upper()
+        plaintext = bytes.fromhex(call.data["plaintext"])
+        magic = call.data.get("magic")
+        drain = int(call.data.get("drain_ms", 2000))
+        for runtime in hass.data.get(DOMAIN, {}).values():
+            for coord in runtime.coordinators.values():
+                if (coord.device.mac or "").upper() != mac:
+                    continue
+                conn = coord.device.connection
+                if conn is None:
+                    _LOGGER.warning("probe_send: %s has no BLE connection", mac)
+                    return
+                if magic is not None:
+                    m = int(magic) & 0xFF
+                    _LOGGER.warning("probe_send: %s magic->0x%02x; reconnecting", mac, m)
+                    conn._frame_magic = m
+                    conn._trailer_const = m
+                    await conn.disconnect()
+                _LOGGER.warning("probe_send: %s -> %s", mac, plaintext.hex())
+                notifs = await conn.send(plaintext, drain_ms=drain)
+                _LOGGER.warning("probe_send: %s got %d notification(s)", mac, len(notifs))
+                return
+        _LOGGER.warning("probe_send: no device with mac=%s", mac)
+
+    hass.services.async_register(
+        DOMAIN,
+        "probe_send",
+        probe_send,
+        schema=vol.Schema({
+            vol.Required("mac"): str,
+            vol.Required("plaintext"): str,
+            vol.Optional("magic"): vol.All(vol.Coerce(int), vol.Range(min=0, max=255)),
+            vol.Optional("drain_ms", default=2000):
+                vol.All(vol.Coerce(int), vol.Range(min=100, max=10000)),
+        }),
     )
