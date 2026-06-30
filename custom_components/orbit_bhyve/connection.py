@@ -10,7 +10,10 @@ Cipher (verified against 257 captured frames + actuated commands):
   TX counter = uint32_LE(init_tx[12:16]); RX counter = init_tx[16:20].
   Frame = [magic][len][ciphertext (len bytes)][trailer u16_LE].
   Trailer = sum(plaintext) + trailer_const + len.
-WRITE_REQ (response=True) is required — WRITE_CMD is silently dropped.
+WRITE_REQ (response=True) is required — WRITE_CMD is silently dropped. The
+device acks via NOTIFICATION, not an ATT Write Response; the ESPHome BLE proxy
+doesn't relay the (absent) write response, so writes are sent with a capped
+wait (WRITE_ACK_TIMEOUT_SEC) and the notification drain is the real ack.
 """
 from __future__ import annotations
 
@@ -27,6 +30,20 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from .const import AES_CHAR, READ_CHAR, WRITE_CHAR
 
 _LOGGER = logging.getLogger(__name__)
+
+# Cap on waiting for an ATT Write Response that the device never sends (it acks
+# via notification instead). Over a direct link the response arrives in <200ms;
+# over the ESPHome proxy it never comes, so we proceed after this. The device's
+# notification ack arrives in ~50-150ms, so this is a generous floor that still
+# keeps cold-start init (8 writes) under ~7s.
+WRITE_ACK_TIMEOUT_SEC = 0.8
+
+# The connect succeeds even on a weak proxy link, but the post-connect handshake
+# (subscribe + AES read/write) can stall on a marginal signal. Bound it so it
+# fails cleanly instead of wedging the connection, and retry the whole open a
+# few times — a clean retry often catches a good GATT window.
+HANDSHAKE_TIMEOUT_SEC = 10.0
+OPEN_MAX_ATTEMPTS = 3
 
 PostHandshakeHook = Callable[["BHyveBleConnection"], Awaitable[None]]
 PlaintextObserver = Callable[[bytes], None]
@@ -80,11 +97,30 @@ class BHyveBleConnection:
         self._plaintext_observer = observer
 
     async def ensure_connected(self) -> None:
-        """Connect + handshake if not already pooled. Call inside a lock if you
-        need exclusive access; this method itself is idempotent."""
+        """Connect + handshake if not already pooled, retrying the whole open a
+        few times. On a marginal proxy link the connect succeeds but the
+        handshake GATT exchange can stall; a clean retry usually gets through,
+        and the bounded handshake means we fail cleanly rather than wedging.
+        Call inside a lock if you need exclusive access; idempotent otherwise."""
         if self.is_connected and self._handshaken:
             return
-        await self._open()
+        last_err: Exception | None = None
+        for attempt in range(1, OPEN_MAX_ATTEMPTS + 1):
+            try:
+                await self._open()
+                return
+            except (BleHandshakeError, asyncio.TimeoutError) as err:
+                last_err = err
+                _LOGGER.debug(
+                    "%s: open attempt %d/%d failed: %s",
+                    self.mac, attempt, OPEN_MAX_ATTEMPTS, err,
+                )
+                await self.disconnect()
+                if attempt < OPEN_MAX_ATTEMPTS:
+                    await asyncio.sleep(0.5)
+        raise BleHandshakeError(
+            f"{self.mac}: handshake failed after {OPEN_MAX_ATTEMPTS} attempts: {last_err}"
+        )
 
     async def _open(self) -> None:
         from homeassistant.components.bluetooth import async_ble_device_from_address
@@ -102,6 +138,36 @@ class BHyveBleConnection:
         # device tested ("Write not permitted"). Confirmed not the actual
         # mechanism for fw0041 the v1 commit fad91eae assumed.
 
+        # The post-connect handshake (subscribe + AES read/write) is the part
+        # that stalls on a marginal link, so bound it — ensure_connected()
+        # retries the whole open on timeout.
+        try:
+            await asyncio.wait_for(self._handshake(), timeout=HANDSHAKE_TIMEOUT_SEC)
+        except asyncio.TimeoutError as err:
+            raise BleHandshakeError(
+                f"{self.mac}: handshake timed out after {HANDSHAKE_TIMEOUT_SEC}s"
+            ) from err
+
+        # One-shot GATT enumeration — looking for standard Battery Service
+        # (0x180F / 0x2A19) or anything else the device exposes that we
+        # haven't been using. Logged at INFO for reverse-engineering work.
+        try:
+            for service in self._client.services:
+                _LOGGER.info("%s: gatt svc %s", self.mac, service.uuid)
+                for char in service.characteristics:
+                    _LOGGER.info(
+                        "%s:   char %s props=%s",
+                        self.mac, char.uuid, list(char.properties),
+                    )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("%s: gatt enum failed: %s", self.mac, err)
+
+        if self._post_handshake_hook is not None:
+            await self._post_handshake_hook(self)
+
+    async def _handshake(self) -> None:
+        """Subscribe + AES handshake. Bounded by a timeout in _open() because
+        these GATT reads/writes are what stall on a weak link."""
         # Subscribe BEFORE writing — device may stay silent otherwise.
         self._notif_buf.clear()
         await self._client.start_notify(READ_CHAR, self._on_notify)
@@ -121,23 +187,6 @@ class BHyveBleConnection:
         self._rx_ctr = struct.unpack("<I", buf[16:20])[0]
         self._handshaken = True
         _LOGGER.debug("%s: handshake ok, iv=%s tx_ctr=0x%08x", self.mac, self._iv.hex(), self._tx_ctr)
-
-        # One-shot GATT enumeration — looking for standard Battery Service
-        # (0x180F / 0x2A19) or anything else the device exposes that we
-        # haven't been using.
-        try:
-            for service in self._client.services:
-                _LOGGER.info("%s: gatt svc %s", self.mac, service.uuid)
-                for char in service.characteristics:
-                    _LOGGER.info(
-                        "%s:   char %s props=%s",
-                        self.mac, char.uuid, list(char.properties),
-                    )
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("%s: gatt enum failed: %s", self.mac, err)
-
-        if self._post_handshake_hook is not None:
-            await self._post_handshake_hook(self)
 
     def _on_notify(self, _sender, data) -> None:
         """Bleak notification callback. Buffers the raw frame for the
@@ -232,7 +281,20 @@ class BHyveBleConnection:
         post-handshake hook (which runs inside _open() inside the lock)."""
         frame = self.encrypt(plaintext)
         assert self._client is not None
-        await self._client.write_gatt_char(WRITE_CHAR, frame, response=True)
+        # WRITE_CHAR (6c72) requires a Write Request (response=True) — the device
+        # silently drops Write Commands. But it answers via NOTIFICATION and, on
+        # some transports (notably the ESPHome Bluetooth proxy), the ATT Write
+        # Response is never relayed back, so a plain response=True write blocks
+        # ~30s. Issue the Write Request but cap the wait; the notification drain
+        # in send() is the real ack. Over a direct link the response arrives in
+        # <200ms so this returns immediately.
+        try:
+            await asyncio.wait_for(
+                self._client.write_gatt_char(WRITE_CHAR, frame, response=True),
+                timeout=WRITE_ACK_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            pass
 
     async def send(self, plaintext: bytes, *, drain_ms: int = 1500) -> list[bytes]:
         """Encrypt + WRITE_REQ + drain notifications for `drain_ms`. Returns
@@ -253,6 +315,29 @@ class BHyveBleConnection:
         async with self._lock:
             await self.ensure_connected()
             await self._write_locked(plaintext)
+
+    async def send_actuation(self, plaintext: bytes, *, drain_ms: int = 1500) -> list[bytes]:
+        """Re-run the per-device init sequence, then send a command — atomically.
+
+        HT25 only honours a watering command in a freshly-initialised session:
+        a pooled connection's bind goes stale, so the command is ack'd but
+        SILENTLY IGNORED (no actuation). Re-run the full init before every
+        actuation rather than trusting the pooled session."""
+        async with self._lock:
+            if self.is_connected and self._handshaken:
+                # Pooled connection — refresh the (possibly stale) bind in place.
+                if self._post_handshake_hook is not None:
+                    await self._post_handshake_hook(self)
+            else:
+                # Cold — ensure_connected() retries the open and runs the hook.
+                await self.ensure_connected()
+            self._notif_buf.clear()
+            await self._write_locked(plaintext)
+            await asyncio.sleep(drain_ms / 1000.0)
+            received = list(self._notif_buf)
+            self._notif_buf.clear()
+            self._arm_idle_timer()
+            return received
 
 
 class BleNotConnectable(Exception):
