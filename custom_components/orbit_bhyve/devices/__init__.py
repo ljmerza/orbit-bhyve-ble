@@ -44,7 +44,10 @@ def resolve_device_class(*, hardware: str, firmware: str, type_: str) -> type[BH
         if firmware == "0085":
             return BHyveHT25Fw0085Device
         return BHyveHT25Device
-    if (hardware or "").startswith("HT34A"):
+    if (hardware or "").startswith("HT34"):
+        # Both HT34A-0001 and HT34-0001 (fw0058) use the protobuf XD protocol.
+        # The older HT34 sharing it is the stuartdenne fork's claim (2026-06-27),
+        # not independently verified on hardware here.
         return BHyveHT34ADevice
     raise UnsupportedModel(hardware or "?", firmware or "?")
 
