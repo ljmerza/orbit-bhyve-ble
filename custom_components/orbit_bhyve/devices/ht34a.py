@@ -1,8 +1,11 @@
-"""HT34A / HT34 (4-port XD timer) device class.
+"""HT34A / HT34 (XD timer) device class.
 
 Protobuf-over-CRC16 protocol (the `OrbitPbApi_Message` schema from the APK),
 shared across the XD family. Covers HT34A-0001 (fw0107, originally ported from
-upstream `wxfield/Orbit_B-Hyve_4Port_Controller`) and HT34-0001 (fw0058). The
+upstream `wxfield/Orbit_B-Hyve_4Port_Controller`) and HT34-0001 (fw0058). Also
+serves the 2-port HT32A-0001 (fw0107), routed here as the XD sibling of the
+4-port HT34A — station count comes from the cloud record, so the same class
+drives a 2-port unit unchanged (issue #13, untested on hardware). The
 cipher/handshake is shared with HT25; only the inner plaintext (protobuf) and
 magic byte (0x11) differ.
 
