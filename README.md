@@ -14,6 +14,7 @@ when the WAN goes down.
 | Hose-tap timer (Gen2) | `HT25G2-0001` | `0111`          | ✅ Actuated end-to-end (protobuf protocol) |
 | 4-port XD         | `HT34A-0001`   | `0107`           | ⚠️ Protobuf control + battery/status decode; not tested here |
 | 4-port XD         | `HT34-0001`    | `0058`           | ⚠️ Shares the XD protobuf protocol; not tested here |
+| 2-port XD         | `HT32A-0001`   | `0107`           | ⚠️ Shares the HT34A XD protobuf protocol; not tested here |
 
 > ⚠️ **Do NOT update your B-Hyve device firmware.** This integration was
 > reverse-engineered against the firmware versions above. A firmware update

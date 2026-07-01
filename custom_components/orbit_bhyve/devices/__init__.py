@@ -49,6 +49,13 @@ def resolve_device_class(*, hardware: str, firmware: str, type_: str) -> type[BH
         # The older HT34 sharing it is the stuartdenne fork's claim (2026-06-27),
         # not independently verified on hardware here.
         return BHyveHT34ADevice
+    if (hardware or "").startswith("HT32"):
+        # HT32A-0001 (fw0107) is the 2-port XD sibling of the HT34A: same
+        # firmware, same protobuf-over-CRC16 protocol (magic 0x11), fewer
+        # stations. Station count flows from the cloud record, so the 4-port
+        # class handles a 2-port unit unchanged. Untested on hardware here
+        # (issue #13) — same caveat as HT34A.
+        return BHyveHT34ADevice
     raise UnsupportedModel(hardware or "?", firmware or "?")
 
 
