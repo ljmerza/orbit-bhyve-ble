@@ -46,15 +46,16 @@ def resolve_device_class(*, hardware: str, firmware: str, type_: str) -> type[BH
         return BHyveHT25Device
     if (hardware or "").startswith("HT34"):
         # Both HT34A-0001 and HT34-0001 (fw0058) use the protobuf XD protocol.
-        # The older HT34 sharing it is the stuartdenne fork's claim (2026-06-27),
-        # not independently verified on hardware here.
+        # HT34A-0001/fw0107 is hardware-verified (issue #16). The older HT34
+        # sharing it is the stuartdenne fork's claim (2026-06-27), still not
+        # independently verified on hardware here.
         return BHyveHT34ADevice
     if (hardware or "").startswith("HT32"):
         # HT32A-0001 (fw0107) is the 2-port XD sibling of the HT34A: same
         # firmware, same protobuf-over-CRC16 protocol (magic 0x11), fewer
         # stations. Station count flows from the cloud record, so the 4-port
-        # class handles a 2-port unit unchanged. Untested on hardware here
-        # (issue #13) — same caveat as HT34A.
+        # class handles a 2-port unit unchanged. Verified end-to-end on 3x
+        # HT32A units — open/close actuation confirmed (issue #13).
         return BHyveHT34ADevice
     raise UnsupportedModel(hardware or "?", firmware or "?")
 
