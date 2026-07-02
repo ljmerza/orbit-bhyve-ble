@@ -5,14 +5,15 @@ shared across the XD family. Covers HT34A-0001 (fw0107, originally ported from
 upstream `wxfield/Orbit_B-Hyve_4Port_Controller`) and HT34-0001 (fw0058). Also
 serves the 2-port HT32A-0001 (fw0107), routed here as the XD sibling of the
 4-port HT34A — station count comes from the cloud record, so the same class
-drives a 2-port unit unchanged (issue #13, untested on hardware). The
-cipher/handshake is shared with HT25; only the inner plaintext (protobuf) and
-magic byte (0x11) differ.
+drives a 2-port unit unchanged. Verified end-to-end on 3x HT32A units:
+open/close actuation confirmed (issue #13). The cipher/handshake is shared
+with HT25; only the inner plaintext (protobuf) and magic byte (0x11) differ.
 
 Battery/status decode and watering-state confirmation were ported from the
-stuartdenne fork (PRs #4/#5), which reports the older HT34-0001 answering the
-same protobuf queries. Neither the HT34A nor the HT34 path is verified on
-hardware in this repo — treat actuation here as untested.
+stuartdenne fork (PRs #4/#5). The HT34A path is hardware-verified: battery +
+status decode confirmed on a real HT34A-0001/fw0107 (issue #16), and the shared
+XD actuation path is proven via the HT32A sibling (issue #13). The older
+HT34-0001/fw0058 remains unverified — no such unit tested in this repo.
 """
 from __future__ import annotations
 
