@@ -75,6 +75,7 @@ class BHyveBleConnection:
         self._rx_ctr: int = 0
         self._lock = asyncio.Lock()
         self._notif_buf: list[bytes] = []
+        self._last_rx_frame: bytes | None = None  # last raw RX frame, for de-dup
         self._handshaken = False
         self._post_handshake_hook: PostHandshakeHook | None = None
         self._plaintext_observer: PlaintextObserver | None = None
@@ -170,6 +171,7 @@ class BHyveBleConnection:
         these GATT reads/writes are what stall on a weak link."""
         # Subscribe BEFORE writing — device may stay silent otherwise.
         self._notif_buf.clear()
+        self._last_rx_frame = None  # fresh CTR stream — don't dedup across sessions
         await self._client.start_notify(READ_CHAR, self._on_notify)
 
         # AES handshake. Phone forces init_tx[11]=0x00.
@@ -195,6 +197,17 @@ class BHyveBleConnection:
         Decryption advances the rx counter — necessary for the next
         notification's plaintext to be correct."""
         frame = bytes(data)
+        # Drop an exact re-delivery of the previous frame. A proxy/link can
+        # re-emit the same notification (observed: dozens of identical frames in
+        # a burst while the vendor app held the device's single BLE session). We
+        # decrypt every delivery, so a re-delivery would advance the RX counter
+        # and desync the CTR stream — poisoning every subsequent frame until the
+        # next handshake. Same plaintext at a new counter yields different
+        # ciphertext, so byte-identical consecutive frames are always dupes.
+        if frame == self._last_rx_frame:
+            _LOGGER.debug("%s: dropped duplicate rx frame %s", self.mac, frame.hex())
+            return
+        self._last_rx_frame = frame
         self._notif_buf.append(frame)
         if not self._handshaken or self._iv is None:
             return
@@ -229,6 +242,7 @@ class BHyveBleConnection:
         self._client = None
         self._handshaken = False
         self._iv = None
+        self._last_rx_frame = None
 
     def _arm_idle_timer(self) -> None:
         if self._idle_sec <= 0:
