@@ -70,11 +70,13 @@ per-poll re-subscription can **wedge** it. **Fix:** always send **`#57{#1=0}`** 
 done (e.g. in a `finally`). Separately, a dropped `#59` on a long-lived connection desyncs the RX
 counter; recover by **reconnecting** (a fresh handshake re-seeds IV + counter). **[HW-verified]**
 
-### 1.5 Some firmware reports a *static* `remaining`
-On a manual run, a valve may report the **same** `#16` remaining-seconds on **every** poll instead of
-counting down. A client that re-arms a wall-clock auto-close from each reading will push the end time
-forward forever and the entity appears to water indefinitely. **Fix:** drive the auto-close from the
-**first** reading and re-anchor only when a later reading is *earlier*. **[HW-verified]**
+### 1.5 A wall-clock auto-close is worth keeping as a safety net
+Drive an auto-close from the device's reported remaining and, defensively, never push the end time
+*later* on a re-read (re-anchor only when a later reading is *earlier*). **Correction (2026-07-05):**
+an earlier version of this section reported a "static remaining" *firmware* quirk. That was wrong — it
+was **our own decode mislabel** (reading the constant *total* field `#16.#6.#7` instead of the
+counting-down *remaining* field `#16.#6.#5`; see §2.1), not firmware. The device's remaining counts
+down correctly; the drift-guard is still fine to keep as belt-and-suspenders. **[HW-verified]**
 
 ### 1.6 CTR desync self-heal
 Any of the above can leave the RX counter desynced (every frame decodes to garbage that fails CRC).
@@ -90,11 +92,15 @@ frame so a legitimately multi-frame CTR-streamed reply's continuation blocks don
 Behavioral detail in the `#16` status block (and friends) that the structural specs don't pin down.
 All confirmed on live hardware.
 
-### 2.1 Run progress / seconds-remaining — and a Gen2↔XD layout flip
-Run progress lives in **`#16.#6` `{#5 total sec, #7 remaining sec}`**, present only while watering.
-**The nesting differs by model:** the **XD** reports remaining at **`#16.#6.#7`**, the **Gen2** at
-**`#16.#7.#6`**. Decode both, and **validate the result is an integer** — a Gen2 *idle* frame emits
-`#16.#7` as a short byte submessage that must not be mistaken for a countdown. **[HW-verified]**
+### 2.1 Run progress / seconds-remaining
+Run progress lives in **`#16.#6`**, present only while watering: **`#5` = seconds remaining
+(counts DOWN)**, **`#7` = total run-time seconds (constant)**. Timed live, `#16.#6.#5` counted
+`174 → 138 → 102` (once per second) over a 180 s run while `#16.#6.#7` held at `180` — identically on
+**both** the Gen2 (fw `0111`) and the XD (fw `0107`). This matches the vendor field names
+`currentTimeRemainingSec` / `totalRunTimeSec`. Read `#16.#6.#5` and validate it is an integer.
+**There is no Gen2↔XD layout flip** — an earlier version of this doc claimed one; both families use
+`#16.#6.#5`, and `#16.#7` is empty or a small `{#6=1}` flag (`faultStatus`), not a countdown.
+**[HW-verified]**
 
 ### 2.2 Which zone is running (multi-station)
 The active station is **`#16.#2.#2.#3.#1`** (`stationId`, 0-indexed → zone = id + 1). On the
@@ -141,8 +147,8 @@ and use it to anchor the rain-delay `#3` expiry (§2.4). **[HW-verified]**
 
 | Device | Hardware | Firmware | Verified here |
 |---|---|---|---|
-| Gen2 1-station | `HT25G2-0001` | `0111` | reliability §1, progress `#16.#7.#6`, stop ack, rain delay, flow `#57`/`#59`, clock |
-| XD 4-station | `HT34A-0001` | `0107` | reliability §1, progress `#16.#6.#7`, **active-zone** decode, stop ack, rain delay, **no flow** (confirmed) |
+| Gen2 1-station | `HT25G2-0001` | `0111` | reliability §1, progress `#16.#6.#5` (remaining) / `#7` (total), stop ack, rain delay, flow `#57`/`#59`, clock |
+| XD 4-station | `HT34A-0001` | `0107` | reliability §1, progress `#16.#6.#5` (remaining) / `#7` (total), **active-zone** decode, stop ack, rain delay, **no flow** (confirmed) |
 
 Other Gen2/XD SKUs in the same families are expected-compatible but were not exercised. See
 knobunc's `PROTOCOL_SPEC.md` for the HT25 mesh (fw `0041`/`0085`) frame format, which this document
