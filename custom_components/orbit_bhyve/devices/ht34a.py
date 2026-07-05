@@ -153,7 +153,10 @@ class BHyveHT34ADevice(BHyveBleDeviceBase):
     def _parse_status(self, val: bytes) -> None:
         """deviceStatusInfo: field 1 is the run state (1=idle, 4=watering),
         field 6 is the active-watering block (present only while watering) with
-        field 7 = seconds remaining. Decoded from idle-vs-watering captures."""
+        field 5 = seconds remaining (counts down) and field 7 = total run time
+        (constant). Hardware-verified on a timed run (HT34A fw0107 + HT25G2 fw0111):
+        6.5 counted 174->138->102 over a 180s run while 6.7 held at 180. These
+        match the vendor names currentTimeRemainingSec / totalRunTimeSec."""
         status = None
         remaining = None
         for fn, wt, v in _pb_fields(val):
@@ -161,7 +164,7 @@ class BHyveHT34ADevice(BHyveBleDeviceBase):
                 status = v
             elif fn == 6 and wt == 2:  # active watering block
                 for sfn, swt, sv in _pb_fields(v):
-                    if sfn == 7 and swt == 0:
+                    if sfn == 5 and swt == 0:  # field 5 = seconds remaining
                         remaining = sv
         if status is not None:
             self.state.is_watering = status == 4
