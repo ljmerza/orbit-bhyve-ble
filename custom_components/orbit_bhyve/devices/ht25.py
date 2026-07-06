@@ -189,28 +189,36 @@ class BHyveHT25Device(BHyveBleDeviceBase):
     async def start_watering(self, station: int, duration_sec: int) -> bool:
         if self.connection is None:
             return False
-        # HT25 is single-station; `station` is a no-op placeholder for API parity.
-        # Stash before sending so the START-ack (which can arrive after a write
-        # timeout) can arm the off-timer in _observe_plaintext.
-        self._pending_start_duration = duration_sec
-        self._pending_start_zone = station
-        plaintext = self._build_start(0xB6, duration_sec)
-        _LOGGER.debug("%s: START tx pt=%s", self.mac, plaintext.hex())
-        notifs = await self._send_command(plaintext, "START")
-        self._stamp_command(f"start s={station} d={duration_sec}", len(notifs))
-        # The off-timer is armed by the device's START-ack (_observe_plaintext),
-        # not by send()'s return — so this holds even when the write-response
-        # times out. Report whatever state the ack has produced by now.
-        return self.state.is_watering
+        try:
+            # HT25 is single-station; `station` is a no-op placeholder for API parity.
+            # Stash before sending so the START-ack (which can arrive after a write
+            # timeout) can arm the off-timer in _observe_plaintext.
+            self._pending_start_duration = duration_sec
+            self._pending_start_zone = station
+            plaintext = self._build_start(0xB6, duration_sec)
+            _LOGGER.debug("%s: START tx pt=%s", self.mac, plaintext.hex())
+            notifs = await self._send_command(plaintext, "START")
+            self._stamp_command(f"start s={station} d={duration_sec}", len(notifs))
+            # The off-timer is armed by the device's START-ack (_observe_plaintext),
+            # not by send()'s return — so this holds even when the write-response
+            # times out. Report whatever state the ack has produced by now.
+            return self.state.is_watering
+        finally:
+            if self.connection is not None:
+                await self.connection.disconnect()
 
     async def stop_watering(self, station: int | None = None) -> bool:
         if self.connection is None:
             return False
-        plaintext = self._build_stop(0xB7)
-        _LOGGER.debug("%s: STOP tx pt=%s", self.mac, plaintext.hex())
-        notifs = await self._send_command(plaintext, "STOP")
-        self._stamp_command("stop", len(notifs))
-        return not self.state.is_watering
+        try:
+            plaintext = self._build_stop(0xB7)
+            _LOGGER.debug("%s: STOP tx pt=%s", self.mac, plaintext.hex())
+            notifs = await self._send_command(plaintext, "STOP")
+            self._stamp_command("stop", len(notifs))
+            return not self.state.is_watering
+        finally:
+            if self.connection is not None:
+                await self.connection.disconnect()
 
     async def _send_command(self, plaintext: bytes, label: str) -> list[bytes]:
         """Send a command frame via send_actuation, which re-runs the bind/init
@@ -232,9 +240,12 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         return notifs
 
     async def refresh_state(self):
-        """Probe the device for an idle/watering status. Best-effort: the
-        watering-status response byte layout isn't fully decoded, so we only
-        update is_connected here. Local optimism (set in start/stop) drives
-        is_watering until full status decoding lands."""
+        """Best-effort liveness refresh: update is_connected from the pooled
+        connection without opening one. is_watering is driven by the device's
+        START/STOP ack (_observe_plaintext) and the coordinator's wall-clock
+        auto-close; the STATUS reply's mode byte is decoded too (base
+        _observe_plaintext, 0x04=watering/0x01=idle), but an idle poll doesn't
+        connect to elicit it, so live idle-poll status would need a connect +
+        STATUS query (future enhancement, needs hardware verification)."""
         await super().refresh_state()
         return self.state

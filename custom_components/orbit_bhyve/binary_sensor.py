@@ -55,6 +55,11 @@ class _BHyveBinarySensorBase(CoordinatorEntity[BHyveDeviceCoordinator], BinarySe
 
 
 class BHyveConnectedBinarySensor(_BHyveBinarySensorBase):
+    """Connectivity: True when the last status poll REACHED the device. Under the
+    ephemeral connect-on-demand model the BLE link is torn down between polls, so
+    this reflects poll-reachability (coherent with the Consecutive timeouts sensor)
+    rather than a live socket."""
+
     _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 

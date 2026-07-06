@@ -29,12 +29,14 @@ from .const import (
     CONF_DEFAULT_DURATION,
     CONF_DEVICES,
     CONF_EMAIL,
+    CONF_FLOW_COUNTS_PER_GALLON,
     CONF_IDLE_DISCONNECT,
     CONF_INCLUDE,
     CONF_PASSWORD,
     CONF_POLL_IDLE,
     CONF_POLL_WATERING,
     DEFAULT_DURATION,
+    DEFAULT_FLOW_COUNTS_PER_GALLON,
     DEFAULT_IDLE_DISCONNECT,
     DEFAULT_POLL_IDLE,
     DEFAULT_POLL_WATERING,
@@ -103,6 +105,7 @@ class BHyveConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_IDLE_DISCONNECT: DEFAULT_IDLE_DISCONNECT,
                     CONF_POLL_IDLE: DEFAULT_POLL_IDLE,
                     CONF_POLL_WATERING: DEFAULT_POLL_WATERING,
+                    CONF_FLOW_COUNTS_PER_GALLON: DEFAULT_FLOW_COUNTS_PER_GALLON,
                 },
             )
 
@@ -189,5 +192,9 @@ class BHyveOptionsFlow(config_entries.OptionsFlow):
             vol.Required(CONF_POLL_WATERING,
                          default=opts.get(CONF_POLL_WATERING, DEFAULT_POLL_WATERING)):
                 vol.All(vol.Coerce(int), vol.Range(min=5, max=600)),
+            vol.Required(CONF_FLOW_COUNTS_PER_GALLON,
+                         default=opts.get(CONF_FLOW_COUNTS_PER_GALLON,
+                                          DEFAULT_FLOW_COUNTS_PER_GALLON)):
+                vol.All(vol.Coerce(int), vol.Range(min=1, max=100000)),
         })
         return self.async_show_form(step_id="init", data_schema=schema)
