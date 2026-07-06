@@ -615,8 +615,11 @@ class _FakeHass:
         self.jobs.append(target)
 
 
-def _handshaken_conn() -> tuple[BHyveBleConnection, _FakeHass]:
+def _handshaken_conn(reply_header: bytes | None = rx.MSG_HEADER) -> tuple[BHyveBleConnection, _FakeHass]:
+    # Default to a protobuf connection (header-based self-heal enabled); pass
+    # reply_header=None for the mesh path, which has no header check.
     conn = _make_conn()
+    conn._reply_header = reply_header
     conn._handshaken = True
     conn._iv = b"\x00" * 12
     conn._rx_ctr = 0
@@ -650,6 +653,29 @@ def test_ctr_selfheal_ignores_bad_continuation_frame():
     cont = _frame_decrypting_to(conn, b"\x11\x22\x33\x44moredata", conn._rx_ctr)
     conn._on_notify(None, cont)             # continuation: bad header, not first
     assert hass.jobs == []                  # no disconnect scheduled
+
+
+def test_ctr_selfheal_skipped_for_mesh_replies():
+    # Regression (ljmerza PR #24 feedback): mesh d7-47 replies use a
+    # [mesh:2][type][seq][routing] shape, NOT the protobuf inner-message header,
+    # so a mesh connection (reply_header=None) must NOT misclassify its first
+    # bind-step reply as a CTR desync and schedule a disconnect mid-handshake.
+    conn, hass = _handshaken_conn(reply_header=None)
+    mesh_reply = _frame_decrypting_to(conn, bytes.fromhex("d747c10540") + b"\x00" * 6, 0)
+    conn._on_notify(None, mesh_reply)
+    assert hass.jobs == []                  # no disconnect scheduled
+
+
+def test_encrypt_raises_cleanly_when_session_cleared():
+    # A disconnect scheduled mid-handshake nulls _iv; encrypt() must raise a
+    # typed BleHandshakeError (open-retry catches it), not a TypeError from the
+    # keystream (the crash ljmerza hit on the mesh path).
+    from orbit_bhyve.connection import BleHandshakeError
+
+    conn = _make_conn()
+    conn._iv = None
+    with pytest.raises(BleHandshakeError):
+        conn.encrypt(b"\x00\x01\x02\x03")
 
 
 # --- connect/handshake retry is single-level (connection.py) ---------------

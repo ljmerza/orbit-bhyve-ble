@@ -50,6 +50,12 @@ class BHyveBleDeviceBase(abc.ABC):
     # Per-class overrides — defaults are HT25's values.
     frame_magic: int = 0x10
     trailer_const: int = 0x10
+    # First-frame reply header for the connection's CTR-desync self-heal.
+    # None (the mesh default) disables the header-based check: d7-47 mesh replies
+    # use a [mesh:2][type][seq][routing] shape, not the protobuf inner-message
+    # header, so the check would misfire on every mesh reply. The protobuf class
+    # sets this to b"\xaa\x77\x5a\x0f".
+    reply_header: bytes | None = None
     GATT_SETTLE_MS: int = 300
     # Whether the model exposes an inline flow sensor (#57/#59). Gen2 (HT25G2)
     # only per app captures; the XD has no flow screen. Verify on hardware
@@ -102,6 +108,7 @@ class BHyveBleDeviceBase(abc.ABC):
                 self.network_key,
                 frame_magic=self.frame_magic,
                 trailer_const=self.trailer_const,
+                reply_header=self.reply_header,
                 idle_disconnect_sec=idle_disconnect_sec,
                 gatt_settle_ms=self.GATT_SETTLE_MS,
             )

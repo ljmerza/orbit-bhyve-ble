@@ -240,9 +240,12 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         return notifs
 
     async def refresh_state(self):
-        """Probe the device for an idle/watering status. Best-effort: the
-        watering-status response byte layout isn't fully decoded, so we only
-        update is_connected here. Local optimism (set in start/stop) drives
-        is_watering until full status decoding lands."""
+        """Best-effort liveness refresh: update is_connected from the pooled
+        connection without opening one. is_watering is driven by the device's
+        START/STOP ack (_observe_plaintext) and the coordinator's wall-clock
+        auto-close; the STATUS reply's mode byte is decoded too (base
+        _observe_plaintext, 0x04=watering/0x01=idle), but an idle poll doesn't
+        connect to elicit it, so live idle-poll status would need a connect +
+        STATUS query (future enhancement, needs hardware verification)."""
         await super().refresh_state()
         return self.state

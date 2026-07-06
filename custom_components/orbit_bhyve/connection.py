@@ -70,6 +70,7 @@ class BHyveBleConnection:
         *,
         frame_magic: int = 0x10,
         trailer_const: int = 0x10,
+        reply_header: bytes | None = None,
         idle_disconnect_sec: int = 60,
         gatt_settle_ms: int = 300,
     ):
@@ -78,6 +79,12 @@ class BHyveBleConnection:
         self._key = bytes.fromhex(network_key)
         self._frame_magic = frame_magic & 0xFF
         self._trailer_const = trailer_const & 0xFF
+        # First-frame plaintext header used to detect a CTR desync. Protobuf
+        # classes reply with the inner-message header b"\xaa\x77\x5a\x0f"; the
+        # d7-47 mesh classes use a different frame shape ([mesh:2][type][seq]
+        # [routing]...) that legitimately never starts with it, so they pass
+        # None here to skip the header-based desync self-heal entirely.
+        self._reply_header = reply_header
         self._idle_sec = idle_disconnect_sec
         self._gatt_settle_ms = gatt_settle_ms
 
@@ -218,7 +225,11 @@ class BHyveBleConnection:
                 "%s: notif pt=%s (ct=%s)",
                 self.mac, pt.hex(), frame.hex(),
             )
-            if len(pt) >= 4 and pt[:4] != b"\xaa\x77\x5a\x0f":
+            if (
+                self._reply_header is not None
+                and len(pt) >= 4
+                and pt[:4] != self._reply_header
+            ):
                 # Only the FIRST frame of a reply must start with the inner-message
                 # header. A long reply that CTR-streams as consecutive 16-byte blocks
                 # (each its own outer frame) has continuation frames that legitimately
@@ -299,6 +310,14 @@ class BHyveBleConnection:
         return bytes(b ^ k for b, k in zip(plaintext, keystream[:len(plaintext)])), next_ctr
 
     def encrypt(self, plaintext: bytes) -> bytes:
+        if self._iv is None:
+            # A disconnect scheduled via hass.add_job (e.g. a desync self-heal)
+            # can interleave with an in-flight handshake/init sequence across its
+            # awaits and null the session mid-write. Fail cleanly with a typed
+            # error the open-retry can catch, not a TypeError from _aes_keystream.
+            raise BleHandshakeError(
+                f"{self.mac}: cannot encrypt — session cleared (disconnected mid-handshake)"
+            )
         ct, self._tx_ctr = self._aes_xor(self._tx_ctr, plaintext)
         trailer = (sum(plaintext) + self._trailer_const + len(plaintext)) & 0xFFFF
         return bytes([self._frame_magic, len(ct)]) + ct + struct.pack("<H", trailer)

@@ -127,6 +127,9 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
 
     frame_magic = 0x11
     trailer_const = 0x11
+    # Protobuf replies start with the inner-message header; enables the
+    # connection's CTR-desync self-heal (mesh classes leave this None).
+    reply_header = b"\xaa\x77\x5a\x0f"
     log_label = "protobuf"
 
     def _observe_plaintext(self, pt: bytes) -> None:
