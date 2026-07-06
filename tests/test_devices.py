@@ -733,3 +733,51 @@ def test_ensure_connected_does_not_multiply_retries(monkeypatch):
         asyncio.run(conn.ensure_connected())
 
     assert calls["connect"] == OPEN_MAX_ATTEMPTS  # 3, never 9
+
+
+# --- Sync button forces a connect on mesh (regression) ---------------------
+
+class _SyncConn:
+    """Minimal connection that counts connects/disconnects for the Sync test."""
+
+    def __init__(self):
+        self.ensure_connected_calls = 0
+        self.disconnects = 0
+        self._connected = False
+
+    async def ensure_connected(self):
+        self.ensure_connected_calls += 1
+        self._connected = True
+
+    async def disconnect(self):
+        self.disconnects += 1
+        self._connected = False
+
+    @property
+    def is_connected(self):
+        return self._connected
+
+
+def test_sync_button_forces_connect_on_mesh():
+    # Regression (ljmerza PR #24 feedback): #24 dropped the forced connect from
+    # the Sync button and routed it through refresh_state, which on mesh is
+    # passive (no BLE) — so the button became a no-op there (never refreshed
+    # battery/state). async_manual_sync must force a fresh connect (the 8-step
+    # init that refreshes battery/state via _observe_plaintext) and tear it down.
+    dev = object.__new__(BHyveHT25Device)  # bypass HA-heavy __init__
+    dev.mac = "44:67:55:52:94:A1"
+    conn = _SyncConn()
+    dev.connection = conn
+    asyncio.run(dev.async_manual_sync())
+    assert conn.ensure_connected_calls == 1   # forced a fresh connect
+    assert conn.disconnects >= 1              # torn down afterwards (ephemeral)
+
+
+def test_manual_sync_is_noop_for_protobuf():
+    # Protobuf refresh_state connects on its own (#15 read), so the base hook
+    # must NOT add a second connect on the Sync button.
+    dev = _make_device(is_watering=False)
+    conn = _SyncConn()
+    dev.connection = conn
+    asyncio.run(dev.async_manual_sync())
+    assert conn.ensure_connected_calls == 0
