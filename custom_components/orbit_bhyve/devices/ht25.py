@@ -14,6 +14,8 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 
+from bleak.exc import BleakError
+
 from ..connection import BHyveBleConnection
 from .base import BHyveBleDeviceBase
 
@@ -249,3 +251,20 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         STATUS query (future enhancement, needs hardware verification)."""
         await super().refresh_state()
         return self.state
+
+    async def async_manual_sync(self) -> None:
+        """Sync button: this mesh class's periodic refresh_state is passive (it
+        never opens BLE), so force a fresh connect here. The connect-time 8-step
+        init's status (seq 0x02) and info (seq 0x03) replies refresh watering
+        state and battery via _observe_plaintext — the on-demand refresh #24
+        dropped when it stopped forcing a connect on the button. Ephemeral:
+        disconnect afterwards so we don't hold the device's single session."""
+        if self.connection is None:
+            return
+        try:
+            await self.connection.disconnect()
+            await self.connection.ensure_connected()
+        except (BleakError, asyncio.TimeoutError, OSError) as err:
+            _LOGGER.warning("%s: manual sync connect failed: %s", self.mac, err)
+        finally:
+            await self.connection.disconnect()
