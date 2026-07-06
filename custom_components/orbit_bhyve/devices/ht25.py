@@ -189,28 +189,36 @@ class BHyveHT25Device(BHyveBleDeviceBase):
     async def start_watering(self, station: int, duration_sec: int) -> bool:
         if self.connection is None:
             return False
-        # HT25 is single-station; `station` is a no-op placeholder for API parity.
-        # Stash before sending so the START-ack (which can arrive after a write
-        # timeout) can arm the off-timer in _observe_plaintext.
-        self._pending_start_duration = duration_sec
-        self._pending_start_zone = station
-        plaintext = self._build_start(0xB6, duration_sec)
-        _LOGGER.debug("%s: START tx pt=%s", self.mac, plaintext.hex())
-        notifs = await self._send_command(plaintext, "START")
-        self._stamp_command(f"start s={station} d={duration_sec}", len(notifs))
-        # The off-timer is armed by the device's START-ack (_observe_plaintext),
-        # not by send()'s return — so this holds even when the write-response
-        # times out. Report whatever state the ack has produced by now.
-        return self.state.is_watering
+        try:
+            # HT25 is single-station; `station` is a no-op placeholder for API parity.
+            # Stash before sending so the START-ack (which can arrive after a write
+            # timeout) can arm the off-timer in _observe_plaintext.
+            self._pending_start_duration = duration_sec
+            self._pending_start_zone = station
+            plaintext = self._build_start(0xB6, duration_sec)
+            _LOGGER.debug("%s: START tx pt=%s", self.mac, plaintext.hex())
+            notifs = await self._send_command(plaintext, "START")
+            self._stamp_command(f"start s={station} d={duration_sec}", len(notifs))
+            # The off-timer is armed by the device's START-ack (_observe_plaintext),
+            # not by send()'s return — so this holds even when the write-response
+            # times out. Report whatever state the ack has produced by now.
+            return self.state.is_watering
+        finally:
+            if self.connection is not None:
+                await self.connection.disconnect()
 
     async def stop_watering(self, station: int | None = None) -> bool:
         if self.connection is None:
             return False
-        plaintext = self._build_stop(0xB7)
-        _LOGGER.debug("%s: STOP tx pt=%s", self.mac, plaintext.hex())
-        notifs = await self._send_command(plaintext, "STOP")
-        self._stamp_command("stop", len(notifs))
-        return not self.state.is_watering
+        try:
+            plaintext = self._build_stop(0xB7)
+            _LOGGER.debug("%s: STOP tx pt=%s", self.mac, plaintext.hex())
+            notifs = await self._send_command(plaintext, "STOP")
+            self._stamp_command("stop", len(notifs))
+            return not self.state.is_watering
+        finally:
+            if self.connection is not None:
+                await self.connection.disconnect()
 
     async def _send_command(self, plaintext: bytes, label: str) -> list[bytes]:
         """Send a command frame via send_actuation, which re-runs the bind/init

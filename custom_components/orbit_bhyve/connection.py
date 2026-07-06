@@ -10,10 +10,12 @@ Cipher (verified against 257 captured frames + actuated commands):
   TX counter = uint32_LE(init_tx[12:16]); RX counter = init_tx[16:20].
   Frame = [magic][len][ciphertext (len bytes)][trailer u16_LE].
   Trailer = sum(plaintext) + trailer_const + len.
-WRITE_REQ (response=True) is required — WRITE_CMD is silently dropped. The
-device acks via NOTIFICATION, not an ATT Write Response; the ESPHome BLE proxy
-doesn't relay the (absent) write response, so writes are sent with a capped
-wait (WRITE_ACK_TIMEOUT_SEC) and the notification drain is the real ack.
+Commands use WRITE_REQ (response=True) for its ATT delivery ack; char 6c72 also
+advertises write-without-response, and both modes have been observed to actuate
+the HT34A (fw0107), so WRITE_REQ is a safe default across device classes. The
+device's higher-level ack is a NOTIFICATION, not an ATT Write Response — the
+ESPHome BLE proxy never relays the (absent) write response, so writes wait only
+a capped WRITE_ACK_TIMEOUT_SEC and the notification drain is the real ack.
 """
 from __future__ import annotations
 
@@ -24,6 +26,7 @@ import struct
 from collections.abc import Awaitable, Callable
 
 from bleak import BleakClient
+from bleak.exc import BleakError
 from bleak_retry_connector import establish_connection
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -31,19 +34,26 @@ from .const import AES_CHAR, READ_CHAR, WRITE_CHAR
 
 _LOGGER = logging.getLogger(__name__)
 
-# Cap on waiting for an ATT Write Response that the device never sends (it acks
-# via notification instead). Over a direct link the response arrives in <200ms;
-# over the ESPHome proxy it never comes, so we proceed after this. The device's
-# notification ack arrives in ~50-150ms, so this is a generous floor that still
-# keeps cold-start init (8 writes) under ~7s.
-WRITE_ACK_TIMEOUT_SEC = 0.8
-
-# The connect succeeds even on a weak proxy link, but the post-connect handshake
-# (subscribe + AES read/write) can stall on a marginal signal. Bound it so it
-# fails cleanly instead of wedging the connection, and retry the whole open a
-# few times — a clean retry often catches a good GATT window.
+# A connect can succeed on a weak/proxy link while the post-connect handshake
+# (subscribe + AES write/read) stalls with no natural timeout — wedging the
+# pooled connection for ~30s and leaking it. Bound the handshake and retry the
+# whole open, disconnecting between tries; healthy links pass on attempt 1.
 HANDSHAKE_TIMEOUT_SEC = 10.0
 OPEN_MAX_ATTEMPTS = 3
+
+# The device acks a command via NOTIFICATION, not an ATT Write Response. Over a
+# direct link the (unused) write response still arrives in <200ms, but over an
+# ESPHome BLE proxy it is never relayed — so a response=True write would block
+# ~30s. Cap the wait; the notification drain in send() is the real ack.
+WRITE_ACK_TIMEOUT_SEC = 0.8
+
+# Event-driven drain: the reply usually lands in 50-150ms and a status burst
+# arrives as a few frames, but an ack-then-status reply can gap ~150ms between
+# the small ack and the richer #16 status (observed 147ms in a live capture).
+# So after the first frame, keep the drain window open only until no new frame
+# has arrived for this long — returning ~4x faster than sleeping the full
+# drain_ms, without truncating a multi-frame reply. drain_ms remains the hard cap.
+NOTIF_QUIET_SEC = 0.35
 
 PostHandshakeHook = Callable[["BHyveBleConnection"], Awaitable[None]]
 PlaintextObserver = Callable[[bytes], None]
@@ -61,6 +71,7 @@ class BHyveBleConnection:
         frame_magic: int = 0x10,
         trailer_const: int = 0x10,
         idle_disconnect_sec: int = 60,
+        gatt_settle_ms: int = 300,
     ):
         self.hass = hass
         self.mac = mac
@@ -68,6 +79,7 @@ class BHyveBleConnection:
         self._frame_magic = frame_magic & 0xFF
         self._trailer_const = trailer_const & 0xFF
         self._idle_sec = idle_disconnect_sec
+        self._gatt_settle_ms = gatt_settle_ms
 
         self._client: BleakClient | None = None
         self._iv: bytes | None = None
@@ -75,6 +87,7 @@ class BHyveBleConnection:
         self._rx_ctr: int = 0
         self._lock = asyncio.Lock()
         self._notif_buf: list[bytes] = []
+        self._notif_event = asyncio.Event()  # set on every notification; drives _drain
         self._last_rx_frame: bytes | None = None  # last raw RX frame, for de-dup
         self._handshaken = False
         self._post_handshake_hook: PostHandshakeHook | None = None
@@ -98,30 +111,21 @@ class BHyveBleConnection:
         self._plaintext_observer = observer
 
     async def ensure_connected(self) -> None:
-        """Connect + handshake if not already pooled, retrying the whole open a
-        few times. On a marginal proxy link the connect succeeds but the
-        handshake GATT exchange can stall; a clean retry usually gets through,
-        and the bounded handshake means we fail cleanly rather than wedging.
-        Call inside a lock if you need exclusive access; idempotent otherwise."""
+        """Connect + handshake if not already pooled. _open() retries the whole
+        connect+handshake OPEN_MAX_ATTEMPTS times internally: on a marginal proxy
+        link the connect succeeds but the handshake GATT exchange can stall, and
+        a clean retry usually gets through while the bounded handshake means we
+        fail cleanly rather than wedging. Call inside a lock if you need
+        exclusive access; idempotent otherwise."""
         if self.is_connected and self._handshaken:
             return
-        last_err: Exception | None = None
-        for attempt in range(1, OPEN_MAX_ATTEMPTS + 1):
-            try:
-                await self._open()
-                return
-            except (BleHandshakeError, asyncio.TimeoutError) as err:
-                last_err = err
-                _LOGGER.debug(
-                    "%s: open attempt %d/%d failed: %s",
-                    self.mac, attempt, OPEN_MAX_ATTEMPTS, err,
-                )
-                await self.disconnect()
-                if attempt < OPEN_MAX_ATTEMPTS:
-                    await asyncio.sleep(0.5)
-        raise BleHandshakeError(
-            f"{self.mac}: handshake failed after {OPEN_MAX_ATTEMPTS} attempts: {last_err}"
-        )
+        # _open() already retries OPEN_MAX_ATTEMPTS times internally; don't wrap
+        # it in a second retry loop or the attempts multiply (3x3=9 handshakes,
+        # ~90-150s on a stalling device). One call = one bounded retry budget.
+        try:
+            await self._open()
+        except (BleHandshakeError, asyncio.TimeoutError) as err:
+            raise BleHandshakeError(f"{self.mac}: handshake failed: {err}") from err
 
     async def _open(self) -> None:
         from homeassistant.components.bluetooth import async_ble_device_from_address
@@ -130,45 +134,41 @@ class BHyveBleConnection:
         if ble_device is None:
             raise BleNotConnectable(f"{self.mac}: not in range of any connectable BLE adapter")
 
-        _LOGGER.debug("%s: connecting", self.mac)
-        self._client = await establish_connection(BleakClient, ble_device, self.mac, max_attempts=3)
-        _LOGGER.debug("%s: connected", self.mac)
+        last_err: Exception | None = None
+        for attempt in range(1, OPEN_MAX_ATTEMPTS + 1):
+            try:
+                _LOGGER.debug("%s: connecting (attempt %d/%d)", self.mac, attempt, OPEN_MAX_ATTEMPTS)
+                self._client = await establish_connection(
+                    BleakClient, ble_device, self.mac, max_attempts=3
+                )
+                _LOGGER.debug("%s: connected", self.mac)
+                if self._gatt_settle_ms > 0:
+                    await asyncio.sleep(self._gatt_settle_ms / 1000.0)
+                # Bound the handshake: on a marginal link the connect succeeds
+                # but the GATT exchange below can hang indefinitely.
+                await asyncio.wait_for(self._handshake(), timeout=HANDSHAKE_TIMEOUT_SEC)
+            except (asyncio.TimeoutError, BleakError, OSError, BleHandshakeError) as err:
+                last_err = err
+                _LOGGER.debug(
+                    "%s: open attempt %d/%d failed: %s", self.mac, attempt, OPEN_MAX_ATTEMPTS, err
+                )
+                await self.disconnect()  # clean slate so the retry gets a fresh GATT window
+                if attempt < OPEN_MAX_ATTEMPTS:
+                    await asyncio.sleep(0.5)  # space out retries on a marginal link
+                continue
+            # Handshake succeeded — run the per-device-class init, then we're open.
+            if self._post_handshake_hook is not None:
+                await self._post_handshake_hook(self)
+            return
 
-        # Note: tried writing the provisioning frame [0x01 0x00 || key] to
-        # NETWORK_CHAR (0x6c76) here — char is firmware-locked on every
-        # device tested ("Write not permitted"). Confirmed not the actual
-        # mechanism for fw0041 the v1 commit fad91eae assumed.
-
-        # The post-connect handshake (subscribe + AES read/write) is the part
-        # that stalls on a marginal link, so bound it — ensure_connected()
-        # retries the whole open on timeout.
-        try:
-            await asyncio.wait_for(self._handshake(), timeout=HANDSHAKE_TIMEOUT_SEC)
-        except asyncio.TimeoutError as err:
-            raise BleHandshakeError(
-                f"{self.mac}: handshake timed out after {HANDSHAKE_TIMEOUT_SEC}s"
-            ) from err
-
-        # One-shot GATT enumeration — looking for standard Battery Service
-        # (0x180F / 0x2A19) or anything else the device exposes that we
-        # haven't been using. Logged at INFO for reverse-engineering work.
-        try:
-            for service in self._client.services:
-                _LOGGER.info("%s: gatt svc %s", self.mac, service.uuid)
-                for char in service.characteristics:
-                    _LOGGER.info(
-                        "%s:   char %s props=%s",
-                        self.mac, char.uuid, list(char.properties),
-                    )
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("%s: gatt enum failed: %s", self.mac, err)
-
-        if self._post_handshake_hook is not None:
-            await self._post_handshake_hook(self)
+        raise BleHandshakeError(
+            f"{self.mac}: open failed after {OPEN_MAX_ATTEMPTS} attempts: {last_err}"
+        )
 
     async def _handshake(self) -> None:
         """Subscribe + AES handshake. Bounded by a timeout in _open() because
-        these GATT reads/writes are what stall on a weak link."""
+        these GATT reads/writes are what stall on a weak link. The
+        post-handshake hook and open-retry are driven by _open()."""
         # Subscribe BEFORE writing — device may stay silent otherwise.
         self._notif_buf.clear()
         self._last_rx_frame = None  # fresh CTR stream — don't dedup across sessions
@@ -209,6 +209,7 @@ class BHyveBleConnection:
             return
         self._last_rx_frame = frame
         self._notif_buf.append(frame)
+        self._notif_event.set()  # wake any in-flight drain (see _drain)
         if not self._handshaken or self._iv is None:
             return
         try:
@@ -217,8 +218,30 @@ class BHyveBleConnection:
                 "%s: notif pt=%s (ct=%s)",
                 self.mac, pt.hex(), frame.hex(),
             )
+            if len(pt) >= 4 and pt[:4] != b"\xaa\x77\x5a\x0f":
+                # Only the FIRST frame of a reply must start with the inner-message
+                # header. A long reply that CTR-streams as consecutive 16-byte blocks
+                # (each its own outer frame) has continuation frames that legitimately
+                # do NOT — none of the capabilities wired today produce those, but
+                # Program reads (#19, Phase 4) will. _notif_buf is cleared before each
+                # write, so len<=1 means this is the reply's first frame: a bad header
+                # there is a real CTR desync → self-heal. A bad header on a later frame
+                # is a continuation (or a mid-stream desync we recover on the next
+                # reply), so don't tear the session down under it. (Full multi-frame
+                # reassembly in the observer is deferred to the Programs phase.)
+                if len(self._notif_buf) <= 1:
+                    _LOGGER.warning(
+                        "%s: CTR desync detected (bad header %s) — scheduling disconnect to self-heal",
+                        self.mac, pt[:4].hex(),
+                    )
+                    self.hass.add_job(self.disconnect)
+                return
         except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("%s: notif decrypt failed: %s raw=%s", self.mac, err, frame.hex())
+            _LOGGER.warning(
+                "%s: CTR desync detected (decrypt failed: %s) — scheduling disconnect to self-heal",
+                self.mac, err,
+            )
+            self.hass.add_job(self.disconnect)
             return
         if self._plaintext_observer is not None:
             try:
@@ -290,14 +313,13 @@ class BHyveBleConnection:
         return pt
 
     async def _write_locked(self, plaintext: bytes) -> None:
-        """Encrypt + WRITE_REQ. Caller MUST already hold self._lock and have
+        """Encrypt + write. Caller MUST already hold self._lock and have
         an established connection. Used by send()/send_raw() and by the
         post-handshake hook (which runs inside _open() inside the lock)."""
         frame = self.encrypt(plaintext)
         assert self._client is not None
-        # WRITE_CHAR (6c72) requires a Write Request (response=True) — the device
-        # silently drops Write Commands. But it answers via NOTIFICATION and, on
-        # some transports (notably the ESPHome Bluetooth proxy), the ATT Write
+        # WRITE_CHAR (6c72) uses a Write Request (response=True). Over some
+        # transports (notably the ESPHome Bluetooth proxy), the ATT Write
         # Response is never relayed back, so a plain response=True write blocks
         # ~30s. Issue the Write Request but cap the wait; the notification drain
         # in send() is the real ack. Over a direct link the response arrives in
@@ -310,14 +332,36 @@ class BHyveBleConnection:
         except asyncio.TimeoutError:
             pass
 
+    async def _drain(self, drain_ms: int) -> None:
+        """Collect the device's reply, returning as soon as it goes quiet
+        instead of always sleeping the full drain window. Wake on the first
+        notification, then hold the window open only while frames keep arriving
+        (NOTIF_QUIET_SEC between them), hard-capped at drain_ms so a silent
+        device still returns on time. Call with _notif_buf freshly cleared."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + drain_ms / 1000.0
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            # Clear before snapshotting the buffer: a frame arriving from here
+            # on re-sets the event and wakes us; a frame already buffered means
+            # we're settling and should wait only a short quiet window for more.
+            self._notif_event.clear()
+            timeout = min(NOTIF_QUIET_SEC, remaining) if self._notif_buf else remaining
+            try:
+                await asyncio.wait_for(self._notif_event.wait(), timeout)
+            except asyncio.TimeoutError:
+                return  # no new frame within the window -> reply complete (or silent)
+
     async def send(self, plaintext: bytes, *, drain_ms: int = 1500) -> list[bytes]:
-        """Encrypt + WRITE_REQ + drain notifications for `drain_ms`. Returns
-        the list of raw notification frames received."""
+        """Encrypt + WRITE_REQ + drain notifications until the reply goes quiet
+        (bounded by `drain_ms`). Returns the raw notification frames received."""
         async with self._lock:
             await self.ensure_connected()
             self._notif_buf.clear()
             await self._write_locked(plaintext)
-            await asyncio.sleep(drain_ms / 1000.0)
+            await self._drain(drain_ms)
             received = list(self._notif_buf)
             self._notif_buf.clear()
             self._arm_idle_timer()
@@ -333,10 +377,12 @@ class BHyveBleConnection:
     async def send_actuation(self, plaintext: bytes, *, drain_ms: int = 1500) -> list[bytes]:
         """Re-run the per-device init sequence, then send a command — atomically.
 
-        HT25 only honours a watering command in a freshly-initialised session:
-        a pooled connection's bind goes stale, so the command is ack'd but
-        SILENTLY IGNORED (no actuation). Re-run the full init before every
-        actuation rather than trusting the pooled session."""
+        Some devices only honour a watering command in a freshly-initialised
+        session: a pooled connection's per-class bind/init goes stale, so the
+        command is ack'd but SILENTLY IGNORED (no actuation). Re-run the init
+        hook before the command rather than trusting the pooled session. For a
+        device class with no post-handshake hook this is just ensure_connected
+        + send."""
         async with self._lock:
             if self.is_connected and self._handshaken:
                 # Pooled connection — refresh the (possibly stale) bind in place.
@@ -347,7 +393,7 @@ class BHyveBleConnection:
                 await self.ensure_connected()
             self._notif_buf.clear()
             await self._write_locked(plaintext)
-            await asyncio.sleep(drain_ms / 1000.0)
+            await self._drain(drain_ms)
             received = list(self._notif_buf)
             self._notif_buf.clear()
             self._arm_idle_timer()

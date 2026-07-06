@@ -38,24 +38,24 @@ def resolve_device_class(*, hardware: str, firmware: str, type_: str) -> type[BH
         # the hardware suffix or fw so HT25-0000 (fw0041/0085) is untouched.
         if (hardware or "").startswith("HT25G2") or firmware == "0111":
             return BHyveHT25G2Device
-        # fw0085 (Deck) keeps the pre-fix code path that empirically actuated
-        # on 2026-05-03. fw0041 (Hill, Corner) and any future fw use the
-        # parameterized BHyveHT25Device.
+        # HT25-0000 mesh (d7-47) firmwares. fw0085 keeps upstream's thin
+        # subclass (retains _rebind_sid_delta=3, community-verified); fw0041 and
+        # any other fw use the parameterized base, which builds frames from the
+        # device's own mesh_device_id (not a hardcoded identity).
         if firmware == "0085":
             return BHyveHT25Fw0085Device
         return BHyveHT25Device
     if (hardware or "").startswith("HT34"):
         # Both HT34A-0001 and HT34-0001 (fw0058) use the protobuf XD protocol.
-        # HT34A-0001/fw0107 is hardware-verified (issue #16). The older HT34
-        # sharing it is the stuartdenne fork's claim (2026-06-27), still not
-        # independently verified on hardware here.
+        # The older HT34 sharing it is the stuartdenne fork's claim (2026-06-27),
+        # not independently verified on hardware here.
         return BHyveHT34ADevice
     if (hardware or "").startswith("HT32"):
         # HT32A-0001 (fw0107) is the 2-port XD sibling of the HT34A: same
         # firmware, same protobuf-over-CRC16 protocol (magic 0x11), fewer
         # stations. Station count flows from the cloud record, so the 4-port
-        # class handles a 2-port unit unchanged. Verified end-to-end on 3x
-        # HT32A units — open/close actuation confirmed (issue #13).
+        # class handles a 2-port unit unchanged. Untested on hardware here
+        # (issue #13) — same caveat as HT34A.
         return BHyveHT34ADevice
     raise UnsupportedModel(hardware or "?", firmware or "?")
 

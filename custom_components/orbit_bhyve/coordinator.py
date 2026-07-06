@@ -78,6 +78,12 @@ class BHyveDeviceCoordinator(DataUpdateCoordinator[DeviceState]):
                 state.seconds_remaining = max(
                     0, int((state.expected_off_at - now).total_seconds())
                 )
+        # Rain-delay expiry (wall clock): once the stored end passes, clear the
+        # display immediately rather than waiting for the next status poll — so
+        # "Rain delay" and "Rain delay ends" don't linger past the delay's end.
+        if state.rain_delay_ends is not None and datetime.now(timezone.utc) >= state.rain_delay_ends:
+            state.rain_delay_minutes = 0
+            state.rain_delay_ends = None
         # Adjust polling cadence based on observed state. While watering, if
         # we're inside the final stretch (expiry+grace lands sooner than the
         # next watering-cadence tick would), shorten just enough to land the

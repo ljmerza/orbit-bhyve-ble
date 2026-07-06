@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import abc
+import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -9,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..connection import BHyveBleConnection
+from ..const import DEFAULT_FLOW_COUNTS_PER_GALLON
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -26,12 +28,19 @@ class DeviceState:
     is_watering: bool = False
     active_zone: int | None = None
     seconds_remaining: int | None = None
+    flow_total: int | None = None  # #59.#3 raw cumulative counter (transient; feeds flow_gpm)
+    flow_gpm: float | None = None  # instantaneous flow rate from read_flow's slope (Gen2)
     started_at: datetime | None = None
     expected_off_at: datetime | None = None
     last_command_at: datetime | None = None
     last_command_label: str | None = None
     is_connected: bool = False
     notifications_last_cmd: int = 0
+    device_clock: int | None = None  # #7 device clock, Unix epoch seconds
+    rain_delay_minutes: int | None = None
+    rain_delay_ends: datetime | None = None
+    last_successful_poll: datetime | None = None
+    consecutive_timeouts: int = 0
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -41,6 +50,11 @@ class BHyveBleDeviceBase(abc.ABC):
     # Per-class overrides — defaults are HT25's values.
     frame_magic: int = 0x10
     trailer_const: int = 0x10
+    GATT_SETTLE_MS: int = 300
+    # Whether the model exposes an inline flow sensor (#57/#59). Gen2 (HT25G2)
+    # only per app captures; the XD has no flow screen. Verify on hardware
+    # before trusting (the `flow` CLI probes both) — see docs/ble_protocol.md.
+    has_flow: bool = False
 
     def __init__(
         self,
@@ -48,8 +62,12 @@ class BHyveBleDeviceBase(abc.ABC):
         record: dict[str, Any],
         *,
         idle_disconnect_sec: int = 60,
+        flow_counts_per_gallon: int = DEFAULT_FLOW_COUNTS_PER_GALLON,
     ):
         self.hass = hass
+        # Counts→gallons scale for the flow sensor (Gen2). Configurable per
+        # install via the options flow; read_flow divides the counter slope by it.
+        self.flow_counts_per_gallon = flow_counts_per_gallon
         self.cloud_id: str = record["cloud_id"]
         self.name: str = record["name"]
         self.mac: str = record["mac"]
@@ -60,8 +78,16 @@ class BHyveBleDeviceBase(abc.ABC):
         self.mesh_device_id: int | None = record.get("mesh_device_id")
         self.bridge_device_id: str | None = record.get("bridge_device_id")
         self.hub_mesh_device_id: int | None = record.get("hub_mesh_device_id")
-        self.battery_pct: int | None = record.get("battery_pct")
-        self.battery_mv: int | None = record.get("battery_mv")
+        # Battery is read LIVE over BLE (#16.#14.#3 / mesh info-ack) and is the
+        # only source we trust. Deliberately NOT seeded from the cloud snapshot in
+        # `record`: the cloud reports on a chemistry-aware discharge curve that
+        # disagrees with our linear _mv_to_pct (esp. for NiMH), so seeding it
+        # painted a wrong value — inconsistent with the voltage sensor — into the
+        # battery sensor's long-term statistics at every startup, until the first
+        # poll replaced it. Start unknown; apply_status_plaintext fills these in
+        # from the device on the first successful poll.
+        self.battery_pct: int | None = None
+        self.battery_mv: int | None = None
         self.network_key: str = record["network_key"]
         self.state = DeviceState()
         # Optional callback a coordinator registers so an out-of-band state
@@ -77,6 +103,7 @@ class BHyveBleDeviceBase(abc.ABC):
                 frame_magic=self.frame_magic,
                 trailer_const=self.trailer_const,
                 idle_disconnect_sec=idle_disconnect_sec,
+                gatt_settle_ms=self.GATT_SETTLE_MS,
             )
             self.connection.set_post_handshake_hook(self._post_handshake)
             self.connection.set_plaintext_observer(self._observe_plaintext)
@@ -94,6 +121,12 @@ class BHyveBleDeviceBase(abc.ABC):
     @property
     def unique_id(self) -> str:
         return f"orbit_bhyve_{self.mac.replace(':', '').lower()}"
+
+    @property
+    def _api_lock(self) -> asyncio.Lock:
+        if not hasattr(self, "_api_lock_var"):
+            self._api_lock_var = asyncio.Lock()
+        return self._api_lock_var
 
     async def async_setup(self) -> None:
         """Hook for device classes that want pre-warming. Default: no-op."""
@@ -115,28 +148,31 @@ class BHyveBleDeviceBase(abc.ABC):
         """Override to send per-class init frames after the AES handshake."""
 
     def _observe_plaintext(self, pt: bytes) -> None:
-        """Parse battery_mV out of every info-ack notification.
+        """Parse d7-47 mesh status replies: battery (seq 0x03) and watering
+        state (seq 0x02).
 
-        d7-47 frame layout: [mesh:2][type:1][seq:1][routing:1][payload:N].
-        seq=0x03 is the device-info command; the response (type byte has
-        the 0x40 reply bit set, routing=0x40) carries a 7-byte payload
-        whose bytes 4-5 are battery voltage as little-endian uint16.
-        Verified against fw0085 (Deck) and fw0041 (Hill, Corner) by
-        cross-checking with cloud snapshots: Hill 2601 vs 2602, Corner
-        2606 vs 2606, Deck May 2 sessions traced 2872→2835 mV (discharge)."""
-        if len(pt) < 12:
+        Frame layout: [mesh:2][type:1][seq:1][routing:1][payload:N]. Replies
+        set the 0x40 reply bit in the type byte and carry routing=0x40 (TX
+        echoes with the bit clear are skipped). Verified against fw0085 (Deck)
+        and fw0041 (Hill, Corner) cross-checked with cloud snapshots."""
+        if len(pt) < 6 or pt[4] != 0x40 or not (pt[2] & 0x40):
             return
-        if pt[3] != 0x03 or pt[4] != 0x40:
-            return
-        if not (pt[2] & 0x40):
-            # TX echoes (response bit clear) carry the same shape; skip.
-            return
-        mv = int.from_bytes(pt[9:11], "little")
-        if not 1500 <= mv <= 4000:
-            # Out-of-band — probably a malformed parse; don't poison state.
-            return
-        self.battery_mv = mv
-        self.battery_pct = _mv_to_pct(mv)
+        seq = pt[3]
+        if seq == 0x03 and len(pt) >= 12:
+            # Info-ack: payload bytes 4-5 (pt[9:11]) are battery mV, LE.
+            mv = int.from_bytes(pt[9:11], "little")
+            if 1500 <= mv <= 4000:  # out-of-band => malformed; don't poison state
+                self.battery_mv = mv
+                self.battery_pct = _mv_to_pct(mv)
+        elif seq == 0x02 and len(pt) >= 6:
+            # Status reply/push: payload[0] (pt[5]) is the watering mode —
+            # 0x04 = watering, 0x01 = idle. Authoritative device state, used to
+            # confirm an actuation actually took.
+            mode = pt[5]
+            if mode == 0x04:
+                self.state.is_watering = True
+            elif mode == 0x01:
+                self.state.is_watering = False
 
     @abc.abstractmethod
     async def start_watering(self, station: int, duration_sec: int) -> bool:

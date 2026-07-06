@@ -80,6 +80,8 @@ class BHyveZoneValve(CoordinatorEntity[BHyveDeviceCoordinator], ValveEntity):
         return {
             "station": self._station,
             "seconds_remaining": state.seconds_remaining,
+            "rain_delay_minutes": state.rain_delay_minutes,
+            "rain_delay_ends": state.rain_delay_ends,
             "last_command": state.last_command_label,
             "last_command_at": state.last_command_at,
             "notifications_last_cmd": state.notifications_last_cmd,

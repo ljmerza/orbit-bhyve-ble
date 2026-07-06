@@ -43,11 +43,23 @@ CONF_DEFAULT_DURATION = "default_duration_sec"
 CONF_IDLE_DISCONNECT = "idle_disconnect_sec"
 CONF_POLL_IDLE = "poll_idle_sec"
 CONF_POLL_WATERING = "poll_watering_sec"
+CONF_FLOW_COUNTS_PER_GALLON = "flow_counts_per_gallon"
 
 DEFAULT_DURATION = 600
 DEFAULT_IDLE_DISCONNECT = 60
-DEFAULT_POLL_IDLE = 300
+DEFAULT_POLL_IDLE = 900  # 15 min — an idle status poll (#15) connects over BLE, so keep
+                         # the cadence gentle on the AA-powered valves; most program runs
+                         # last longer and get picked up at least once. Tunable in the
+                         # Configure dialog (Poll idle).
 DEFAULT_POLL_WATERING = 30
+
+# Flow (Gen2 #59.#3) is a CUMULATIVE per-run volume counter in raw device units,
+# not gpm. To convert the counter to gallons, divide by this factor (exposed as
+# the "Flow calibration" option so a user can re-calibrate their own install).
+# DEFAULT MEASURED 2026-07-03 on BTValve01: a 44.5 s flow window logged +1443
+# counts while a bucket collected 3.33 gal over the same window → 1443 / 3.33 ≈
+# 433 counts/gal (self-consistent: 3.33 gal / 44.5 s = 4.49 gpm matches the slope).
+DEFAULT_FLOW_COUNTS_PER_GALLON = 433
 
 # Stored shape per device under entry.data["devices"]:
 #   {
