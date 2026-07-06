@@ -1,0 +1,7 @@
+# Test-only deps. The suite exercises the pure protocol/dispatch logic and does
+# NOT require Home Assistant — conftest.py registers a lightweight orbit_bhyve
+# namespace so the submodules import without the HA-heavy package __init__.
+pytest>=8.0
+# Runtime deps pulled in transitively by the device/connection modules:
+bleak-retry-connector>=3.5.0
+cryptography>=42.0
