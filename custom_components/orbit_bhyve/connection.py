@@ -405,8 +405,22 @@ class BHyveBleConnection:
         async with self._lock:
             if self.is_connected and self._handshaken:
                 # Pooled connection — refresh the (possibly stale) bind in place.
-                if self._post_handshake_hook is not None:
-                    await self._post_handshake_hook(self)
+                # But over an ESPHome proxy the pooled link can already be dead at
+                # the GATT layer while is_connected still reads True, so the refresh
+                # writes fail with BleakError ("Not connected"). Don't let that
+                # surface as a failed actuation: drop the stale session and reopen
+                # a fresh one (ensure_connected re-runs the hook). HW-observed on a
+                # mesh HT25 STOP over a proxy — the very next fresh connect landed.
+                try:
+                    if self._post_handshake_hook is not None:
+                        await self._post_handshake_hook(self)
+                except (BleakError, OSError, asyncio.TimeoutError) as err:
+                    _LOGGER.debug(
+                        "%s: pooled bind refresh failed (%s) — reopening a fresh session",
+                        self.mac, err,
+                    )
+                    await self.disconnect()
+                    await self.ensure_connected()
             else:
                 # Cold — ensure_connected() retries the open and runs the hook.
                 await self.ensure_connected()

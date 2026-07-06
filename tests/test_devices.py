@@ -733,3 +733,61 @@ def test_ensure_connected_does_not_multiply_retries(monkeypatch):
         asyncio.run(conn.ensure_connected())
 
     assert calls["connect"] == OPEN_MAX_ATTEMPTS  # 3, never 9
+
+
+# --- stale pooled session self-heals on actuation (connection.py) ----------
+
+def test_send_actuation_reopens_when_pooled_bind_refresh_fails():
+    # Regression (ljmerza PR #24 hardware feedback): over an ESPHome proxy a
+    # pooled session can be dead at the GATT layer while is_connected still reads
+    # True. send_actuation's in-place bind refresh then fails with BleakError
+    # ("Not connected") — which must NOT propagate to the caller (it surfaced as
+    # a failed close_valve service call in HA). Instead send_actuation drops the
+    # stale session and reopens a fresh one, then completes the command write.
+    from bleak.exc import BleakError
+
+    conn = _make_conn()
+    conn._handshaken = True
+
+    class _StaleClient:
+        is_connected = True  # is_connected property → True → pooled-refresh branch
+
+        async def disconnect(self):
+            pass
+
+    conn._client = _StaleClient()
+
+    calls = {"hook": 0, "disconnect": 0, "ensure_connected": 0, "writes": []}
+
+    async def _hook(_c):
+        calls["hook"] += 1
+        if calls["hook"] == 1:
+            # Stale pooled link: the first bind-refresh write fails at the proxy.
+            raise BleakError("Bluetooth GATT Error ... Not connected")
+
+    async def _disconnect():
+        calls["disconnect"] += 1
+
+    async def _ensure_connected():
+        calls["ensure_connected"] += 1
+
+    async def _write_locked(pt):
+        calls["writes"].append(pt)
+
+    async def _drain(_ms):
+        pass
+
+    conn.set_post_handshake_hook(_hook)
+    conn.disconnect = _disconnect
+    conn.ensure_connected = _ensure_connected
+    conn._write_locked = _write_locked
+    conn._drain = _drain
+    conn._arm_idle_timer = lambda: None
+
+    # Must not raise, even though the pooled bind refresh failed.
+    result = asyncio.run(conn.send_actuation(b"\xaa\xbb", drain_ms=1))
+
+    assert calls["disconnect"] == 1          # stale session dropped
+    assert calls["ensure_connected"] == 1    # fresh session reopened
+    assert calls["writes"] == [b"\xaa\xbb"]  # command still written after recovery
+    assert result == []
