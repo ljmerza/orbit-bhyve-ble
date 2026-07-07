@@ -158,6 +158,21 @@ class BHyveBleDeviceBase(abc.ABC):
         if self._state_changed_cb is not None:
             self._state_changed_cb()
 
+    def _mark_reached(self) -> None:
+        """Record a successful device reach for the connectivity diagnostics
+        (Connected / Last successful poll / Consecutive timeouts). Connectivity
+        is EVENT-DRIVEN under the ephemeral connect-on-demand model: the live
+        socket is torn down between operations, so "reachable" means the last
+        reach succeeded — not that a socket is open right now."""
+        self.state.is_connected = True
+        self.state.last_successful_poll = datetime.now(timezone.utc)
+        self.state.consecutive_timeouts = 0
+
+    def _mark_unreachable(self) -> None:
+        """Record a failed device reach (couldn't connect / talk to the device)."""
+        self.state.is_connected = False
+        self.state.consecutive_timeouts += 1
+
     async def _post_handshake(self, conn: BHyveBleConnection) -> None:
         """Override to send per-class init frames after the AES handshake."""
 
@@ -197,10 +212,14 @@ class BHyveBleDeviceBase(abc.ABC):
         ...
 
     async def refresh_state(self) -> DeviceState:
-        """Default: only refresh BLE-connection liveness. Subclasses can extend
-        with a status-request roundtrip."""
-        if self.connection is not None:
-            self.state.is_connected = self.connection.is_connected
+        """Default (mesh): passive — return the last-known state without opening
+        BLE. Connectivity is event-driven (stamped on each real device reach via
+        _mark_reached / _mark_unreachable), so a passive poll must NOT overwrite
+        state.is_connected with the transient live socket: under the ephemeral
+        model that socket is torn down between operations and would read False
+        even right after a successful reach, pinning the Connected sensor off.
+        Subclasses that connect every poll (protobuf's #15 read) override this
+        and stamp connectivity themselves."""
         return self.state
 
     @property

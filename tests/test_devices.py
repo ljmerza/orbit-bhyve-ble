@@ -766,6 +766,7 @@ def test_sync_button_forces_connect_on_mesh():
     # init that refreshes battery/state via _observe_plaintext) and tear it down.
     dev = object.__new__(BHyveHT25Device)  # bypass HA-heavy __init__
     dev.mac = "44:67:55:52:94:A1"
+    dev.state = DeviceState()
     conn = _SyncConn()
     dev.connection = conn
     asyncio.run(dev.async_manual_sync())
@@ -781,3 +782,65 @@ def test_manual_sync_is_noop_for_protobuf():
     dev.connection = conn
     asyncio.run(dev.async_manual_sync())
     assert conn.ensure_connected_calls == 0
+
+
+# --- event-driven mesh connectivity (Connected sensor) ---------------------
+
+def test_manual_sync_marks_connected_on_success():
+    # A Sync that reaches the device must flip the Connected diagnostic on and
+    # stamp last_successful_poll / clear consecutive_timeouts. Event-driven,
+    # because the ephemeral disconnect closes the socket before the coordinator
+    # refresh runs — reading the live socket then would read False.
+    dev = object.__new__(BHyveHT25Device)
+    dev.mac = "44:67:55:52:94:A1"
+    dev.state = DeviceState(consecutive_timeouts=3)
+    dev.connection = _SyncConn()
+    asyncio.run(dev.async_manual_sync())
+    assert dev.state.is_connected is True
+    assert dev.state.consecutive_timeouts == 0
+    assert dev.state.last_successful_poll is not None
+
+
+class _FailSyncConn:
+    """A connection whose connect always fails (device unreachable)."""
+
+    async def disconnect(self):
+        pass
+
+    async def ensure_connected(self):
+        from bleak.exc import BleakError
+        raise BleakError("Not connected")
+
+    @property
+    def is_connected(self):
+        return False
+
+
+def test_manual_sync_marks_unreachable_on_failure():
+    # A Sync that can't reach the device flips Connected off and counts a timeout
+    # (and must not raise — the button/service call stays healthy).
+    dev = object.__new__(BHyveHT25Device)
+    dev.mac = "44:67:55:52:94:A1"
+    dev.state = DeviceState(is_connected=True, consecutive_timeouts=0)
+    dev.connection = _FailSyncConn()
+    asyncio.run(dev.async_manual_sync())
+    assert dev.state.is_connected is False
+    assert dev.state.consecutive_timeouts == 1
+
+
+def test_mesh_passive_poll_does_not_clobber_connected():
+    # The passive mesh poll must NOT overwrite event-driven connectivity with the
+    # torn-down live socket (which reads False under the ephemeral model) — doing
+    # so pinned the Connected sensor off right after a successful reach.
+    dev = object.__new__(BHyveHT25Device)
+    dev.mac = "44:67:55:52:94:A1"
+    dev.state = DeviceState(is_connected=True)
+
+    class _DownConn:
+        @property
+        def is_connected(self):
+            return False   # socket torn down between operations
+
+    dev.connection = _DownConn()
+    asyncio.run(dev.refresh_state())
+    assert dev.state.is_connected is True   # not clobbered
