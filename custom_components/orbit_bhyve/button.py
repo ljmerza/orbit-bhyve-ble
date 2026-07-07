@@ -74,6 +74,10 @@ class BHyveSyncButton(CoordinatorEntity[BHyveDeviceCoordinator], ButtonEntity):
         if device.connection is None:
             return
         _LOGGER.info("%s: sync requested via button", device.mac)
+        # Force any device-class-specific on-demand refresh first (mesh forces a
+        # BLE connect so the connect-time init pulls fresh battery/state; protobuf
+        # is a no-op here since its refresh_state connects for a #15 read below).
+        await device.async_manual_sync()
         await self.coordinator.async_request_refresh()
 
 

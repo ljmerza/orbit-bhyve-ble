@@ -138,6 +138,13 @@ class BHyveBleDeviceBase(abc.ABC):
     async def async_setup(self) -> None:
         """Hook for device classes that want pre-warming. Default: no-op."""
 
+    async def async_manual_sync(self) -> None:
+        """Extra work for an explicit Sync-button press, run before the
+        coordinator refresh. Default no-op: classes whose refresh_state already
+        connects (protobuf's #15 read) need nothing more. The mesh classes,
+        whose refresh_state is passive (no BLE), override this to force a
+        connect so the button actually pulls live state off the device."""
+
     async def async_unload(self) -> None:
         if self.connection is not None:
             await self.connection.disconnect()
