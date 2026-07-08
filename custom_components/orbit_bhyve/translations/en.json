@@ -78,7 +78,7 @@
         "interval_days": {"name": "Interval (days)", "description": "For day mode \"interval\" — run every N days."},
         "interval_anchor": {"name": "Interval anchor date", "description": "For day mode \"interval\" — ISO date the interval counts from (default today)."},
         "start_times": {"name": "Start times", "description": "One or more start times (HH:MM, device-local)."},
-        "zones": {"name": "Zones", "description": "Per-zone run time — a list of {zone, minutes}."},
+        "zones": {"name": "Zones", "description": "Per-zone run time — a list of zone/minutes pairs."},
         "name": {"name": "Program name", "description": "Optional label stored on the device."},
         "budget": {"name": "Seasonal budget (%)", "description": "Seasonal adjust percentage (default 100)."},
         "enabled": {"name": "Enable", "description": "Enable and arm the program so it runs on schedule."}

@@ -32,7 +32,8 @@ set_program:
   description: Create or replace a watering program (slots A–D) on a B-Hyve valve (HT34A / HT25G2). Choose exactly one day-mode.
   target:
     device:
-      integration: orbit_bhyve
+      filter:
+        - integration: orbit_bhyve
   fields:
     slot:
       name: Program slot
@@ -122,7 +123,8 @@ delete_program:
   description: Clear a watering program slot (A–D) on a B-Hyve valve (HT34A / HT25G2).
   target:
     device:
-      integration: orbit_bhyve
+      filter:
+        - integration: orbit_bhyve
   fields:
     slot:
       name: Program slot
@@ -138,7 +140,8 @@ get_program:
   description: Read back the stored watering programs (A–D) from a B-Hyve valve (HT34A / HT25G2). Returns a response.
   target:
     device:
-      integration: orbit_bhyve
+      filter:
+        - integration: orbit_bhyve
   fields:
     slot:
       name: Program slot
