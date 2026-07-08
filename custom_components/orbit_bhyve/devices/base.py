@@ -23,6 +23,47 @@ def _mv_to_pct(mv: int) -> int:
     return max(0, min(100, pct))
 
 
+# Watering-program slots (A=1 .. F=6). The device carries six schedule slots;
+# the app exposes A-D. A=bit0 in the #20 activeProgramFlags enable bitmask.
+PROGRAM_SLOTS = {"A": 1, "B": 2, "C": 3, "D": 4, "E": 5, "F": 6}
+SLOT_LETTERS = {v: k for k, v in PROGRAM_SLOTS.items()}
+
+
+@dataclass
+class ProgramSpec:
+    """A watering program to WRITE (#19 setProgramSchedule).
+
+    Zones are 0-indexed station ids on the wire (the CLI/service layer maps its
+    1-indexed zones down). Exactly one day-mode is expressed by which of the
+    weekday/interval/odd/even/once fields is populated (per `day_mode`)."""
+    slot: int                            # 1=A .. 6=F
+    day_mode: str                        # "weekdays" | "interval" | "odd" | "even" | "once"
+    weekday_mask: int | None = None      # weekdays: bit0=Sun .. bit6=Sat
+    interval_days: int | None = None     # interval: N
+    interval_anchor: str | None = None   # interval: ISO-8601 anchor
+    start_mins: tuple[int, ...] = ()     # minutes-from-midnight (device-local)
+    zones: tuple[tuple[int, int], ...] = ()   # (station_id_0idx, run_sec)
+    name: str = ""
+    budget: int = 100
+    enabled: bool = False                # drive the enable handshake after storing
+
+
+@dataclass
+class ProgramSummary:
+    """A #19 program body decoded from a device read (connect burst / sync dump)."""
+    slot: int
+    empty: bool = True                   # #2 programTypeNotSet present -> empty slot
+    enabled: bool | None = None          # from the #20 bitmask, not the #19 body
+    day_mode: str | None = None
+    weekday_mask: int | None = None
+    interval_days: int | None = None
+    interval_anchor: str | None = None
+    start_mins: tuple[int, ...] = ()
+    zones: tuple[tuple[int, int], ...] = ()   # (station_id_0idx, run_sec)
+    name: str | None = None
+    budget: int | None = None
+
+
 @dataclass
 class DeviceState:
     is_watering: bool = False
@@ -41,6 +82,11 @@ class DeviceState:
     rain_delay_ends: datetime | None = None
     last_successful_poll: datetime | None = None
     consecutive_timeouts: int = 0
+    # Controller / program state (protobuf family).
+    controller_mode: int | None = None   # #16.#2.#1 timerMode.mode: 0=off, 1=auto, 2=manual
+    next_start_flags: int | None = None  # #16.#9 nextStartProgramFlags (slot bitmask, A=bit0)
+    next_start_at: datetime | None = None  # #16.#10 nextStartTimeSecEpochUTC as an aware datetime
+    programs: dict[int, ProgramSummary] = field(default_factory=dict)  # slot(1-6) -> summary
     extra: dict[str, Any] = field(default_factory=dict)
 
 

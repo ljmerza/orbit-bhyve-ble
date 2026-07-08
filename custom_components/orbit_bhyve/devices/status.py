@@ -17,7 +17,7 @@ import struct
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 
-from .base import _mv_to_pct
+from .base import ProgramSummary, _mv_to_pct
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -27,7 +27,8 @@ MSG_HEADER = bytes([0xAA, 0x77, 0x5A, 0x0F])
 RX_F_CLOCK = 7            # wrapper: device clock, Unix epoch seconds
 RX_F_STATUS = 16          # device status submessage
 RX_F_STATUS_MODE = 1      #   #16.#1: 1=idle, 3=rain-delay, 4=manual running
-RX_F_STATUS_RUNECHO = 2   #   #16.#2: active-run echo { #1=2, #2 { #3 { #1 stationId } } }
+RX_F_STATUS_RUNECHO = 2   #   #16.#2: active-run echo { #1=mode, #2 { #3 { #1 stationId } } }
+RX_F_RUNECHO_MODE = 1     #     #16.#2.#1: timerMode.mode (0=off, 1=auto, 2=manual)
 RX_F_RUNECHO_PARAMS = 2   #     #16.#2.#2 manualParams
 RX_F_RUNECHO_STATION = 3  #     #16.#2.#2.#3 stationInfo
 RX_F_STATION_ID = 1       #     #16.#2.#2.#3.#1: stationId (0-indexed; zone = id + 1)
@@ -61,6 +62,25 @@ RX_F_WSTATUS_CODE = 1      #   #30.#1: 1=complete, 2=inProgress, 3=pumpDelay, 4=
                            #   (enum per knobunc's PROTOCOL_SPEC; 1=complete corroborated by our
                            #   own stop reply #30{#1=1}). Terminal/absent => not watering.
 RX_WSTATUS_ACTIVE = (2, 3, 5, 6, 7)  # in-progress + delay states = a run is still active
+RX_F_STATUS_NEXTSTART_FLAGS = 9   # #16.#9: nextStartProgramFlags (slot bitmask, A=bit0)
+RX_F_STATUS_NEXTSTART = 10        # #16.#10: nextStartTimeSecEpochUTC
+
+# --- watering-program (#19 WateringProgram) decode ------------------------
+# Field numbers inside a #19 body. Exactly one day-mode field is present.
+RX_F_PROGRAM = 19          # #19 setProgramSchedule / connect-burst program body
+_PRG_SLOT = 1              # #19.#1: slot (A=1 .. F=6)
+_PRG_NOTSET = 2            # #19.#2: programTypeNotSet (present -> empty slot)
+_DM_WEEKDAYS = 3          # #19.#3 weekdays { #1 dayFlags }  bit0=Sun .. bit6=Sat
+_DM_INTERVAL = 4          # #19.#4 interval { #1 intervalDays, #2 anchorIso }
+_DM_ODD = 5              # #19.#5 odd {} empty marker
+_DM_EVEN = 6             # #19.#6 even {} empty marker
+_DM_RUNONCE = 7          # #19.#7 runOnce { #1 programFlags }
+_PRG_START = 8            # #19.#8 repeated start-times (mins-from-midnight; echoed PACKED)
+_PRG_ZONES = 9           # #19.#9 repeated StationInfo { #1 stationId(0-idx), #2 runTimeSec }
+_PRG_BUDGET = 10         # #19.#10 seasonal budget %
+_PRG_NAME = 17           # #19.#17 name (UTF-8)
+RX_F_ACTIVE_PROGRAMS = 20  # #20 setActivePrograms { #1 activeProgramFlags bitmask }
+_AP_FLAGS = 1              # #20.#1 activeProgramFlags
 
 
 def _crc16_ccitt(data: bytes, init: int = 0) -> int:
@@ -170,6 +190,9 @@ class DeviceStatus(NamedTuple):
     rain_delay_minutes: int | None = None  # #16.#13.#1
     rain_delay_expiry: int | None = None   # #16.#13.#3, Unix epoch seconds
     rain_delay_active: bool | None = None  # #16.#13.#4
+    controller_mode: int | None = None     # #16.#2.#1 timerMode.mode: 0=off, 1=auto, 2=manual
+    next_start_flags: int | None = None    # #16.#9 nextStartProgramFlags (slot bitmask, A=bit0)
+    next_start_epoch: int | None = None    # #16.#10 nextStartTimeSecEpochUTC
 
 
 def extract_status(protobuf: bytes) -> DeviceStatus:
@@ -179,6 +202,7 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
 
     run_state = battery_mv = is_watering = seconds_remaining = None
     active_station = rd_minutes = rd_expiry = rd_active = None
+    controller_mode = next_start_flags = next_start_epoch = None
 
     device_clock = _pb_field(top, RX_F_CLOCK)     # #7 wrapper field
     status = _pb_field(top, RX_F_STATUS)          # #16 submessage
@@ -186,6 +210,10 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
         sfields = pb_parse(status)
         run_state = _pb_field(sfields, RX_F_STATUS_MODE)
         battery_mv = _pb_subfield(sfields, RX_F_STATUS_BATT, RX_F_BATT_MV)
+        # Controller mode (#16.#2.#1) + the next scheduled program run (#16.#9/#10).
+        controller_mode = _pb_path(sfields, RX_F_STATUS_RUNECHO, RX_F_RUNECHO_MODE)
+        next_start_flags = _pb_field(sfields, RX_F_STATUS_NEXTSTART_FLAGS)
+        next_start_epoch = _pb_field(sfields, RX_F_STATUS_NEXTSTART)
         # Which zone is running: prefer the shallow #16.#6.#4 (currentStationId,
         # HW-verified), fall back to the deep timerMode path #16.#2.#2.#3.#1.
         active_station = _pb_subfield(sfields, RX_F_STATUS_PROGRESS, RX_F_PROGRESS_STATION)
@@ -257,7 +285,130 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
         rain_delay_minutes=rd_minutes,
         rain_delay_expiry=rd_expiry,
         rain_delay_active=rd_active,
+        controller_mode=controller_mode,
+        next_start_flags=next_start_flags,
+        next_start_epoch=next_start_epoch,
     )
+
+
+# --- watering-program decode (multi-frame reads) --------------------------
+
+def _decode_packed_varints(data: bytes) -> list[int]:
+    """Decode a packed-repeated-varint byte run into a list of ints."""
+    out: list[int] = []
+    i = 0
+    while i < len(data):
+        v, i = _read_varint(data, i)
+        if v is None:
+            break
+        out.append(v)
+    return out
+
+
+def parse_program_body(pb: bytes) -> ProgramSummary | None:
+    """Decode a #19 WateringProgram body -> ProgramSummary (or None if malformed).
+
+    Mirrors the CLI reference (`scripts/bhyve.py::parse_program_body`) byte-for-byte,
+    including the read-back quirk that #8 start-times come back as a PACKED repeated
+    varint (wire 2) even though we WRITE them as individual varints (HW-confirmed on
+    fw0111)."""
+    f = pb_parse(pb)
+    if f is None:
+        return None
+    slot = _pb_field(f, _PRG_SLOT)
+    empty = isinstance(_pb_field(f, _PRG_NOTSET), (bytes, bytearray))  # #2 present
+
+    day_mode = weekday_mask = interval_days = interval_anchor = None
+    wk = _pb_field(f, _DM_WEEKDAYS)
+    if isinstance(wk, (bytes, bytearray)):
+        day_mode, weekday_mask = "weekdays", _pb_field(pb_parse(wk), 1)
+    iv = _pb_field(f, _DM_INTERVAL)
+    if isinstance(iv, (bytes, bytearray)):
+        ivf = pb_parse(iv)
+        day_mode, interval_days = "interval", _pb_field(ivf, 1)
+        anchor = _pb_field(ivf, 2)
+        if isinstance(anchor, (bytes, bytearray)):
+            interval_anchor = anchor.decode(errors="replace")
+    if _pb_field(f, _DM_ODD) is not None:
+        day_mode = "odd"
+    if _pb_field(f, _DM_EVEN) is not None:
+        day_mode = "even"
+    if _pb_field(f, _DM_RUNONCE) is not None:
+        day_mode = "once"
+
+    start_mins: list[int] = []
+    for num, wire, v in f:
+        if num != _PRG_START:
+            continue
+        if wire == 0:
+            start_mins.append(v)
+        elif isinstance(v, (bytes, bytearray)):
+            start_mins.extend(_decode_packed_varints(v))
+
+    zones: list[tuple[int, int]] = []
+    for num, _wire, v in f:
+        if num == _PRG_ZONES and isinstance(v, (bytes, bytearray)):
+            zf = pb_parse(v)
+            zones.append((_pb_field(zf, 1), _pb_field(zf, 2)))
+
+    name = _pb_field(f, _PRG_NAME)
+    if isinstance(name, (bytes, bytearray)):
+        name = name.decode(errors="replace")
+    return ProgramSummary(
+        slot=slot, empty=empty, day_mode=day_mode, weekday_mask=weekday_mask,
+        interval_days=interval_days, interval_anchor=interval_anchor,
+        start_mins=tuple(start_mins), zones=tuple(zones), name=name,
+        budget=_pb_field(f, _PRG_BUDGET),
+    )
+
+
+def split_inner_messages(stream: bytes) -> list[bytes]:
+    """Scan a reassembled decrypted byte stream for every CRC-valid inner message,
+    returning each one's protobuf. The device packs back-to-back messages
+    contiguously (NOT block-padded), so one outer frame is not necessarily one
+    message and a message may span frames — this rejoins them from the stream."""
+    out: list[bytes] = []
+    i = 0
+    while i + 6 <= len(stream):
+        hdr = stream.find(MSG_HEADER, i)
+        if hdr < 0 or hdr + 6 > len(stream):
+            break
+        payload_len = stream[hdr + 4]
+        total = payload_len + 6
+        if payload_len < 2 or hdr + total > len(stream):
+            break  # incomplete trailing message
+        pb = decode_inner(stream[hdr:hdr + total])
+        if pb is not None:
+            out.append(pb)
+        i = hdr + total
+    return out
+
+
+def parse_sync_dump(stream: bytes):
+    """From a reassembled #10 sync dump (concatenated plaintext), return
+    (programs {slot:ProgramSummary}, active_mask int|None, status DeviceStatus|None).
+    `enabled` is filled on each program from the #20 bitmask (A=bit0)."""
+    programs: dict[int, ProgramSummary] = {}
+    active_mask: int | None = None
+    status: DeviceStatus | None = None
+    for pb in split_inner_messages(stream):
+        top = pb_parse(pb)
+        if top is None:
+            continue
+        p19 = _pb_field(top, RX_F_PROGRAM)
+        if isinstance(p19, (bytes, bytearray)):
+            sch = parse_program_body(p19)
+            if sch and sch.slot is not None:
+                programs[sch.slot] = sch
+        p20 = _pb_field(top, RX_F_ACTIVE_PROGRAMS)
+        if isinstance(p20, (bytes, bytearray)):
+            active_mask = _pb_field(pb_parse(p20), _AP_FLAGS)
+        if isinstance(_pb_field(top, RX_F_STATUS), (bytes, bytearray)):
+            status = extract_status(pb)
+    if active_mask is not None:
+        for sid, sch in programs.items():
+            sch.enabled = bool(active_mask & (1 << (sid - 1)))
+    return programs, active_mask, status
 
 
 def apply_status_plaintext(device, pt: bytes) -> None:
@@ -340,6 +491,22 @@ def apply_status_plaintext(device, pt: bytes) -> None:
         # after expiry (the "7 hours ago" bug).
         device.state.rain_delay_minutes = 0
         device.state.rain_delay_ends = None
+
+    # Controller mode (#16.#2.#1: 0=off, 1=auto, 2=manual) — the "Automatic
+    # watering" switch reads this. Present whenever a #16 status block is decoded.
+    if st.controller_mode is not None:
+        device.state.controller_mode = st.controller_mode
+
+    # Next scheduled program run (#16.#9/#10). The device reports it once a
+    # program is stored+enabled while in autoMode; feeds the "Next run" sensor and
+    # confirms the enable handshake. Absent (flags 0/None) => no next start armed.
+    if st.next_start_flags is not None:
+        device.state.next_start_flags = st.next_start_flags or None
+        device.state.next_start_at = (
+            datetime.fromtimestamp(st.next_start_epoch, tz=timezone.utc)
+            if st.next_start_flags and st.next_start_epoch
+            else None
+        )
 
     if (
         st.battery_mv is not None
