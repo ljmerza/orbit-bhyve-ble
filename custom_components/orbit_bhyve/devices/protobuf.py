@@ -180,13 +180,23 @@ def _build_set_epoch_time_pb(epoch_utc: int | None = None, tz_offset_sec: int | 
     #16 run-state, battery, clock, controller-mode, next-start), so it doubles as
     the coordinator-poll status elicitor while keeping the device clock honest
     (program start-times, rain-delay #3, and auto-close all key off this clock).
-    Defaults to the host's current time / UTC offset."""
-    now = datetime.now().astimezone()
-    if epoch_utc is None:
-        epoch_utc = int(now.timestamp())
-    if tz_offset_sec is None:
-        off = now.utcoffset()
-        tz_offset_sec = int(off.total_seconds()) if off is not None else 0
+    Defaults to HA's configured local time / UTC offset — NOT the container OS
+    timezone, which can diverge from the user's HA setting and would skew the
+    device's schedule next-start computation."""
+    if epoch_utc is None or tz_offset_sec is None:
+        try:
+            # HA's configured local time, not the container OS timezone. Local
+            # import so the module still loads without Home Assistant (the
+            # standalone protocol tests, which pass explicit epoch/offset).
+            from homeassistant.util import dt as dt_util
+            now = dt_util.now()
+        except ImportError:
+            now = datetime.now().astimezone()
+        if epoch_utc is None:
+            epoch_utc = int(now.timestamp())
+        if tz_offset_sec is None:
+            off = now.utcoffset()
+            tz_offset_sec = int(off.total_seconds()) if off is not None else 0
     body = _pb_field_varint(1, epoch_utc) + _pb_field_varint_signed(2, tz_offset_sec)
     return _pb_field_bytes(75, body)
 
@@ -680,6 +690,17 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
             finally:
                 await self.connection.disconnect()
 
+    def _enable_mask(self, mask: int | None) -> int:
+        """The current #20 enable bitmask to base a write on. A program read can
+        decode the #19 bodies but drop the trailing #20 mask frame (mask=None) on
+        a marginal link; falling back to 0 there would clear every OTHER slot's
+        enable bit on the next write. _read_programs already carries each slot's
+        enabled flag forward into state.programs, so reconstruct the mask from it
+        instead of collapsing to 0."""
+        if mask is not None:
+            return mask
+        return sum(1 << (sid - 1) for sid, s in self.state.programs.items() if s.enabled)
+
     @_ble_write_guard
     async def set_program(self, spec: ProgramSpec) -> bool:
         """Store a program (#19) and, if spec.enabled, drive the 3-write run
@@ -692,7 +713,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
             try:
                 letter = SLOT_LETTERS.get(spec.slot, str(spec.slot))
                 _programs, mask = await self._read_programs()
-                mask = mask or 0
+                mask = self._enable_mask(mask)
                 pb = _build_program_pb(spec)
                 await self.connection.send(_build_message(pb), drain_ms=2000)
                 self._stamp_command(f"program set {letter}", 0)
@@ -722,9 +743,14 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 await self.connection.send(
                     _build_message(_build_set_active_programs_pb(newmask))
                 )
-                # Confirm via #16.#9/#10 next-start (folded into state by the observer).
+                # Confirm via #16.#9/#10 next-start (folded into state by the
+                # observer). next_start_flags is a bitmask of whichever slot(s)
+                # start NEXT, so anchor the confirm to THIS slot's bit — otherwise
+                # an already-enabled program with an earlier start would confirm a
+                # slot that didn't actually arm. (A slot that armed but isn't the
+                # soonest reads as unconfirmed; the poll then re-reads real state.)
                 await self.refresh_status()
-                ok = bool(self.state.next_start_flags)
+                ok = bool(self.state.next_start_flags and self.state.next_start_flags & bit)
                 _LOGGER.log(
                     logging.DEBUG if ok else logging.WARNING,
                     "%s: %s program set %s enabled %s",
@@ -745,7 +771,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 _programs, mask = await self._read_programs()
                 bit = 1 << (slot - 1)
                 await self.connection.send(
-                    _build_message(_build_set_active_programs_pb((mask or 0) & ~bit))
+                    _build_message(_build_set_active_programs_pb(self._enable_mask(mask) & ~bit))
                 )
                 await self.connection.send(_build_message(_build_program_delete_pb(slot)))
                 await self.connection.send(_build_message(_build_set_timer_mode_pb(1)))
@@ -767,7 +793,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 return False
             try:
                 _programs, mask = await self._read_programs()
-                mask = mask or 0
+                mask = self._enable_mask(mask)
                 bit = 1 << (slot - 1)
                 newmask = (mask | bit) if on else (mask & ~bit)
                 await self.connection.send(
@@ -786,14 +812,6 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 return bool((mask2 or 0) & bit) == on
             finally:
                 await self.connection.disconnect()
-
-    async def run_program(self, slot: int) -> bool:
-        """Arm a program to run: enable it (#20) + autoMode (#14{1}), so the device
-        computes and honours its next scheduled start. NOTE: this is an *arm*, not a
-        verified immediate 'run now' — no immediate-run BLE path was confirmed in
-        W0, so the button fires the program at its next start. Returns True once a
-        next-start is reported."""
-        return await self.set_program_enabled(slot, True)
 
     @_ble_write_guard
     async def set_controller_mode(self, on: bool) -> bool:

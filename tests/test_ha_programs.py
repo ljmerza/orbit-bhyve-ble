@@ -121,9 +121,11 @@ def test_ha_parse_decodes_packed_single_start_hw_shape():
 
 def _dump_stream(program_pbs, mask, status_pb=None) -> bytes:
     """A #10 sync-dump plaintext stream: concatenated inner messages (each
-    aa775a0f-framed), exactly what connection.send_stream returns."""
+    aa775a0f-framed), exactly what connection.send_stream returns. mask=None
+    models a burst whose trailing #20 enable frame dropped (parse -> mask None)."""
     parts = [tx._build_message(p) for p in program_pbs]
-    parts.append(tx._build_message(tx._build_set_active_programs_pb(mask)))
+    if mask is not None:
+        parts.append(tx._build_message(tx._build_set_active_programs_pb(mask)))
     if status_pb is not None:
         parts.append(tx._build_message(status_pb))
     return b"".join(parts)
@@ -341,6 +343,57 @@ def test_delete_program_clears_slot():
     assert ok is True
     ops = _program_ops(dev.connection.sent)
     assert ops == [20, 19, 14]  # clear-bit, delete body, keep autoMode
+
+
+def test_enable_mask_reconstructs_from_state_when_frame_dropped():
+    # C1: if the #20 mask frame drops on the pre-write read (mask=None), rebuild
+    # it from the last-known per-slot enabled flags rather than collapsing to 0
+    # (which would clear every other slot's enable bit on the next write).
+    dev = _make_gen2()
+    dev.state.programs = {
+        1: ProgramSummary(slot=1, empty=False, enabled=True),
+        2: ProgramSummary(slot=2, empty=False, enabled=False),
+        3: ProgramSummary(slot=3, empty=False, enabled=True),
+    }
+    assert dev._enable_mask(None) == 0b101   # bits for slots 1 and 3
+    assert dev._enable_mask(0b010) == 0b010  # a present mask passes through
+
+
+def test_enable_preserves_other_slots_when_mask_frame_drops():
+    # C1 end-to-end: enabling slot D on a read that dropped its #20 frame must
+    # not clear slot A's enable bit — the #20 write carries A's bit too.
+    a = tx._build_program_pb(_ha_spec(1, "odd", start_mins=(360,), zones=((0, 60),), name="A"))
+    d = tx._build_program_pb(_ha_spec(4, "weekdays", weekday_mask=0x7F,
+                                      start_mins=(360,), zones=((0, 180),), name="D"))
+    dev = _make_gen2()
+    dev.state.programs = {1: ProgramSummary(slot=1, empty=False, enabled=True)}  # A known-enabled
+    dev.connection = _FakeProgramConn(
+        dev,
+        dumps=[_dump_stream([a, d], mask=None), _dump_stream([a, d], mask=0b1001)],
+    )
+    asyncio.run(dev.set_program_enabled(4, True))
+    enable_masks = [
+        rx._pb_field(rx.pb_parse(rx._pb_field(rx.pb_parse(rx.decode_inner(f)), 20)), 1)
+        for f in dev.connection.sent
+        if rx._pb_field(rx.pb_parse(rx.decode_inner(f) or b""), 20) is not None
+    ]
+    assert enable_masks and all(m & 0b0001 for m in enable_masks)  # slot A never cleared
+    assert all(m & 0b1000 for m in enable_masks)                   # slot D set
+
+
+def test_set_program_enable_confirm_requires_this_slots_next_start():
+    # C2: next_start_flags is a bitmask of whichever slot(s) start next. Enabling
+    # slot D must NOT confirm just because another program (slot A) is next.
+    spec = _ha_spec(4, "weekdays", weekday_mask=0x7F, start_mins=(360,),
+                    zones=((0, 180),), name="D", enabled=True)
+    stored = tx._build_program_pb(spec)
+    dev = _make_gen2()
+    dev.connection = _FakeProgramConn(
+        dev,
+        dumps=[_dump_stream([], mask=0), _dump_stream([stored], mask=0)],
+        status_pt=_status_with_next_start(0b0001),  # slot A is next, not D
+    )
+    assert asyncio.run(dev.set_program(spec)) is False
 
 
 class _WriteDesyncConn(_FakeProgramConn):
