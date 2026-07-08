@@ -30,11 +30,9 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import BHyveDeviceCoordinator
-from .devices.base import SLOT_LETTERS, ProgramSummary, _mv_to_pct
+from .devices.base import PROGRAM_SLOTS, SLOT_LETTERS, UI_SLOTS, ProgramSummary, _mv_to_pct
 from .devices.protobuf import BHyveProtobufDevice
 
-# The app exposes program slots A–D.
-_UI_SLOTS = ["A", "B", "C", "D"]
 _WEEKDAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
 
@@ -81,7 +79,7 @@ async def async_setup_entry(
         if isinstance(device, BHyveProtobufDevice):
             entities.append(BHyveRainDelayEndsSensor(coord))
             entities.append(BHyveNextRunSensor(coord))
-            for letter in _UI_SLOTS:
+            for letter in UI_SLOTS:
                 entities.append(BHyveProgramSummarySensor(coord, letter))
         # Flow-rate gauge only for models with a flow sensor (Gen2, not the XD).
         if getattr(device, "has_flow", False):
@@ -330,7 +328,7 @@ class BHyveProgramSummarySensor(_BHyveDeviceSensorBase):
         super().__init__(coordinator)
         device = coordinator.device
         self._letter = letter
-        self._slot = {"A": 1, "B": 2, "C": 3, "D": 4}[letter]
+        self._slot = PROGRAM_SLOTS[letter]
         self._attr_unique_id = f"{device.unique_id}_program_{letter.lower()}"
         self._attr_name = f"Program {letter}"
 

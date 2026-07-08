@@ -203,6 +203,10 @@ def _spec_from_call(call: ServiceCall) -> ProgramSpec:
             weekday_mask |= 1 << _WEEKDAY_BITS[d[:3].lower()]
         if not weekday_mask:
             raise HomeAssistantError("weekdays mode needs at least one weekday")
+    elif day_mode == "interval" and not call.data.get("interval_days"):
+        # Symmetric with the weekdays check: don't let a missing interval_days
+        # silently fall back to every-1-day in _build_program_pb.
+        raise HomeAssistantError("interval mode needs interval_days")
     start_mins: list[int] = []
     for tok in call.data["start_times"]:
         h, _, m = str(tok).partition(":")
@@ -486,7 +490,10 @@ def _register_services(hass: HomeAssistant) -> None:
         result: dict[str, Any] = {}
         for coord in coords:
             programs = await coord.device.get_programs()
-            await coord.async_request_refresh()
+            # get_programs() already refreshed state.programs over its own ephemeral
+            # session; push that to the entities without a second BLE connect (a
+            # full async_request_refresh would re-poll the device for a read-only call).
+            coord.async_set_updated_data(coord.device.state)
             slots = programs
             if slot_filter:
                 sid = PROGRAM_SLOTS[slot_filter.upper()]

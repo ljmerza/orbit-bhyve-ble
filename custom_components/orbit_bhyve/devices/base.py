@@ -27,6 +27,9 @@ def _mv_to_pct(mv: int) -> int:
 # the app exposes A-D. A=bit0 in the #20 activeProgramFlags enable bitmask.
 PROGRAM_SLOTS = {"A": 1, "B": 2, "C": 3, "D": 4, "E": 5, "F": 6}
 SLOT_LETTERS = {v: k for k, v in PROGRAM_SLOTS.items()}
+# The slots surfaced as HA entities (the app-visible A-D), one per program switch
+# and summary sensor.
+UI_SLOTS = ("A", "B", "C", "D")
 
 
 @dataclass

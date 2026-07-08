@@ -23,13 +23,10 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import BHyveDeviceCoordinator
-from .devices.base import PROGRAM_SLOTS
+from .devices.base import PROGRAM_SLOTS, UI_SLOTS
 from .devices.protobuf import BHyveProtobufDevice
 
 _LOGGER = logging.getLogger(__name__)
-
-# The app exposes program slots A–D (E/F are extra internal slots).
-_UI_SLOTS = ["A", "B", "C", "D"]
 
 
 async def async_setup_entry(
@@ -43,7 +40,7 @@ async def async_setup_entry(
         if not isinstance(coord.device, BHyveProtobufDevice):
             continue
         entities.append(BHyveAutomaticWateringSwitch(coord))
-        for letter in _UI_SLOTS:
+        for letter in UI_SLOTS:
             entities.append(BHyveProgramEnableSwitch(coord, letter))
     async_add_entities(entities)
 
