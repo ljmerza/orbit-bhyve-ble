@@ -14,7 +14,12 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady, HomeAssistantError
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryNotReady,
+    HomeAssistantError,
+    ServiceValidationError,
+)
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -202,11 +207,11 @@ def _spec_from_call(call: ServiceCall) -> ProgramSpec:
         for d in days:
             weekday_mask |= 1 << _WEEKDAY_BITS[d[:3].lower()]
         if not weekday_mask:
-            raise HomeAssistantError("weekdays mode needs at least one weekday")
+            raise ServiceValidationError("weekdays mode needs at least one weekday")
     elif day_mode == "interval" and not call.data.get("interval_days"):
         # Symmetric with the weekdays check: don't let a missing interval_days
         # silently fall back to every-1-day in _build_program_pb.
-        raise HomeAssistantError("interval mode needs interval_days")
+        raise ServiceValidationError("interval mode needs interval_days")
     start_mins: list[int] = []
     for tok in call.data["start_times"]:
         h, _, m = str(tok).partition(":")
