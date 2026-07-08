@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from bleak.exc import BleakError
 
 from orbit_bhyve.connection import BHyveBleConnection
 from orbit_bhyve.devices import protobuf as tx
@@ -340,6 +341,37 @@ def test_delete_program_clears_slot():
     assert ok is True
     ops = _program_ops(dev.connection.sent)
     assert ops == [20, 19, 14]  # clear-bit, delete body, keep autoMode
+
+
+class _WriteDesyncConn(_FakeProgramConn):
+    """Reads (send_stream) succeed, but the first write send() raises BleakError —
+    as a CTR-desync self-heal tears the pooled session down mid-sequence over an
+    ESPHome proxy (hardware-observed on a marginal-link Gen2 valve)."""
+
+    async def send(self, frame: bytes, drain_ms: int = 1500):
+        raise BleakError("Not connected")
+
+
+def test_set_program_returns_false_on_marginal_link_desync():
+    # A write that desyncs mid-sequence must fail gracefully as False (the caller
+    # /coordinator re-reads real state), NOT surface a raw BleakError as a 500.
+    spec = _ha_spec(4, "weekdays", weekday_mask=0x7F, start_mins=(360,),
+                    zones=((0, 180),), name="D", enabled=False)
+    dev = _make_gen2()
+    dev.connection = _WriteDesyncConn(dev, dumps=[_dump_stream([], mask=0)])
+    ok = asyncio.run(dev.set_program(spec))
+    assert ok is False                      # graceful, not a raised exception
+    assert dev.connection.disconnects == 1  # session still torn down (finally ran)
+
+
+def test_program_and_controller_writes_return_false_on_desync():
+    # The Program A-D enable switches and the Automatic-watering switch drive
+    # these; a marginal-link write must return False, never raise to the switch.
+    dev = _make_gen2()
+    dev.connection = _WriteDesyncConn(dev, dumps=[_dump_stream([], mask=0)])
+    assert asyncio.run(dev.set_program_enabled(1, True)) is False
+    assert asyncio.run(dev.delete_program(1)) is False
+    assert asyncio.run(dev.set_controller_mode(True)) is False
 
 
 def test_set_controller_mode_confirms_via_status():

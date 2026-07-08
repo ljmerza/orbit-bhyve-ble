@@ -17,6 +17,7 @@ re-declared, so there is a single source for both directions.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import struct
 import time
@@ -32,6 +33,31 @@ from .base import (
 from .status import MSG_HEADER, _crc16_ccitt, apply_status_plaintext, parse_sync_dump
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _ble_write_guard(method):
+    """Make a bool-returning BLE write method fail gracefully on a marginal link.
+
+    A CTR-desync self-heal tears the session down mid-sequence (its disconnect is
+    scheduled on the loop), so a following write raises BleakError("Not connected")
+    — over an ESPHome proxy this is a routine, transient event. Catch it (and a
+    proxy write-response timeout) and return False instead of surfacing a raw
+    exception to the service/switch call: the coordinator refresh that follows
+    re-reads the device's actual state, and the user/automation can retry. Mirrors
+    the read path's best-effort behavior (get_programs falls back to last-known).
+    The method's own try/finally has already run its disconnect by the time we
+    catch here."""
+    @functools.wraps(method)
+    async def _wrapped(self, *args, **kwargs):
+        try:
+            return await method(self, *args, **kwargs)
+        except (BleakError, asyncio.TimeoutError) as err:
+            _LOGGER.warning(
+                "%s: %s %s failed on a BLE error (%s) — marginal link, not confirmed",
+                self.mac, self.log_label, method.__name__, err,
+            )
+            return False
+    return _wrapped
 
 
 def _pb_varint(val: int) -> bytes:
@@ -654,6 +680,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
             finally:
                 await self.connection.disconnect()
 
+    @_ble_write_guard
     async def set_program(self, spec: ProgramSpec) -> bool:
         """Store a program (#19) and, if spec.enabled, drive the 3-write run
         handshake (store -> enable #20 -> autoMode #14{1} -> re-send store+enable).
@@ -707,6 +734,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
             finally:
                 await self.connection.disconnect()
 
+    @_ble_write_guard
     async def delete_program(self, slot: int) -> bool:
         """Clear a slot: drop its enable bit, write the #19 NotSet body, keep the
         controller in autoMode. Returns True once the read-back shows it empty."""
@@ -728,6 +756,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
             finally:
                 await self.connection.disconnect()
 
+    @_ble_write_guard
     async def set_program_enabled(self, slot: int, on: bool) -> bool:
         """Toggle a stored program's enable bit (#20 bitmask) and keep the
         controller in autoMode. On enable, re-send the bitmask while in autoMode so
@@ -766,6 +795,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
         next-start is reported."""
         return await self.set_program_enabled(slot, True)
 
+    @_ble_write_guard
     async def set_controller_mode(self, on: bool) -> bool:
         """Device-global controller mode via #14 timerMode: on -> autoMode(1)
         ('Enable Watering', scheduled programs run), off -> offMode(0) (automatic
@@ -783,6 +813,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
             finally:
                 await self.connection.disconnect()
 
+    @_ble_write_guard
     async def identify(self, seconds: int = 6) -> bool:
         """Flash the device's LED to locate it (#47 identifyDevice). The flash
         LATCHES on Gen2 (identifyTimeSec isn't a reliable auto-off), so we start it,
