@@ -72,6 +72,7 @@
       "name": "Set watering program",
       "description": "Create or replace a watering program (slots A–D) on a B-Hyve valve (HT34A / HT25G2).",
       "fields": {
+        "device_id": {"name": "Device", "description": "The B-Hyve valve (HT34A / HT25G2)."},
         "slot": {"name": "Program slot", "description": "Which program slot to write (A–D)."},
         "day_mode": {"name": "Day mode", "description": "How often the program runs. Exactly one mode."},
         "weekdays": {"name": "Weekdays", "description": "For day mode \"weekdays\" — which days to run."},
@@ -88,6 +89,7 @@
       "name": "Delete watering program",
       "description": "Clear a watering program slot (A–D) on a B-Hyve valve (HT34A / HT25G2).",
       "fields": {
+        "device_id": {"name": "Device", "description": "The B-Hyve valve (HT34A / HT25G2)."},
         "slot": {"name": "Program slot", "description": "Which program slot to clear (A–D)."}
       }
     },
@@ -95,6 +97,7 @@
       "name": "Get watering program(s)",
       "description": "Read back the stored watering programs (A–D) from a B-Hyve valve (HT34A / HT25G2).",
       "fields": {
+        "device_id": {"name": "Device", "description": "The B-Hyve valve (HT34A / HT25G2)."},
         "slot": {"name": "Program slot", "description": "Optional — a single slot (A–D). Omit to return all slots."}
       }
     }
