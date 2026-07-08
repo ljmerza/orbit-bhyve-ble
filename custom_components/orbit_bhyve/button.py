@@ -25,6 +25,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
 from .coordinator import BHyveDeviceCoordinator
 from .devices import BHyveHubDevice
+from .devices.protobuf import BHyveProtobufDevice
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -47,6 +48,10 @@ async def async_setup_entry(
         # than waiting for the watering poll's passive update.
         if getattr(coord.device, "has_flow", False):
             entities.append(BHyveCheckFlowButton(coord))
+        # LED-locate is a protobuf-family capability (#47). It's a no-op on the XD
+        # but harmless, so expose it on the whole family for a consistent card.
+        if isinstance(coord.device, BHyveProtobufDevice):
+            entities.append(BHyveIdentifyButton(coord))
     async_add_entities(entities)
 
 
@@ -112,3 +117,36 @@ class BHyveCheckFlowButton(CoordinatorEntity[BHyveDeviceCoordinator], ButtonEnti
         await device.read_flow()
         # Push the freshly-sampled flow_gpm to entities without a full #15 poll.
         self.coordinator.async_set_updated_data(device.state)
+
+
+class BHyveIdentifyButton(CoordinatorEntity[BHyveDeviceCoordinator], ButtonEntity):
+    """Flash the device's LED to physically locate it (#47 identifyDevice).
+
+    Gen2 (HT25G2) flashes red for a few seconds; a no-op on the XD (HT34A), which
+    ignores #47 — harmless, so the button exists across the protobuf family for a
+    uniform device card."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Identify"
+    _attr_icon = "mdi:led-on"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        device = coordinator.device
+        self._attr_unique_id = f"{device.unique_id}_identify"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, device.cloud_id)},
+            "name": device.name,
+            "manufacturer": "Orbit Irrigation",
+            "model": device.hardware,
+            "sw_version": device.firmware,
+            "connections": {("mac", device.mac)} if device.mac else set(),
+        }
+
+    async def async_press(self) -> None:
+        device = self.coordinator.device
+        if device.connection is None:
+            return
+        _LOGGER.info("%s: identify requested via button", device.mac)
+        await device.identify()

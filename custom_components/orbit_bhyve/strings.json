@@ -67,6 +67,36 @@
     "refresh_devices": {
       "name": "Refresh devices from cloud",
       "description": "Re-query the Orbit cloud for new/changed devices and updated network keys."
+    },
+    "set_program": {
+      "name": "Set watering program",
+      "description": "Create or replace a watering program (slots A–D) on a B-Hyve valve (HT34A / HT25G2).",
+      "fields": {
+        "slot": {"name": "Program slot", "description": "Which program slot to write (A–D)."},
+        "day_mode": {"name": "Day mode", "description": "How often the program runs. Exactly one mode."},
+        "weekdays": {"name": "Weekdays", "description": "For day mode \"weekdays\" — which days to run."},
+        "interval_days": {"name": "Interval (days)", "description": "For day mode \"interval\" — run every N days."},
+        "interval_anchor": {"name": "Interval anchor date", "description": "For day mode \"interval\" — ISO date the interval counts from (default today)."},
+        "start_times": {"name": "Start times", "description": "One or more start times (HH:MM, device-local)."},
+        "zones": {"name": "Zones", "description": "Per-zone run time — a list of {zone, minutes}."},
+        "name": {"name": "Program name", "description": "Optional label stored on the device."},
+        "budget": {"name": "Seasonal budget (%)", "description": "Seasonal adjust percentage (default 100)."},
+        "enabled": {"name": "Enable", "description": "Enable and arm the program so it runs on schedule."}
+      }
+    },
+    "delete_program": {
+      "name": "Delete watering program",
+      "description": "Clear a watering program slot (A–D) on a B-Hyve valve (HT34A / HT25G2).",
+      "fields": {
+        "slot": {"name": "Program slot", "description": "Which program slot to clear (A–D)."}
+      }
+    },
+    "get_program": {
+      "name": "Get watering program(s)",
+      "description": "Read back the stored watering programs (A–D) from a B-Hyve valve (HT34A / HT25G2).",
+      "fields": {
+        "slot": {"name": "Program slot", "description": "Optional — a single slot (A–D). Omit to return all slots."}
+      }
     }
   }
 }

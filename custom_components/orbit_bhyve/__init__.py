@@ -13,9 +13,10 @@ from typing import Any
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .cloud import CloudAuthError, CloudConnectionError, OrbitCloudClient
@@ -37,8 +38,12 @@ from .const import (
 )
 from .coordinator import BHyveDeviceCoordinator
 from .devices import UnsupportedModel, build_device
+from .devices.base import PROGRAM_SLOTS, SLOT_LETTERS, ProgramSpec, ProgramSummary
+from .devices.protobuf import BHyveProtobufDevice
 
 _LOGGER = logging.getLogger(__name__)
+
+_WEEKDAY_BITS = {"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
 
 PLATFORMS: list[Platform] = [
     Platform.VALVE,
@@ -46,6 +51,7 @@ PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.NUMBER,
     Platform.BUTTON,
+    Platform.SWITCH,
 ]
 
 
@@ -155,6 +161,87 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
             seconds=poll_watering if coord.device.state.is_watering else poll_idle
         )
     _LOGGER.debug("%s: options applied in place (no reload)", entry.entry_id)
+
+
+def _protobuf_coordinators_for_call(
+    hass: HomeAssistant, call: ServiceCall
+) -> list[BHyveDeviceCoordinator]:
+    """Resolve the targeted device_id(s) to protobuf-family coordinators.
+
+    Program services target a device; map its registry id -> our cloud_id (the
+    device_info identifier) -> coordinator. Non-protobuf targets (hub/mesh) are
+    skipped — programs are a protobuf-family capability."""
+    device_ids = call.data.get("device_id", [])
+    if isinstance(device_ids, str):
+        device_ids = [device_ids]
+    reg = dr.async_get(hass)
+    wanted_cloud_ids: set[str] = set()
+    for did in device_ids:
+        entry = reg.async_get(did)
+        if entry is None:
+            continue
+        wanted_cloud_ids |= {ident[1] for ident in entry.identifiers if ident[0] == DOMAIN}
+    coords: list[BHyveDeviceCoordinator] = []
+    for runtime in hass.data.get(DOMAIN, {}).values():
+        for cloud_id, coord in runtime.coordinators.items():
+            if cloud_id in wanted_cloud_ids and isinstance(coord.device, BHyveProtobufDevice):
+                coords.append(coord)
+    return coords
+
+
+def _spec_from_call(call: ServiceCall) -> ProgramSpec:
+    """Build a ProgramSpec from the set_program service data. Zones are given in
+    MINUTES (user-friendly) and start times as HH:MM, both mapped to the wire's
+    0-indexed stations / seconds / minutes-from-midnight."""
+    slot = PROGRAM_SLOTS[call.data["slot"].upper()]
+    day_mode = call.data["day_mode"]
+    weekday_mask = None
+    if day_mode == "weekdays":
+        days = call.data.get("weekdays") or []
+        weekday_mask = 0
+        for d in days:
+            weekday_mask |= 1 << _WEEKDAY_BITS[d[:3].lower()]
+        if not weekday_mask:
+            raise HomeAssistantError("weekdays mode needs at least one weekday")
+    start_mins: list[int] = []
+    for tok in call.data["start_times"]:
+        h, _, m = str(tok).partition(":")
+        start_mins.append((int(h) * 60 + int(m or 0)) % 1440)
+    zones: list[tuple[int, int]] = []
+    for z in call.data["zones"]:
+        zones.append((int(z["zone"]) - 1, int(z["minutes"]) * 60))
+    return ProgramSpec(
+        slot=slot,
+        day_mode=day_mode,
+        weekday_mask=weekday_mask,
+        interval_days=call.data.get("interval_days"),
+        interval_anchor=call.data.get("interval_anchor"),
+        start_mins=tuple(start_mins),
+        zones=tuple(zones),
+        name=call.data.get("name", ""),
+        budget=int(call.data.get("budget", 100)),
+        enabled=bool(call.data.get("enabled", False)),
+    )
+
+
+def _summary_to_dict(summary: ProgramSummary) -> dict[str, Any]:
+    """A JSON-serializable view of a decoded program slot for the get_program
+    service response (zones back to 1-indexed, run time in minutes)."""
+    if summary.empty:
+        return {"slot": SLOT_LETTERS.get(summary.slot, summary.slot), "empty": True}
+    return {
+        "slot": SLOT_LETTERS.get(summary.slot, summary.slot),
+        "empty": False,
+        "enabled": summary.enabled,
+        "name": summary.name,
+        "day_mode": summary.day_mode,
+        "weekday_mask": summary.weekday_mask,
+        "interval_days": summary.interval_days,
+        "interval_anchor": summary.interval_anchor,
+        "start_times": [f"{m // 60:02d}:{m % 60:02d}" for m in summary.start_mins],
+        "zones": [{"zone": sid + 1, "minutes": round(sec / 60, 2)} for sid, sec in summary.zones],
+        "budget": summary.budget,
+    }
 
 
 def _register_services(hass: HomeAssistant) -> None:
@@ -332,4 +419,90 @@ def _register_services(hass: HomeAssistant) -> None:
             vol.Optional("drain_ms", default=2000):
                 vol.All(vol.Coerce(int), vol.Range(min=100, max=10000)),
         }),
+    )
+
+    # ─── Watering programs (protobuf family: HT34A / HT25G2) ──────────────────
+
+    async def set_program(call: ServiceCall) -> None:
+        coords = _protobuf_coordinators_for_call(hass, call)
+        if not coords:
+            raise HomeAssistantError("no protobuf B-Hyve device matched the target")
+        spec = _spec_from_call(call)
+        for coord in coords:
+            ok = await coord.device.set_program(spec)
+            await coord.async_request_refresh()
+            if not ok:
+                _LOGGER.warning(
+                    "%s: set_program slot %s not confirmed by the device",
+                    coord.device.mac, call.data["slot"],
+                )
+
+    hass.services.async_register(
+        DOMAIN,
+        "set_program",
+        set_program,
+        schema=vol.Schema({
+            vol.Required("device_id"): vol.All(cv.ensure_list, [cv.string]),
+            vol.Required("slot"): vol.In(list(PROGRAM_SLOTS)),
+            vol.Required("day_mode"): vol.In(["weekdays", "interval", "odd", "even", "once"]),
+            vol.Optional("weekdays"): vol.All(cv.ensure_list, [vol.In(list(_WEEKDAY_BITS))]),
+            vol.Optional("interval_days"): vol.All(vol.Coerce(int), vol.Range(min=1, max=31)),
+            vol.Optional("interval_anchor"): cv.string,
+            vol.Required("start_times"): vol.All(cv.ensure_list, [cv.string]),
+            vol.Required("zones"): vol.All(cv.ensure_list, [vol.Schema({
+                vol.Required("zone"): vol.All(vol.Coerce(int), vol.Range(min=1, max=16)),
+                vol.Required("minutes"): vol.All(vol.Coerce(int), vol.Range(min=1, max=1440)),
+            })]),
+            vol.Optional("name", default=""): cv.string,
+            vol.Optional("budget", default=100): vol.All(vol.Coerce(int), vol.Range(min=0, max=300)),
+            vol.Optional("enabled", default=False): cv.boolean,
+        }),
+    )
+
+    async def delete_program(call: ServiceCall) -> None:
+        coords = _protobuf_coordinators_for_call(hass, call)
+        if not coords:
+            raise HomeAssistantError("no protobuf B-Hyve device matched the target")
+        slot = PROGRAM_SLOTS[call.data["slot"].upper()]
+        for coord in coords:
+            await coord.device.delete_program(slot)
+            await coord.async_request_refresh()
+
+    hass.services.async_register(
+        DOMAIN,
+        "delete_program",
+        delete_program,
+        schema=vol.Schema({
+            vol.Required("device_id"): vol.All(cv.ensure_list, [cv.string]),
+            vol.Required("slot"): vol.In(list(PROGRAM_SLOTS)),
+        }),
+    )
+
+    async def get_program(call: ServiceCall) -> ServiceResponse:
+        coords = _protobuf_coordinators_for_call(hass, call)
+        if not coords:
+            raise HomeAssistantError("no protobuf B-Hyve device matched the target")
+        slot_filter = call.data.get("slot")
+        result: dict[str, Any] = {}
+        for coord in coords:
+            programs = await coord.device.get_programs()
+            await coord.async_request_refresh()
+            slots = programs
+            if slot_filter:
+                sid = PROGRAM_SLOTS[slot_filter.upper()]
+                slots = {sid: programs[sid]} if sid in programs else {}
+            result[coord.device.name] = [
+                _summary_to_dict(programs[sid]) for sid in sorted(slots)
+            ]
+        return {"devices": result}
+
+    hass.services.async_register(
+        DOMAIN,
+        "get_program",
+        get_program,
+        schema=vol.Schema({
+            vol.Required("device_id"): vol.All(cv.ensure_list, [cv.string]),
+            vol.Optional("slot"): vol.In(list(PROGRAM_SLOTS)),
+        }),
+        supports_response=SupportsResponse.ONLY,
     )
