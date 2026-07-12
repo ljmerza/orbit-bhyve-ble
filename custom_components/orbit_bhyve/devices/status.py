@@ -507,6 +507,15 @@ def apply_status_plaintext(device, pt: bytes) -> None:
             if st.next_start_flags and st.next_start_epoch
             else None
         )
+    elif st.run_state is not None:
+        # A #16 status block was decoded but carried no #16.#9 nextStartProgramFlags.
+        # Protobuf omits zero-valued scalars, so when the last enabled program is
+        # disabled/deleted the device stops emitting #9 entirely (rather than #9=0),
+        # which would otherwise freeze the "Next run" sensor at the old timestamp and
+        # leave stale flags that let set_program falsely confirm. Clear it — symmetric
+        # to the rain-delay clear above (the "7 hours ago" bug).
+        device.state.next_start_flags = None
+        device.state.next_start_at = None
 
     if (
         st.battery_mv is not None

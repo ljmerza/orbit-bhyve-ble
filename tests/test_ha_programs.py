@@ -16,7 +16,12 @@ from bleak.exc import BleakError
 from orbit_bhyve.connection import BHyveBleConnection
 from orbit_bhyve.devices import protobuf as tx
 from orbit_bhyve.devices import status as rx
-from orbit_bhyve.devices.base import DeviceState, ProgramSpec, ProgramSummary
+from orbit_bhyve.devices.base import (
+    DeviceState,
+    ProgramSpec,
+    ProgramSummary,
+    parse_start_minutes,
+)
 from orbit_bhyve.devices.ht25g2 import BHyveHT25G2Device
 
 
@@ -553,3 +558,66 @@ def test_refresh_state_reads_programs_on_idle_poll():
     # the #10 syncRequest went out on the idle poll (via send_stream)
     assert any(rx._pb_field(rx.pb_parse(rx.decode_inner(f) or b""), 10) is not None
                for f in dev.connection.streamed)
+
+
+# --- PR#31 round-2 review regressions ---------------------------------------
+
+def test_next_start_clears_when_16_9_absent():
+    # Finding 1 / class "protobuf zero-omission -> clear-on-absence": the device
+    # omits zero-valued #16.#9, so disabling/deleting the last program stops it
+    # emitting #9. A later #16 status with NO #9 must CLEAR the Next-run state, not
+    # freeze it at the old timestamp (which also blocked a stale false-confirm).
+    dev = _make_gen2()
+    dev._observe_plaintext(_status_with_next_start(0b0010, epoch=1_700_000_000))
+    assert dev.state.next_start_flags == 0b0010
+    assert dev.state.next_start_at is not None
+    dev._observe_plaintext(_status_idle())          # #16 present, #9 absent
+    assert dev.state.next_start_flags is None
+    assert dev.state.next_start_at is None
+
+
+def test_set_program_disable_confirm_fails_safe_on_dropped_mask():
+    # Finding 3 / class "frame-drop None handling is symmetric": a DISABLE whose
+    # confirm read drops the #20 mask (mask=None) must not confirm True unverified.
+    # Routing through _enable_mask reports it unconfirmed (the safe direction) — the
+    # old `(mask2 or 0) & bit == on` returned True for a disable without verifying.
+    a = tx._build_program_pb(_ha_spec(1, "odd", start_mins=(360,), zones=((0, 60),), name="A"))
+    dev = _make_gen2()
+    dev.state.programs = {1: ProgramSummary(slot=1, empty=False, enabled=True, name="A")}
+    dev.connection = _FakeProgramConn(
+        dev,
+        # pre-write read has the mask; the confirm read DROPS the trailing #20 frame
+        dumps=[_dump_stream([a], mask=1), _dump_stream([a], mask=None)],
+    )
+    assert asyncio.run(dev.set_program_enabled(1, False)) is False
+
+
+def test_read_programs_clears_stale_on_empty_but_coherent_dump():
+    # Finding 5 / class "clear-on-absence": all programs deleted via the app on
+    # hardware that OMITS deleted slots -> a coherent dump (a #20 mask and/or #16
+    # status decoded, zero #19 bodies) must CLEAR last-known, not retain a stale
+    # schedule forever. Contrast with the truncated-read test above (mask+status
+    # both None) which must PRESERVE state.
+    dev = _make_gen2()
+    dev.state.programs = {1: ProgramSummary(slot=1, empty=False, enabled=True, name="Stale")}
+    dev.connection = _ScriptedStreamConn(dev, streams=[_dump_stream([], mask=0)])
+    programs = asyncio.run(dev.get_programs())
+    assert programs == {}
+    assert dev.state.programs == {}   # stale schedule cleared
+
+
+def test_parse_start_minutes_accepts_hhmm_and_hhmmss():
+    # Finding 2 / class "service-input coercion footguns".
+    assert parse_start_minutes("06:00") == 360
+    assert parse_start_minutes("18:00") == 1080
+    assert parse_start_minutes("06:00:30") == 360   # HA time-selector HH:MM:SS, secs dropped
+    assert parse_start_minutes("23:59") == 1439
+
+
+@pytest.mark.parametrize("bad", ["1080", 1080, "24:00", "12:60", "18:00:00:00", "abc", ""])
+def test_parse_start_minutes_rejects_footguns(bad):
+    # "1080"/1080 is the YAML sexagesimal footgun (unquoted 18:00 -> int 1080 ->
+    # cv.string "1080"); the old `% 1440` math silently scheduled MIDNIGHT. Reject
+    # rather than wrap, and reject out-of-range / non-time tokens.
+    with pytest.raises(ValueError):
+        parse_start_minutes(bad)

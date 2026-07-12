@@ -32,6 +32,30 @@ SLOT_LETTERS = {v: k for k, v in PROGRAM_SLOTS.items()}
 UI_SLOTS = ("A", "B", "C", "D")
 
 
+def parse_start_minutes(tok: object) -> int:
+    """Parse one program start-time token to minutes-from-midnight (0..1439).
+
+    Guards two YAML/service footguns instead of silently wrapping with `% 1440`:
+    an *unquoted* HH:MM inside a YAML list is parsed as a sexagesimal INT
+    (`18:00` -> `1080`, later coerced to the string ``"1080"``), and an
+    ``HH:MM:SS`` string (what HA time selectors emit) is not something ``int()``
+    accepts. Require an explicit ``HH:MM[:SS]`` string and reject out-of-range /
+    non-time tokens — the old ``(int(h)*60+int(m)) % 1440`` turned ``18:00`` into
+    midnight. Raises ``ValueError`` on bad input (the service layer maps that to a
+    ``ServiceValidationError``); kept HA-free so it is unit-testable standalone."""
+    s = str(tok).strip()
+    parts = s.split(":")
+    if len(parts) not in (2, 3) or not all(p.isdigit() for p in parts):
+        raise ValueError(
+            f"start_times entries must be HH:MM (or HH:MM:SS); got {tok!r}. "
+            "Quote bare times in YAML so 18:00 isn't read as the integer 1080."
+        )
+    hour, minute = int(parts[0]), int(parts[1])
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"start_times entry out of range: {tok!r}")
+    return hour * 60 + minute
+
+
 @dataclass
 class ProgramSpec:
     """A watering program to WRITE (#19 setProgramSchedule).

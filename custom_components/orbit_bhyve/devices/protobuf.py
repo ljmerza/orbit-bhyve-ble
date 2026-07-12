@@ -664,7 +664,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
         stream = await self.connection.send_stream(
             _build_message(_build_sync_request_pb()), drain_ms=6000
         )
-        programs, mask, _status = parse_sync_dump(stream)
+        programs, mask, status = parse_sync_dump(stream)
         if programs:
             if mask is None:
                 # Mask frame dropped on this burst — keep each slot's known enable
@@ -674,6 +674,15 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                     if sch.enabled is None and prev is not None:
                         sch.enabled = prev.enabled
             self.state.programs = programs
+        elif mask is not None or status is not None:
+            # ZERO #19 bodies but the burst DID decode a coherent frame (the #20 enable
+            # mask and/or the #16 status): the device answered fully and stores no
+            # programs — e.g. every slot deleted via the app on hardware that omits
+            # deleted slots rather than echoing NotSet bodies. Clear last-known so a
+            # stale schedule doesn't linger forever. A truncated / CTR-desynced burst
+            # decodes NEITHER (mask and status both None), so it still preserves state
+            # — the presence of a decoded frame is the distinguishing signal.
+            self.state.programs = {}
         return programs, mask
 
     async def get_programs(self) -> dict:
@@ -809,7 +818,12 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 )
                 await self.refresh_status()
                 _programs2, mask2 = await self._read_programs()
-                return bool((mask2 or 0) & bit) == on
+                # Route the confirm read through _enable_mask so a dropped #20 frame
+                # (mask2=None) fails safe in BOTH directions: `(mask2 or 0)` would let a
+                # DISABLE confirm True without verifying anything (0 & bit == 0 == "off"),
+                # asymmetric with enable. Reconstructing from last-known flags reports the
+                # unverified toggle as unconfirmed instead — the safe direction.
+                return bool(self._enable_mask(mask2) & bit) == on
             finally:
                 await self.connection.disconnect()
 
