@@ -57,6 +57,14 @@ def resolve_device_class(*, hardware: str, firmware: str, type_: str) -> type[BH
         # class handles a 2-port unit unchanged. Untested on hardware here
         # (issue #13) — same caveat as HT34A.
         return BHyveHT34ADevice
+    if (hardware or "").startswith("HT31"):
+        # HT31-0001 "Smart Hose Tap Timer" (fw0058): single-port sibling of
+        # the XD family — same fw0058 protobuf-over-CRC16 protocol (magic
+        # 0x11) as HT34-0001. Hardware-verified end-to-end (status/battery
+        # polling + valve actuation with water observed) on five fw0058
+        # units, 2026-07-12. Station count flows from the cloud record, so
+        # the 4-port class handles the 1-port unit unchanged.
+        return BHyveHT34ADevice
     raise UnsupportedModel(hardware or "?", firmware or "?")
 
 

@@ -34,6 +34,7 @@ from orbit_bhyve.devices.protobuf import BHyveProtobufDevice
     [
         ("", "", "bridge", BHyveHubDevice),               # hub wins on type
         ("HT34A-0001", "0107", "", BHyveHT34ADevice),     # XD 4-port
+        ("HT31-0001", "0058", "", BHyveHT34ADevice),      # 1-port Smart Hose Tap (XD protobuf)
         ("HT25G2-0001", "0111", "", BHyveHT25G2Device),   # Gen2 by suffix
         ("HT25-0001", "0111", "", BHyveHT25G2Device),       # Gen2 by fw0111
         ("HT25-0001", "0085", "", BHyveHT25Fw0085Device),   # mesh fw0085 (upstream subclass)
