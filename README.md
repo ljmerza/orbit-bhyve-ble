@@ -62,6 +62,16 @@ Per discovered sprinkler device:
 - **Sync** button per device — forces a fresh BLE connect + init
   handshake. Useful after a long idle, or to refresh the battery
   reading on demand without waiting for the next poll.
+- **Identify** button (protobuf family) — flashes the device LED (#47)
+  so you can physically locate it. No-op on the XD, which ignores it.
+- **Automatic watering** switch — the device-global controller mode
+  (auto vs. off). When off, stored programs don't run.
+- **Program A–D** enable switches + summary sensors — each stored
+  program slot's on/off enable bit, plus a sensor showing its schedule
+  (days, start times, per-zone durations). A slot with no stored program
+  reads `unavailable`.
+- **Next run** sensor — the device-computed next scheduled program start
+  (timestamp), with the program letter(s) as an attribute.
 - Manufacturer / model / firmware / MAC are exposed via the device's
   "Device info" panel.
 
@@ -75,6 +85,20 @@ registry.
 - `orbit_bhyve.stop_all` — stop everything on the targeted device
 - `orbit_bhyve.refresh_devices` — re-query the cloud (for new devices, key
   rotation, or fw changes); manual, no background polling
+- `orbit_bhyve.get_program` — read back a program slot (A–F) as structured
+  data (`SupportsResponse.ONLY`): days, start times, per-zone durations
+- `orbit_bhyve.set_program` — store/replace a program in a slot: watering
+  days (weekdays / even / odd / every-N-days), start time(s), per-zone
+  run durations. Optionally enable it in the same call
+- `orbit_bhyve.delete_program` — clear a program slot
+
+> **Watering programs are for non-Smart slots.** The device stores up to six
+> program slots; this integration reads and writes their schedules over BLE.
+> Slots are read back from the device's `#10` sync dump (a multi-frame reply
+> reassembled over the connection), so `get_program` and the Program sensors
+> reflect what's actually stored — including programs created in the B-Hyve
+> app. For richer scheduling logic, drive `start_watering` from
+> `irrigation_unlimited` or HA's Smart Irrigation instead.
 
 ## Options flow
 

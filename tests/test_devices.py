@@ -115,6 +115,18 @@ def _flow_frame(active: int, total: int) -> bytes:
 _STATUS_REQ_FRAME = None  # set lazily to the #15{} frame the device emits
 
 
+def _is_status_elicitor(frame: bytes) -> bool:
+    """True if `frame` is a status-eliciting request: either #15{} getDeviceStatus
+    (post-command confirm reads) or #75 setEpochTime (the coordinator poll, which
+    sets the clock AND returns the same #16 status). Both should yield on_status."""
+    top = rx.pb_parse(rx.decode_inner(frame) or b"")
+    return rx._pb_field(top, 15) is not None or rx._pb_field(top, 75) is not None
+
+
+def _sent_status_request(conn) -> bool:
+    return any(_is_status_elicitor(f) for f in conn.sent)
+
+
 class _FakeConn:
     """Stand-in for BHyveBleConnection: records sent frames and feeds a canned
     plaintext back through the device's own observer, exactly as _on_notify
@@ -122,17 +134,23 @@ class _FakeConn:
 
     def __init__(self, device, *, on_status=None, on_command=None):
         self.device = device
-        self.on_status = on_status      # fed when the #15{} status request is sent
+        self.on_status = on_status      # fed on a status elicitor (#15{} or #75)
         self.on_command = on_command    # fed on any other frame (start/stop/rain)
         self.sent: list[bytes] = []
         self.disconnects = 0
 
     async def send(self, frame: bytes, drain_ms: int = 1500):
         self.sent.append(frame)
-        pt = self.on_status if frame == pb._build_message(pb._REQUEST_STATUS_PB) else self.on_command
+        pt = self.on_status if _is_status_elicitor(frame) else self.on_command
         if pt is not None:
             self.device._observe_plaintext(pt)
         return [b"\x01"]  # one notification (the bare #30 ack for a stop)
+
+    async def send_stream(self, frame: bytes, drain_ms: int = 4000):
+        # The idle coordinator poll reads programs via #10 syncRequest; these
+        # fakes carry no program dump, so return an empty stream (no programs).
+        self.sent.append(frame)
+        return b""
 
     async def disconnect(self):
         self.disconnects += 1
@@ -205,7 +223,21 @@ def test_refresh_state_polls_status_and_sees_out_of_band_run():
     state = asyncio.run(dev.refresh_state())
 
     assert state.is_watering is True
-    assert pb._build_message(pb._REQUEST_STATUS_PB) in dev.connection.sent
+    # The poll elicitor is #75 setEpochTime (reads status AND syncs the clock).
+    assert _sent_status_request(dev.connection)
+
+
+def test_refresh_state_poll_uses_epoch_time_elicitor():
+    # The coordinator poll must use #75 setEpochTime (not the bare #15{}) so it
+    # keeps the device clock honest while reading status — HW-validated content-
+    # identical reply (session 2026-07-06).
+    dev = _make_device(is_watering=False)
+    dev.connection = _FakeConn(dev, on_status=_status_frame(1), on_command=None)
+    asyncio.run(dev.refresh_state())
+    sent_fields = [rx._pb_field(rx.pb_parse(rx.decode_inner(f) or b""), 75) for f in dev.connection.sent]
+    assert any(v is not None for v in sent_fields)  # a #75 frame was sent
+    # and NOT the bare #15{} on the poll path
+    assert pb._build_message(pb._REQUEST_STATUS_PB) not in dev.connection.sent
 
 
 def test_start_arms_wall_clock_autoclose():

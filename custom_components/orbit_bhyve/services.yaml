@@ -27,6 +27,143 @@ refresh_devices:
   name: Refresh devices from cloud
   description: Re-query the Orbit cloud for new/changed devices and updated network keys. Manual; no background polling.
 
+set_program:
+  name: Set watering program
+  description: Create or replace a watering program (slots A–D) on a B-Hyve valve (HT34A / HT25G2). Choose exactly one day-mode.
+  fields:
+    device_id:
+      name: Device
+      description: The B-Hyve valve (HT34A / HT25G2).
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: orbit_bhyve
+    slot:
+      name: Program slot
+      description: Which program slot to write (A–D).
+      required: true
+      example: A
+      selector:
+        select:
+          options: [A, B, C, D]
+    day_mode:
+      name: Day mode
+      description: How often the program runs. Exactly one mode.
+      required: true
+      example: weekdays
+      selector:
+        select:
+          options: [weekdays, interval, odd, even, once]
+    weekdays:
+      name: Weekdays
+      description: For day mode "weekdays" — which days to run.
+      required: false
+      example: "[mon, wed, fri]"
+      selector:
+        select:
+          multiple: true
+          options: [sun, mon, tue, wed, thu, fri, sat]
+    interval_days:
+      name: Interval (days)
+      description: For day mode "interval" — run every N days.
+      required: false
+      example: 3
+      selector:
+        number:
+          min: 1
+          max: 31
+          mode: box
+    interval_anchor:
+      name: Interval anchor date
+      description: For day mode "interval" — ISO date the interval counts from (default today).
+      required: false
+      example: "2026-07-01T00:00:00-04:00"
+      selector:
+        text:
+    start_times:
+      name: Start times
+      description: One or more start times (HH:MM, device-local).
+      required: true
+      example: "[06:00, 18:00]"
+      selector:
+        object:
+    zones:
+      name: Zones
+      description: Per-zone run time — a list of {zone, minutes}.
+      required: true
+      example: "[{zone: 1, minutes: 5}, {zone: 2, minutes: 7}]"
+      selector:
+        object:
+    name:
+      name: Program name
+      description: Optional label stored on the device.
+      required: false
+      example: Front lawn
+      selector:
+        text:
+    budget:
+      name: Seasonal budget (%)
+      description: Seasonal adjust percentage (default 100).
+      required: false
+      default: 100
+      example: 100
+      selector:
+        number:
+          min: 0
+          max: 300
+          unit_of_measurement: "%"
+          mode: box
+    enabled:
+      name: Enable
+      description: Enable and arm the program (runs the store→enable→autoMode handshake) so it runs on schedule.
+      required: false
+      default: false
+      selector:
+        boolean:
+
+delete_program:
+  name: Delete watering program
+  description: Clear a watering program slot (A–D) on a B-Hyve valve (HT34A / HT25G2).
+  fields:
+    device_id:
+      name: Device
+      description: The B-Hyve valve (HT34A / HT25G2).
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: orbit_bhyve
+    slot:
+      name: Program slot
+      description: Which program slot to clear (A–D).
+      required: true
+      example: A
+      selector:
+        select:
+          options: [A, B, C, D]
+
+get_program:
+  name: Get watering program(s)
+  description: Read back the stored watering programs (A–D) from a B-Hyve valve (HT34A / HT25G2). Returns a response.
+  fields:
+    device_id:
+      name: Device
+      description: The B-Hyve valve (HT34A / HT25G2).
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: orbit_bhyve
+    slot:
+      name: Program slot
+      description: Optional — a single slot (A–D). Omit to return all slots.
+      required: false
+      example: A
+      selector:
+        select:
+          options: [A, B, C, D]
+
 probe_status:
   name: Probe device status (debug)
   description: Force a fresh BLE connect + 8-step init on a device. No actuation. Decoded plaintext lands in the HA log via connection._on_notify. Used for protocol decoding work (e.g., finding battery bytes).
