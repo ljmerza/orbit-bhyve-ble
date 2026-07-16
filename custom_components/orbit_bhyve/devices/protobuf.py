@@ -603,10 +603,21 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 plaintext = _build_message(_build_rain_delay_pb(minutes, expiry))
                 notifs = await self.connection.send(plaintext, drain_ms=2000)
                 self._stamp_command(f"rain_delay set {minutes}m", len(notifs))
+                # Seed the INTENDED delay onto state before the confirm read. If that
+                # read falls into _recover_status (a unit that ignores the passive
+                # #15), its status elicitor is a setRainDelay re-assert of self.state
+                # (_noop_rain_delay_pb). Left at the pre-set value it would re-send
+                # #17{#1=0} and CLEAR the delay we just set (the reported bug). Seeding
+                # the new value makes that re-assert idempotent with the set, so the
+                # device echoes the real #16.#13 back and confirmation stays honest.
+                self.state.rain_delay_minutes = minutes
+                self.state.rain_delay_ends = datetime.fromtimestamp(expiry, tz=timezone.utc)
                 # Read back the authoritative #16.#13 echo via #15{} rather than trusting
-                # the set reply's push (which the device suppresses while active).
+                # the set reply's push (which the device suppresses while active). Gate
+                # "confirmed" on a real #16 decoding this cycle (_status_parsed) so the
+                # seeded value alone can't report a false confirm when no status came back.
                 await self.refresh_status()
-                ok = bool(self.state.rain_delay_minutes)
+                ok = self._status_parsed and bool(self.state.rain_delay_minutes)
                 _LOGGER.log(
                     logging.DEBUG if ok else logging.WARNING,
                     "%s: %s rain-delay set %dm %s",
@@ -628,9 +639,16 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
             plaintext = _build_message(_build_rain_delay_pb(0, None))
             notifs = await self.connection.send(plaintext, drain_ms=2000)
             self._stamp_command("rain_delay clear", len(notifs))
+            # Seed the cleared state before the confirm read for the same reason as
+            # set_rain_delay: if _recover_status runs, its _noop_rain_delay_pb elicitor
+            # re-asserts self.state — left at the stale pre-clear minutes it would
+            # re-send the delay and UNDO the clear. Seeding 0 makes it re-send #17{#1=0}
+            # (idempotent with the clear) and the device echoes the real cleared #16.#13.
+            self.state.rain_delay_minutes = 0
+            self.state.rain_delay_ends = None
             # Confirm the cleared #16.#13 echo via a #15{} read-back.
             await self.refresh_status()
-            return not self.state.rain_delay_minutes
+            return self._status_parsed and not self.state.rain_delay_minutes
         finally:
             if self.connection is not None:
                 await self.connection.disconnect()

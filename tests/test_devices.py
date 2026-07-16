@@ -302,6 +302,59 @@ def test_set_rain_delay_anchors_expiry_to_device_clock():
     assert rx._pb_field(rd_pb, rx.RX_F_RD_EXPIRY) == clock + minutes * 60
 
 
+def _written_rain_delay_minutes(frame: bytes) -> int | None:
+    """If `frame` is a setRainDelay (#17) write, return its #1 minutes; else None."""
+    inner = rx.decode_inner(frame)
+    if inner is None:
+        return None
+    body = rx._pb_field(rx.pb_parse(inner), 17)
+    if body is None:
+        return None
+    return rx._pb_field(rx.pb_parse(body), rx.RX_F_RD_MINUTES) or 0
+
+
+class _IgnoresStatusEchoesRainDelayConn(_FakeConn):
+    """A unit (like BTValve01 while active) that ignores the passive #15 query and
+    does NOT echo the set write's own reply ("suppressed while active"), but DOES
+    answer the status-recovery no-op — a #17 write issued right after a failed #15
+    — with the resulting #16 status. Tells the two #17 writes apart by whether a
+    #15 immediately preceded them: only the recovery no-op does."""
+
+    def __init__(self, device, *, clock: int):
+        super().__init__(device, on_status=None, on_command=None)
+        self._clock = clock
+
+    async def send(self, frame: bytes, drain_ms: int = 1500):
+        prev = self.sent[-1] if self.sent else None
+        self.sent.append(frame)
+        minutes = _written_rain_delay_minutes(frame)
+        if minutes is not None and prev == pb._build_message(pb._REQUEST_STATUS_PB):
+            self.device._observe_plaintext(_status_clock_and_rain_delay(self._clock, minutes))
+        return [b"\x01"]
+
+
+def test_set_rain_delay_survives_recovery_on_unit_that_ignores_15():
+    # Regression: on a unit that ignores #15 and whose set reply is suppressed, the
+    # confirm read-back falls into _recover_status, whose #16-eliciting no-op re-
+    # asserts self.state. set_rain_delay must SEED the intended minutes BEFORE that
+    # read, so the no-op re-sends the delay just set — not a stale bare #17{#1=0}
+    # clear that silently cancels it (the "rain-delay set … unconfirmed" bug, where
+    # the entity snapped back to 0). has_flow=False isolates the rain-delay recovery
+    # path from the orthogonal flow (#57) dance.
+    clock = 1_700_000_000
+    dev = _make_device(is_watering=False)
+    dev.has_flow = False
+    dev.connection = _IgnoresStatusEchoesRainDelayConn(dev, clock=clock)
+
+    ok = asyncio.run(dev.set_rain_delay(120))
+
+    # Pre-fix: the recovery no-op read stale state (0) and sent #17{#1=0}, so the
+    # device echoed 0 -> ok False, minutes 0. Post-fix: the seed makes the no-op
+    # re-assert 120, the device echoes 120 back -> confirmed.
+    assert ok is True
+    assert dev.state.rain_delay_minutes == 120
+
+
 # --- flow (#57/#59, Gen2-only) --------------------------------------------
 
 def test_has_flow_only_on_gen2():
