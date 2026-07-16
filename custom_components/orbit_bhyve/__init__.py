@@ -119,13 +119,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     _register_services(hass)
 
-    # Kick a prompt (non-blocking) first poll so an in-progress run / live state
-    # is read within one cycle instead of waiting a full idle interval. Matters
-    # after an HA restart mid-run: without this the valve shows idle until the
-    # next idle-cadence tick. async_request_refresh only *schedules* the poll, so
-    # this doesn't block setup on a slow/deep-sleeping device.
+    # Kick a prompt first poll so an in-progress run / live state is read
+    # within one cycle instead of waiting a full idle interval. Matters after
+    # an HA restart mid-run: without this the valve shows idle until the next
+    # idle-cadence tick.
+    #
+    # NOTE: async_request_refresh() must NOT be awaited here. Its debouncer
+    # fires IMMEDIATELY on the first call, so awaiting it runs a real BLE poll
+    # inline during setup. If no Bluetooth backend is up yet (e.g. the adapter
+    # hasn't enumerated at boot), that await can outlive bootstrap's timeout:
+    # HA cancels the entry mid-setup, the forwarded platforms leak ('has
+    # already been setup!' on every retry/reload), and the coordinators are
+    # left shut down ('Debouncer call ignored as shutdown has been
+    # requested.'). Fire the first polls as entry-scoped background tasks.
     for coord in runtime.coordinators.values():
-        await coord.async_request_refresh()
+        entry.async_create_background_task(
+            hass,
+            coord.async_request_refresh(),
+            f"orbit_bhyve first poll {coord.name}",
+        )
     return True
 
 
