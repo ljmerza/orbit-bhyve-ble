@@ -17,7 +17,7 @@ import struct
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 
-from .base import ProgramSummary, _mv_to_pct
+from .base import ProgramSummary
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -427,8 +427,7 @@ def apply_status_plaintext(device, pt: bytes) -> None:
         device.state.device_clock = st.device_clock
 
     if st.battery_mv is not None and 1500 <= st.battery_mv <= 4000:
-        device.battery_mv = st.battery_mv
-        device.battery_pct = _mv_to_pct(st.battery_mv)
+        device.battery_mv = st.battery_mv  # battery_pct is a chemistry-aware property
 
     # Raw cumulative flow counter (#59.#3) — record whenever a #59 carries it,
     # regardless of the flow-active flag, so read_flow can sample its slope even

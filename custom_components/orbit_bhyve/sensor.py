@@ -30,7 +30,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import BHyveDeviceCoordinator
-from .devices.base import PROGRAM_SLOTS, SLOT_LETTERS, UI_SLOTS, ProgramSummary, _mv_to_pct
+from .devices.base import PROGRAM_SLOTS, SLOT_LETTERS, UI_SLOTS, ProgramSummary
 from .devices.protobuf import BHyveProtobufDevice
 
 _WEEKDAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
@@ -134,12 +134,11 @@ class BHyveBatterySensor(_RestoreLastValueSensor):
 
     @property
     def native_value(self) -> float | None:
-        device = self.coordinator.device
-        if device.battery_pct is not None:
-            return device.battery_pct
-        if device.battery_mv is not None:
-            return _mv_to_pct(device.battery_mv)
-        return self._restored_value
+        # battery_pct is a chemistry-aware property derived from battery_mv, so
+        # it already covers the mv-only case; fall back to the restored value only
+        # when no live voltage has been read yet.
+        pct = self.coordinator.device.battery_pct
+        return pct if pct is not None else self._restored_value
 
 
 class BHyveBatteryVoltageSensor(_RestoreLastValueSensor):

@@ -79,6 +79,47 @@ def test_mv_to_pct(mv, pct):
     assert _mv_to_pct(mv) == pct
 
 
+@pytest.mark.parametrize(
+    "chemistry,mv,pct",
+    [
+        # NiMH plateau (2450 mV) reads a healthy 25% on its curve vs a false ~8% on
+        # alkaline; endpoints 2350..2750.
+        ("nimh", 2450, 25),
+        ("nimh", 2350, 0),
+        ("nimh", 2750, 100),
+        # Primary lithium: 2600..3400; its 3000 mV plateau reads 50%.
+        ("lithium_primary", 3000, 50),
+        ("lithium_primary", 2600, 0),
+        # Regulated li-ion shares alkaline endpoints (unmeasurable-by-percent, so
+        # it just tracks the alkaline curve).
+        ("lithium_regulated", 2700, 50),
+        # Unknown chemistry falls back to the alkaline curve rather than dividing by
+        # a bogus span.
+        ("bogus", 2700, 50),
+    ],
+)
+def test_mv_to_pct_chemistry(chemistry, mv, pct):
+    assert _mv_to_pct(mv, chemistry) == pct
+
+
+def test_battery_pct_property_follows_chemistry():
+    # battery_pct is derived live from battery_mv + battery_chemistry, so flipping
+    # the chemistry re-gauges the same voltage with no new BLE read.
+    record = {
+        "cloud_id": "abc", "name": "T", "mac": "AA:BB:CC:DD:EE:FF",
+        "hardware": "HT25G2-0001", "firmware": "0111", "stations": 1,
+        "network_key": "",  # no key -> no BLE connection (no hass needed)
+    }
+    dev = BHyveHT25G2Device(None, record)
+    assert dev.battery_pct is None            # no voltage yet
+    dev.battery_mv = 2450
+    assert dev.battery_chemistry == "alkaline"  # default
+    assert dev.battery_pct == _mv_to_pct(2450, "alkaline")
+    dev.battery_chemistry = "nimh"
+    assert dev.battery_pct == _mv_to_pct(2450, "nimh")
+    assert dev.battery_pct == 25
+
+
 def test_cloud_battery_snapshot_is_not_seeded():
     # The cloud battery snapshot must NEVER seed the sensor: it's on a different
     # discharge curve than _mv_to_pct, so it painted a wrong (voltage-inconsistent)
