@@ -191,38 +191,42 @@ class BHyveHT25Device(BHyveBleDeviceBase):
     async def start_watering(self, station: int, duration_sec: int) -> bool:
         if self.connection is None:
             return False
-        try:
-            # HT25 is single-station; `station` is a no-op placeholder for API parity.
-            # Stash before sending so the START-ack (which can arrive after a write
-            # timeout) can arm the off-timer in _observe_plaintext.
-            self._pending_start_duration = duration_sec
-            self._pending_start_zone = station
-            plaintext = self._build_start(0xB6, duration_sec)
-            _LOGGER.debug("%s: START tx pt=%s", self.mac, plaintext.hex())
-            notifs = await self._send_command(plaintext, "START")
-            self._stamp_command(f"start s={station} d={duration_sec}", len(notifs))
-            self._mark_reached()  # connected + sent → device reached this cycle
-            # The off-timer is armed by the device's START-ack (_observe_plaintext),
-            # not by send()'s return — so this holds even when the write-response
-            # times out. Report whatever state the ack has produced by now.
-            return self.state.is_watering
-        finally:
-            if self.connection is not None:
-                await self.connection.disconnect()
+        # _api_lock: an active status poll (_connect_refresh) must never
+        # interleave with an actuation on the device's single BLE session.
+        async with self._api_lock:
+            try:
+                # HT25 is single-station; `station` is a no-op placeholder for API parity.
+                # Stash before sending so the START-ack (which can arrive after a write
+                # timeout) can arm the off-timer in _observe_plaintext.
+                self._pending_start_duration = duration_sec
+                self._pending_start_zone = station
+                plaintext = self._build_start(0xB6, duration_sec)
+                _LOGGER.debug("%s: START tx pt=%s", self.mac, plaintext.hex())
+                notifs = await self._send_command(plaintext, "START")
+                self._stamp_command(f"start s={station} d={duration_sec}", len(notifs))
+                self._mark_reached()  # connected + sent → device reached this cycle
+                # The off-timer is armed by the device's START-ack (_observe_plaintext),
+                # not by send()'s return — so this holds even when the write-response
+                # times out. Report whatever state the ack has produced by now.
+                return self.state.is_watering
+            finally:
+                if self.connection is not None:
+                    await self.connection.disconnect()
 
     async def stop_watering(self, station: int | None = None) -> bool:
         if self.connection is None:
             return False
-        try:
-            plaintext = self._build_stop(0xB7)
-            _LOGGER.debug("%s: STOP tx pt=%s", self.mac, plaintext.hex())
-            notifs = await self._send_command(plaintext, "STOP")
-            self._stamp_command("stop", len(notifs))
-            self._mark_reached()  # connected + sent → device reached this cycle
-            return not self.state.is_watering
-        finally:
-            if self.connection is not None:
-                await self.connection.disconnect()
+        async with self._api_lock:
+            try:
+                plaintext = self._build_stop(0xB7)
+                _LOGGER.debug("%s: STOP tx pt=%s", self.mac, plaintext.hex())
+                notifs = await self._send_command(plaintext, "STOP")
+                self._stamp_command("stop", len(notifs))
+                self._mark_reached()  # connected + sent → device reached this cycle
+                return not self.state.is_watering
+            finally:
+                if self.connection is not None:
+                    await self.connection.disconnect()
 
     async def _send_command(self, plaintext: bytes, label: str) -> list[bytes]:
         """Send a command frame via send_actuation, which re-runs the bind/init
@@ -244,33 +248,54 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         return notifs
 
     async def refresh_state(self):
-        """Passive poll: return the last-known state without opening BLE.
-        Connectivity is event-driven (stamped by _mark_reached on each actual
-        connect: Sync / start / stop), so this poll deliberately does NOT touch
-        state.is_connected — reading the torn-down live socket would pin the
-        Connected sensor off. is_watering is driven by the device's START/STOP
-        ack (_observe_plaintext) and the coordinator's wall-clock auto-close;
-        eliciting live idle status would need a connect + STATUS query (future
-        enhancement, needs hardware verification)."""
-        await super().refresh_state()
+        """Poll. Default (option off): passive — return the last-known state
+        without opening BLE. Connectivity is event-driven (stamped by
+        _mark_reached on each actual connect: Sync / start / stop), so the
+        passive poll deliberately does NOT touch state.is_connected — reading
+        the torn-down live socket would pin the Connected sensor off.
+        is_watering is driven by the device's START/STOP ack
+        (_observe_plaintext) and the coordinator's wall-clock auto-close.
+
+        With the "Mesh live status poll" option on (active_status_poll), an
+        IDLE poll instead forces a connect: the init's STATUS (seq 0x02) and
+        INFO (seq 0x03) replies refresh watering state, countdown and battery
+        via _observe_plaintext — so app/hub/schedule runs surface within one
+        idle tick. Never while watering: at the watering cadence a connect per
+        tick would hammer the AA cells and race actuations, and the STATUS
+        countdown + wall clock already track an active run."""
+        if self.active_status_poll and not self.state.is_watering:
+            recent = self.state.last_successful_poll
+            # Skip if something else (Sync button, an actuation) reached the
+            # device moments ago — no point paying for a second connect.
+            if recent is None or (
+                datetime.now(timezone.utc) - recent
+            ).total_seconds() > 10:
+                await self._connect_refresh()
         return self.state
 
-    async def async_manual_sync(self) -> None:
-        """Sync button: this mesh class's periodic refresh_state is passive (it
-        never opens BLE), so force a fresh connect here. The connect-time 8-step
-        init's status (seq 0x02) and info (seq 0x03) replies refresh watering
-        state and battery via _observe_plaintext — the on-demand refresh #24
-        dropped when it stopped forcing a connect on the button. Ephemeral:
+    async def _connect_refresh(self) -> None:
+        """Force a fresh ephemeral connect purely for its init replies: the
+        8-step init's status (seq 0x02) and info (seq 0x03) responses refresh
+        watering state and battery via _observe_plaintext. Disconnect first so
+        the init actually re-runs (a pooled session would skip it), and
         disconnect afterwards so we don't hold the device's single session."""
         if self.connection is None:
             return
-        try:
-            await self.connection.disconnect()
-            await self.connection.ensure_connected()
-        except (BleakError, asyncio.TimeoutError, OSError) as err:
-            _LOGGER.warning("%s: manual sync connect failed: %s", self.mac, err)
-            self._mark_unreachable()
-        else:
-            self._mark_reached()  # connect + init succeeded → device reached
-        finally:
-            await self.connection.disconnect()
+        async with self._api_lock:
+            try:
+                await self.connection.disconnect()
+                await self.connection.ensure_connected()
+            except (BleakError, asyncio.TimeoutError, OSError) as err:
+                _LOGGER.warning("%s: status refresh connect failed: %s", self.mac, err)
+                self._mark_unreachable()
+            else:
+                self._mark_reached()  # connect + init succeeded → device reached
+            finally:
+                await self.connection.disconnect()
+
+    async def async_manual_sync(self) -> None:
+        """Sync button: this mesh class's periodic refresh_state can be passive
+        (it never opens BLE unless the live-status option is on), so force a
+        fresh connect here — the on-demand refresh #24 dropped when it stopped
+        forcing a connect on the button."""
+        await self._connect_refresh()

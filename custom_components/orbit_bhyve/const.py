@@ -44,6 +44,7 @@ CONF_IDLE_DISCONNECT = "idle_disconnect_sec"
 CONF_POLL_IDLE = "poll_idle_sec"
 CONF_POLL_WATERING = "poll_watering_sec"
 CONF_FLOW_COUNTS_PER_GALLON = "flow_counts_per_gallon"
+CONF_MESH_STATUS_POLL = "mesh_status_poll"
 
 DEFAULT_DURATION = 600
 DEFAULT_IDLE_DISCONNECT = 60
@@ -52,6 +53,11 @@ DEFAULT_POLL_IDLE = 900  # 15 min — an idle status poll (#15) connects over BL
                          # last longer and get picked up at least once. Tunable in the
                          # Configure dialog (Poll idle).
 DEFAULT_POLL_WATERING = 30
+# Opt-in, default OFF: an idle mesh (HT25) status poll must CONNECT over BLE
+# (~96 connects/day at the default 15-min idle cadence, each a full bind/init
+# on AA cells), unlike the protobuf family whose poll is already a connect.
+# Without it, mesh idle state stays event-driven (acks + wall clock).
+DEFAULT_MESH_STATUS_POLL = False
 
 # Flow (Gen2 #59.#3) is a CUMULATIVE per-run volume counter in raw device units,
 # not gpm. To convert the counter to gallons, divide by this factor (exposed as

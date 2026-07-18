@@ -82,6 +82,13 @@ Per discovered sprinkler device:
 - **Sync** button per device — forces a fresh BLE connect + init
   handshake. Useful after a long idle, or to refresh the battery
   reading on demand without waiting for the next poll.
+- **Mesh live status** (HT25, opt-in option) — by default mesh timers are
+  polled passively (state comes from command acks + a wall-clock timer, to
+  spare the AA batteries). Turning on **Mesh live status poll** makes each
+  idle poll connect and read the device's real watering state, countdown
+  and battery — so runs started from the B-Hyve app or a hub schedule show
+  up in HA within one poll. Costs roughly 96 BLE connects/day at the
+  default 15-minute cadence.
 - **Identify** button (protobuf family) — flashes the device LED (#47)
   so you can physically locate it. No-op on the XD, which ignores it.
 - **Automatic watering** switch — the device-global controller mode
@@ -145,6 +152,9 @@ registry.
 - **Flow calibration** (counts per gallon) — converts the Gen2 flow
   counter to gallons; default 433 was bucket-measured. Re-calibrate by
   comparing `Water used` against a bucket/meter over one run
+- **Mesh live status poll** (bool, default off) — HT25 mesh timers connect
+  over BLE on each idle poll to read live watering state and battery.
+  Battery trade-off: ~96 connects/day at the default idle cadence
 
 ## How it works
 
