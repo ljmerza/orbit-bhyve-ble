@@ -629,7 +629,7 @@ Decoded (partial): `deviceInfo { numStations: 4, hwVersion: "HT34A-0001", fwVers
 **Frame types:** `0x003E` (standard status), `0x005E` (watering-summary variant -- carries `f18 wateringStatusSummary`)  
 **OrbitPbApi_Message field:** f16 `deviceStatusInfo`  
 **Class:** `OrbitPbApi_DeviceStatusInfo`  
-**Parser:** `BHyveHT34ADevice._parse_status()` in `devices/ht34a.py` (decodes run-state (f1) + time-remaining (f6/f7) only; the remaining fields below are protocol reference, not all parsed)
+**Parser:** `extract_status()` in `devices/status.py` (decodes run-state (f1), run progress (f6), faultStatus (f7), next-start (f9/f10), rain delay (f13), battery (f14); the remaining fields below are protocol reference, not all parsed)
 
 Both type codes carry the same protobuf class. `0x003E` is the typical device status update;
 `0x005E` is seen when the device sends a watering status summary (its `OrbitPbApi_DeviceStatusInfo`

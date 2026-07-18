@@ -69,6 +69,13 @@ Per discovered sprinkler device:
 - **Connected** and **Watering** binary sensors — device connectivity
   (diagnostic) and whether a station is currently running, for automations
   and dashboards.
+- **Problem** binary sensor (protobuf family) — the device's own fault
+  report: pump, battery, voltage-boost, flow anomalies and per-station
+  faults, with each flag as an attribute. On flow-capable Gen2 valves two
+  dedicated sensors ride along: **Leak detected** (water moving while the
+  valve is commanded closed) and **No flow** (valve open but nothing
+  flowing; disabled by default until field-confirmed — you can test it by
+  starting a run with the faucet closed).
 - **Default watering duration** (`number` entity, minutes) — per device.
   The valve uses this when `start_watering` is called without an
   explicit duration. Restored across HA restarts.
@@ -95,6 +102,10 @@ Per discovered sprinkler device:
   confirm whether it ever populates.
 - Manufacturer / model / firmware / MAC are exposed via the device's
   "Device info" panel.
+- **Download diagnostics** — the integration and each device support HA's
+  standard diagnostics download (Settings → Devices & Services → ⋮ →
+  Download diagnostics): device records, live state and poll health, with
+  credentials and BLE network keys redacted. Attach it to bug reports.
 
 Hubs (`BH1-0001`) are filtered out at discovery — they don't actuate
 anything, so they don't appear in the device picker or the device
