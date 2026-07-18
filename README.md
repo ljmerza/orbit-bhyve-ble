@@ -69,6 +69,13 @@ Per discovered sprinkler device:
 - **Connected** and **Watering** binary sensors — device connectivity
   (diagnostic) and whether a station is currently running, for automations
   and dashboards.
+- **Problem** binary sensor (protobuf family) — the device's own fault
+  report: pump, battery, voltage-boost, flow anomalies and per-station
+  faults, with each flag as an attribute. On flow-capable Gen2 valves two
+  dedicated sensors ride along: **Leak detected** (water moving while the
+  valve is commanded closed) and **No flow** (valve open but nothing
+  flowing; disabled by default until field-confirmed — you can test it by
+  starting a run with the faucet closed).
 - **Default watering duration** (`number` entity, minutes) — per device.
   The valve uses this when `start_watering` is called without an
   explicit duration. Restored across HA restarts.
@@ -92,8 +99,20 @@ Per discovered sprinkler device:
   reads `unavailable`.
 - **Next run** sensor — the device-computed next scheduled program start
   (timestamp), with the program letter(s) as an attribute.
+- **Flow rate** and **Water used** sensors (flow-capable Gen2 valves) —
+  instantaneous GPM sampled from the inline flow sensor on each watering
+  poll, plus a cumulative gallons total integrated from it that plugs
+  straight into HA's Water dashboard (no Integration helper needed; the
+  total is restored across restarts). Calibrate with the **Flow
+  calibration** option below. A diagnostic **Flow rate (device)** sensor
+  (disabled by default) records the device's own reported GPM field to
+  confirm whether it ever populates.
 - Manufacturer / model / firmware / MAC are exposed via the device's
   "Device info" panel.
+- **Download diagnostics** — the integration and each device support HA's
+  standard diagnostics download (Settings → Devices & Services → ⋮ →
+  Download diagnostics): device records, live state and poll health, with
+  credentials and BLE network keys redacted. Attach it to bug reports.
 
 Hubs (`BH1-0001`) are filtered out at discovery — they don't actuate
 anything, so they don't appear in the device picker or the device
@@ -130,6 +149,9 @@ registry.
   station is watering
 - **Polling interval — watering** (sec) — faster polling while a station is
   active
+- **Flow calibration** (counts per gallon) — converts the Gen2 flow
+  counter to gallons; default 433 was bucket-measured. Re-calibrate by
+  comparing `Water used` against a bucket/meter over one run
 - **Mesh live status poll** (bool, default off) — HT25 mesh timers connect
   over BLE on each idle poll to read live watering state and battery.
   Battery trade-off: ~96 connects/day at the default idle cadence

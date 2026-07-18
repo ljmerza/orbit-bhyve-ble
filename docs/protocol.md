@@ -191,16 +191,17 @@ device-to-host messages (`wateringStatus`, `batteryStatus`, `deviceInfo`, and th
 message. Its length varies with content (a status with no rain-delay or schedule
 block is shorter), so detect it by decoding the protobuf, never by the frame length
 field. The full `OrbitPbApi_DeviceStatusInfo` submessage is documented below as
-protocol reference; this integration's decoder, `BHyveHT34ADevice._parse_status()`
-(`devices/ht34a.py`), reads only the run state (f1) and the time-remaining inside the
-`wateringStatus` block (f6) — it does not extract every field in the table:
+protocol reference; this integration's decoder, `extract_status()`
+(`devices/status.py`), reads the run state (f1), run progress (f6), fault status
+(f7), next-start (f9/f10), rain delay (f13) and battery (f14) — it does not
+extract every field in the table:
 
 | Field | Name | Notes |
 |-------|------|-------|
 | f1 | `deviceStatus` (enum) | `deviceOff`, `deviceIdle`, `lowBattery`, `rainDelayEnabled`, `wateringInProgress` (4), `meshDeviceOffline` |
 | f2 | `timerMode.mode` | off / on / program |
 | f6 | `wateringStatus` | running station and `time_remaining_sec` |
-| f7 | `faultStatus` | empty message means no faults |
+| f7 | `faultStatus` | empty message means no faults; parsed into the Problem / Leak / No-flow binary sensors |
 | f9 | `nextStartProgramFlags` | program bitmask for the next scheduled start |
 | f10 | `nextStartTimeSecEpochUTC` | epoch time of the next scheduled start |
 | f13 | `rainDelay` | `{mins, end_epoch, type}` |

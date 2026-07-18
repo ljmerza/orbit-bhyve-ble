@@ -17,7 +17,7 @@ import struct
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 
-from .base import ProgramSummary
+from .base import FaultStatus, ProgramSummary
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -54,8 +54,11 @@ RX_F_WATERING = 59        # flow sensor data (knobunc: FlowSensorData). Gen2 onl
 RX_F_WATERING_ACTIVE = 1  #   #59.#1: knobunc currentFlowRateFrequency_Hz — ~0 when no water moving,
                           #     so we use it as a "water currently flowing" signal (not "valve open").
 RX_F_FLOW_TOTAL = 3       #   #59.#3: knobunc currentCycleVolumeTicks — CUMULATIVE per-run counter (gpm
-                          #     = its slope). #59.#4 currentFlowRateGpm (float) exists but is unused
-                          #     here pending HW confirmation that it populates.
+                          #     = its slope).
+RX_F_FLOW_RATE_GPM = 4    #   #59.#4: knobunc currentFlowRateGpm — float32 (wire 5). Never yet observed
+                          #     populated on fw0111, so it feeds only the disabled-by-default
+                          #     "Flow rate (device)" sensor to gather field confirmation; the primary
+                          #     gauge stays the #59.#3 slope (read_flow).
 RX_F_WATERING_STATUS = 30  # WateringStatus notification { #1 = status enum } — the "stop ack"
 RX_F_WSTATUS_CODE = 1      #   #30.#1: 1=complete, 2=inProgress, 3=pumpDelay, 4=stationComplete,
                            #   5=stationDelay, 6=programPreDelay, 7=programPostDelay
@@ -64,6 +67,21 @@ RX_F_WSTATUS_CODE = 1      #   #30.#1: 1=complete, 2=inProgress, 3=pumpDelay, 4=
 RX_WSTATUS_ACTIVE = (2, 3, 5, 6, 7)  # in-progress + delay states = a run is still active
 RX_F_STATUS_NEXTSTART_FLAGS = 9   # #16.#9: nextStartProgramFlags (slot bitmask, A=bit0)
 RX_F_STATUS_NEXTSTART = 10        # #16.#10: nextStartTimeSecEpochUTC
+RX_F_STATUS_FAULT = 7     # #16.#7: faultStatus block (OrbitPbApi_FaultStatus,
+                          #   ble-messages.md "Nested: OrbitPbApi_FaultStatus"). A healthy
+                          #   status carries it EMPTY (`3a 00`, per the captured idle
+                          #   example) = "no faults"; protobuf omits false bools, so any
+                          #   absent field inside the block is False. Fields:
+_FLT_PUMP = 1             #   #16.#7.#1  pumpFault (bool)
+_FLT_STATIONS_LO = 2      #   #16.#7.#2  stationFaultFlags_0_31
+_FLT_STATIONS_HI = 3      #   #16.#7.#3  stationFaultFlags_32_63
+_FLT_VBOOST = 4           #   #16.#7.#4  voltageBoostCircuitFail (bool)
+_FLT_OFF_FLOW = 5         #   #16.#7.#5  valveOffFlowDetected (bool) — leak while closed
+_FLT_NO_FLOW = 6          #   #16.#7.#6  valveOnNoFlowDetected (bool)
+_FLT_LOW_FLOW = 7         #   #16.#7.#7  valveLowFlowDetected (bool)
+_FLT_HIGH_FLOW = 8        #   #16.#7.#8  valveHighFlowDetected (bool)
+_FLT_ACCESSORY = 9        #   #16.#7.#9  smartAccessoryFaultFlags
+_FLT_BATTERY = 10         #   #16.#7.#10 batteryFault (bool)
 
 # --- watering-program (#19 WateringProgram) decode ------------------------
 # Field numbers inside a #19 body. Exactly one day-mode field is present.
@@ -187,12 +205,14 @@ class DeviceStatus(NamedTuple):
     active_station: int | None = None      # #16.#6.#4 (fallback #16.#2.#2.#3.#1), 0-indexed (zone = +1)
     seconds_remaining: int | None = None   # #16.#6.#5 (counts down), present only while watering
     flow_total: int | None = None          # #59.#3 cumulative volume counter (Gen2)
+    flow_rate_gpm: float | None = None     # #59.#4 device-reported gpm float32 (unconfirmed)
     rain_delay_minutes: int | None = None  # #16.#13.#1
     rain_delay_expiry: int | None = None   # #16.#13.#3, Unix epoch seconds
     rain_delay_active: bool | None = None  # #16.#13.#4
     controller_mode: int | None = None     # #16.#2.#1 timerMode.mode: 0=off, 1=auto, 2=manual
     next_start_flags: int | None = None    # #16.#9 nextStartProgramFlags (slot bitmask, A=bit0)
     next_start_epoch: int | None = None    # #16.#10 nextStartTimeSecEpochUTC
+    faults: FaultStatus | None = None      # #16.#7 faultStatus; None = block absent
 
 
 def extract_status(protobuf: bytes) -> DeviceStatus:
@@ -202,7 +222,7 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
 
     run_state = battery_mv = is_watering = seconds_remaining = None
     active_station = rd_minutes = rd_expiry = rd_active = None
-    controller_mode = next_start_flags = next_start_epoch = None
+    controller_mode = next_start_flags = next_start_epoch = faults = None
 
     device_clock = _pb_field(top, RX_F_CLOCK)     # #7 wrapper field
     status = _pb_field(top, RX_F_STATUS)          # #16 submessage
@@ -229,6 +249,22 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
         )
         if not isinstance(seconds_remaining, int):
             seconds_remaining = None
+        flt = _pb_field(sfields, RX_F_STATUS_FAULT)      # #16.#7
+        if isinstance(flt, (bytes, bytearray)):
+            # b"" (the healthy `3a 00` empty block) parses to [] → all-False.
+            ff = pb_parse(flt)
+            faults = FaultStatus(
+                pump_fault=bool(_pb_field(ff, _FLT_PUMP)),
+                voltage_boost_fail=bool(_pb_field(ff, _FLT_VBOOST)),
+                valve_off_flow=bool(_pb_field(ff, _FLT_OFF_FLOW)),
+                valve_on_no_flow=bool(_pb_field(ff, _FLT_NO_FLOW)),
+                valve_low_flow=bool(_pb_field(ff, _FLT_LOW_FLOW)),
+                valve_high_flow=bool(_pb_field(ff, _FLT_HIGH_FLOW)),
+                battery_fault=bool(_pb_field(ff, _FLT_BATTERY)),
+                station_fault_flags=(_pb_field(ff, _FLT_STATIONS_LO) or 0)
+                | ((_pb_field(ff, _FLT_STATIONS_HI) or 0) << 32),
+                accessory_fault_flags=_pb_field(ff, _FLT_ACCESSORY) or 0,
+            )
         rd = _pb_field(sfields, RX_F_STATUS_RAINDELAY)   # #16.#13
         if isinstance(rd, (bytes, bytearray)):
             rdf = pb_parse(rd)
@@ -273,6 +309,12 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
         ws = _pb_subfield(top, RX_F_WATERING_STATUS, RX_F_WSTATUS_CODE)
         is_watering = ws in RX_WSTATUS_ACTIVE
     flow_total = _pb_subfield(top, RX_F_WATERING, RX_F_FLOW_TOTAL)   # #59.#3 cumulative
+    # #59.#4 device-reported instantaneous gpm — a float32 (wire 5), which
+    # pb_parse returns as the raw 4 bytes.
+    flow_rate_gpm = None
+    raw_gpm = _pb_subfield(top, RX_F_WATERING, RX_F_FLOW_RATE_GPM)
+    if isinstance(raw_gpm, (bytes, bytearray)) and len(raw_gpm) == 4:
+        flow_rate_gpm = round(struct.unpack("<f", bytes(raw_gpm))[0], 2)
 
     return DeviceStatus(
         run_state=run_state,
@@ -282,12 +324,14 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
         active_station=active_station,
         seconds_remaining=seconds_remaining,
         flow_total=flow_total,
+        flow_rate_gpm=flow_rate_gpm,
         rain_delay_minutes=rd_minutes,
         rain_delay_expiry=rd_expiry,
         rain_delay_active=rd_active,
         controller_mode=controller_mode,
         next_start_flags=next_start_flags,
         next_start_epoch=next_start_epoch,
+        faults=faults,
     )
 
 
@@ -435,6 +479,11 @@ def apply_status_plaintext(device, pt: bytes) -> None:
     if st.flow_total is not None:
         device.state.flow_total = st.flow_total
 
+    # Device-reported instantaneous gpm (#59.#4) — feeds the diagnostic
+    # "Flow rate (device)" sensor; not yet observed populated on hardware.
+    if st.flow_rate_gpm is not None:
+        device.state.flow_gpm_device = st.flow_rate_gpm
+
     if st.is_watering is not None:
         device.state.is_watering = st.is_watering
         if hasattr(device, "_status_parsed"):
@@ -468,6 +517,7 @@ def apply_status_plaintext(device, pt: bytes) -> None:
             device.state.seconds_remaining = None
             device.state.flow_total = None
             device.state.flow_gpm = 0.0  # valve closed → no flow
+            device.state.flow_gpm_device = None
             device.state.started_at = None
             device.state.expected_off_at = None
 
@@ -490,6 +540,15 @@ def apply_status_plaintext(device, pt: bytes) -> None:
         # after expiry (the "7 hours ago" bug).
         device.state.rain_delay_minutes = 0
         device.state.rain_delay_ends = None
+
+    # Fault report (#16.#7) — the Problem / Leak binary sensors read this.
+    # Present-but-empty decodes to the all-False report (all-clear); a status
+    # WITHOUT the block keeps the last-known report rather than clearing it —
+    # absence means "no fault report in this frame", not "faults gone" (unlike
+    # #16.#13, there is no evidence the device ever drops #7 to signal a clear;
+    # the captured healthy idle status still carries the empty block).
+    if st.faults is not None:
+        device.state.faults = st.faults
 
     # Controller mode (#16.#2.#1: 0=off, 1=auto, 2=manual) — the "Automatic
     # watering" switch reads this. Present whenever a #16 status block is decoded.
