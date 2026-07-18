@@ -87,6 +87,10 @@ Per discovered sprinkler device:
   (timestamp), with the program letter(s) as an attribute.
 - Manufacturer / model / firmware / MAC are exposed via the device's
   "Device info" panel.
+- **Download diagnostics** — the integration and each device support HA's
+  standard diagnostics download (Settings → Devices & Services → ⋮ →
+  Download diagnostics): device records, live state and poll health, with
+  credentials and BLE network keys redacted. Attach it to bug reports.
 
 Hubs (`BH1-0001`) are filtered out at discovery — they don't actuate
 anything, so they don't appear in the device picker or the device
