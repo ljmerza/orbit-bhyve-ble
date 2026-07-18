@@ -474,3 +474,74 @@ def test_apply_ignores_desynced_frame():
     rx.apply_status_plaintext(dev, bytes(frame))
     assert dev.battery_mv is None
     assert dev.state.is_watering is True  # unchanged from the fake's initial state
+
+
+# --- faultStatus (#16.#7) decode -------------------------------------------
+
+def _status_with_faults(fault_body, run_state=1) -> bytes:
+    """A #16 status carrying a #16.#7 faultStatus block. b"" builds the healthy
+    EMPTY block (the `3a 00` from the captured idle example); None omits the
+    block entirely (frame carries no fault report)."""
+    sub = tx._pb_field_varint(rx.RX_F_STATUS_MODE, run_state)
+    if fault_body is not None:
+        sub += tx._pb_field_bytes(rx.RX_F_STATUS_FAULT, fault_body)
+    return tx._pb_field_bytes(rx.RX_F_STATUS, sub)
+
+
+def test_extract_status_empty_fault_block_is_all_clear():
+    # Byte-level anchor: field 7 wire 2 length 0 == `3a 00` (captured idle
+    # status). Present-but-empty must decode to a real all-False report, NOT
+    # None — that distinction is what lets "Problem: off" mean "device said
+    # no faults" instead of "never heard".
+    pb = _status_with_faults(b"")
+    assert bytes.fromhex("3a00") in pb
+    st = rx.extract_status(pb)
+    assert st.faults is not None
+    assert st.faults.any_fault is False
+    assert st.faults.station_faults == ()
+
+
+def test_extract_status_fault_flags_decode():
+    body = (
+        tx._pb_field_varint(rx._FLT_OFF_FLOW, 1)      # leak while closed
+        + tx._pb_field_varint(rx._FLT_BATTERY, 1)
+        + tx._pb_field_varint(rx._FLT_STATIONS_LO, 0b101)  # stations 1 and 3
+    )
+    st = rx.extract_status(_status_with_faults(body))
+    f = st.faults
+    assert f.valve_off_flow is True
+    assert f.battery_fault is True
+    assert f.pump_fault is False          # omitted bool -> False
+    assert f.valve_on_no_flow is False
+    assert f.station_fault_flags == 0b101
+    assert f.station_faults == (1, 3)     # 1-indexed
+    assert f.any_fault is True
+
+
+def test_extract_status_fault_hi_flags_shifted():
+    body = tx._pb_field_varint(rx._FLT_STATIONS_HI, 1)  # station bit 32
+    st = rx.extract_status(_status_with_faults(body))
+    assert st.faults.station_fault_flags == 1 << 32
+    assert st.faults.station_faults == (33,)
+
+
+def test_extract_status_absent_fault_block_is_none():
+    st = rx.extract_status(_status_pb(run_state=1, battery_mv=2700))
+    assert st.faults is None
+
+
+def test_apply_keeps_last_known_faults_when_block_absent():
+    # A later #16 WITHOUT #7 must not clear a stored fault — absence means
+    # "no report in this frame", not "faults gone".
+    dev = _fake_device()
+    leak = tx._pb_field_varint(rx._FLT_OFF_FLOW, 1)
+    rx.apply_status_plaintext(dev, tx._build_message(_status_with_faults(leak)))
+    assert dev.state.faults.valve_off_flow is True
+
+    rx.apply_status_plaintext(dev, tx._build_message(_status_pb(run_state=1)))
+    assert dev.state.faults is not None
+    assert dev.state.faults.valve_off_flow is True  # kept
+
+    # ...but a fresh EMPTY block is an explicit all-clear.
+    rx.apply_status_plaintext(dev, tx._build_message(_status_with_faults(b"")))
+    assert dev.state.faults.any_fault is False

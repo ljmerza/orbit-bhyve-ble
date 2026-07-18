@@ -121,6 +121,44 @@ class ProgramSummary:
     budget: int | None = None
 
 
+@dataclass(frozen=True)
+class FaultStatus:
+    """Decoded #16.#7 faultStatus block (OrbitPbApi_FaultStatus, see
+    docs/ble-messages.md). Protobuf omits false bools, so a present-but-empty
+    block (`3a 00` — what a healthy idle status carries) decodes to the
+    all-False "no faults" report; a MISSING block means the frame carried no
+    fault report at all and the consumer must keep its last-known value."""
+
+    pump_fault: bool = False           # #7.#1
+    voltage_boost_fail: bool = False   # #7.#4 voltageBoostCircuitFail
+    valve_off_flow: bool = False       # #7.#5 flow with valve commanded closed = leak
+    valve_on_no_flow: bool = False     # #7.#6 no flow during a run
+    valve_low_flow: bool = False       # #7.#7
+    valve_high_flow: bool = False      # #7.#8
+    battery_fault: bool = False        # #7.#10
+    station_fault_flags: int = 0       # #7.#2 | (#7.#3 << 32), bit = 0-indexed station
+    accessory_fault_flags: int = 0     # #7.#9 smartAccessoryFaultFlags
+
+    @property
+    def any_fault(self) -> bool:
+        return bool(
+            self.pump_fault
+            or self.voltage_boost_fail
+            or self.valve_off_flow
+            or self.valve_on_no_flow
+            or self.valve_low_flow
+            or self.valve_high_flow
+            or self.battery_fault
+            or self.station_fault_flags
+            or self.accessory_fault_flags
+        )
+
+    @property
+    def station_faults(self) -> tuple[int, ...]:
+        """1-indexed stations whose fault bit is set (bit N = station N+1)."""
+        return tuple(i + 1 for i in range(64) if self.station_fault_flags >> i & 1)
+
+
 @dataclass
 class DeviceState:
     is_watering: bool = False
@@ -144,6 +182,9 @@ class DeviceState:
     next_start_flags: int | None = None  # #16.#9 nextStartProgramFlags (slot bitmask, A=bit0)
     next_start_at: datetime | None = None  # #16.#10 nextStartTimeSecEpochUTC as an aware datetime
     programs: dict[int, ProgramSummary] = field(default_factory=dict)  # slot(1-6) -> summary
+    # Last fault report (#16.#7). None until a decoded status carries the block;
+    # a frame WITHOUT the block keeps the last-known report (see FaultStatus).
+    faults: FaultStatus | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
