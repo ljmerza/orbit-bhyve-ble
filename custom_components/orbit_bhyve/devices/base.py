@@ -86,6 +86,20 @@ def parse_start_minutes(tok: object) -> int:
     return hour * 60 + minute
 
 
+def accumulate_gallons(
+    total: float, prev_gpm: float | None, dt_sec: float, cap_sec: float
+) -> float:
+    """One left-rectangle step of the "Water used" integral: book `prev_gpm` —
+    the rate that was live at the START of the interval — over `dt_sec`,
+    bounded by `cap_sec` so a restart/outage gap can't book a huge block of
+    phantom gallons. The caller gates on "previous update was watering"; this
+    handles only the math. Kept HA-free so it is unit-testable standalone
+    (same rationale as parse_start_minutes)."""
+    if not prev_gpm or prev_gpm <= 0 or dt_sec <= 0:
+        return total
+    return total + prev_gpm * (min(dt_sec, cap_sec) / 60.0)
+
+
 @dataclass
 class ProgramSpec:
     """A watering program to WRITE (#19 setProgramSchedule).
@@ -128,6 +142,7 @@ class DeviceState:
     seconds_remaining: int | None = None
     flow_total: int | None = None  # #59.#3 raw cumulative counter (transient; feeds flow_gpm)
     flow_gpm: float | None = None  # instantaneous flow rate from read_flow's slope (Gen2)
+    flow_gpm_device: float | None = None  # #59.#4 device-reported gpm float (unconfirmed on HW)
     started_at: datetime | None = None
     expected_off_at: datetime | None = None
     last_command_at: datetime | None = None

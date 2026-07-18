@@ -54,8 +54,11 @@ RX_F_WATERING = 59        # flow sensor data (knobunc: FlowSensorData). Gen2 onl
 RX_F_WATERING_ACTIVE = 1  #   #59.#1: knobunc currentFlowRateFrequency_Hz — ~0 when no water moving,
                           #     so we use it as a "water currently flowing" signal (not "valve open").
 RX_F_FLOW_TOTAL = 3       #   #59.#3: knobunc currentCycleVolumeTicks — CUMULATIVE per-run counter (gpm
-                          #     = its slope). #59.#4 currentFlowRateGpm (float) exists but is unused
-                          #     here pending HW confirmation that it populates.
+                          #     = its slope).
+RX_F_FLOW_RATE_GPM = 4    #   #59.#4: knobunc currentFlowRateGpm — float32 (wire 5). Never yet observed
+                          #     populated on fw0111, so it feeds only the disabled-by-default
+                          #     "Flow rate (device)" sensor to gather field confirmation; the primary
+                          #     gauge stays the #59.#3 slope (read_flow).
 RX_F_WATERING_STATUS = 30  # WateringStatus notification { #1 = status enum } — the "stop ack"
 RX_F_WSTATUS_CODE = 1      #   #30.#1: 1=complete, 2=inProgress, 3=pumpDelay, 4=stationComplete,
                            #   5=stationDelay, 6=programPreDelay, 7=programPostDelay
@@ -187,6 +190,7 @@ class DeviceStatus(NamedTuple):
     active_station: int | None = None      # #16.#6.#4 (fallback #16.#2.#2.#3.#1), 0-indexed (zone = +1)
     seconds_remaining: int | None = None   # #16.#6.#5 (counts down), present only while watering
     flow_total: int | None = None          # #59.#3 cumulative volume counter (Gen2)
+    flow_rate_gpm: float | None = None     # #59.#4 device-reported gpm float32 (unconfirmed)
     rain_delay_minutes: int | None = None  # #16.#13.#1
     rain_delay_expiry: int | None = None   # #16.#13.#3, Unix epoch seconds
     rain_delay_active: bool | None = None  # #16.#13.#4
@@ -273,6 +277,12 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
         ws = _pb_subfield(top, RX_F_WATERING_STATUS, RX_F_WSTATUS_CODE)
         is_watering = ws in RX_WSTATUS_ACTIVE
     flow_total = _pb_subfield(top, RX_F_WATERING, RX_F_FLOW_TOTAL)   # #59.#3 cumulative
+    # #59.#4 device-reported instantaneous gpm — a float32 (wire 5), which
+    # pb_parse returns as the raw 4 bytes.
+    flow_rate_gpm = None
+    raw_gpm = _pb_subfield(top, RX_F_WATERING, RX_F_FLOW_RATE_GPM)
+    if isinstance(raw_gpm, (bytes, bytearray)) and len(raw_gpm) == 4:
+        flow_rate_gpm = round(struct.unpack("<f", bytes(raw_gpm))[0], 2)
 
     return DeviceStatus(
         run_state=run_state,
@@ -282,6 +292,7 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
         active_station=active_station,
         seconds_remaining=seconds_remaining,
         flow_total=flow_total,
+        flow_rate_gpm=flow_rate_gpm,
         rain_delay_minutes=rd_minutes,
         rain_delay_expiry=rd_expiry,
         rain_delay_active=rd_active,
@@ -435,6 +446,11 @@ def apply_status_plaintext(device, pt: bytes) -> None:
     if st.flow_total is not None:
         device.state.flow_total = st.flow_total
 
+    # Device-reported instantaneous gpm (#59.#4) — feeds the diagnostic
+    # "Flow rate (device)" sensor; not yet observed populated on hardware.
+    if st.flow_rate_gpm is not None:
+        device.state.flow_gpm_device = st.flow_rate_gpm
+
     if st.is_watering is not None:
         device.state.is_watering = st.is_watering
         if hasattr(device, "_status_parsed"):
@@ -468,6 +484,7 @@ def apply_status_plaintext(device, pt: bytes) -> None:
             device.state.seconds_remaining = None
             device.state.flow_total = None
             device.state.flow_gpm = 0.0  # valve closed → no flow
+            device.state.flow_gpm_device = None
             device.state.started_at = None
             device.state.expected_off_at = None
 

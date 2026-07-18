@@ -815,9 +815,9 @@ Confidence levels reflect the strength of the APK evidence:
 | f49 | `manualPresetRunTime` | d2h | `0x16` | **live-verified 2026-06-28**: `getManualPresetRunTime`->`0x16`/f49 = `08d804` (`presetRunTimeSec=600`). Parser: not implemented in this integration. | high |
 | f55 | `getFlowSensorParams` | h2d | unknown | `flow_sensor_params_BANG_` writer; keyword confirmed | high |
 | f56 | `flowSensorParams` | d2h | unknown | implied counterpart to `getFlowSensorParams` | medium |
-| f57 | `enableFlowSensorData` | h2d | unknown | `enable_flow_sensor_event_BANG_` writer; keyword confirmed | high |
-| f58 | `getFlowSensorData` | h2d | unknown | `get_instantaneous_flow_BANG_` writer; keyword confirmed | high |
-| f59 | `flowSensorData` | d2h | unknown | implied counterpart to `getFlowSensorData` | medium |
+| f57 | `enableFlowSensorData` | h2d | unknown | **HW-verified 2026-07-03 (Gen2 fw0111)**: subscribe `ca030508e8071002` = `#57{#1=1000ms, #2=2}`, unsubscribe `ca030408001002` = `#57{#1=0, #2=2}`. A live subscription persists across reconnects and starves the `#16` status read, so `read_flow` always unsubscribes after its ~4 s sampling window. Implemented: `devices/protobuf.py` (`_FLOW_SUBSCRIBE_PB` / `_FLOW_UNSUBSCRIBE_PB`). | high |
+| f58 | `getFlowSensorData` | h2d | unknown | `get_instantaneous_flow_BANG_` writer; keyword confirmed. Not used by this integration — the f57 subscription stream serves the same data. | high |
+| f59 | `flowSensorData` | d2h | unknown | **HW-verified 2026-07-03 (Gen2 fw0111)**: streamed ~1/s after an f57 subscribe. `#59.#1` flow-rate frequency Hz (~0 when no water moving), `#59.#3` `currentCycleVolumeTicks` cumulative per-run counter (~433 counts/gal, bucket-calibrated), `#59.#4` `currentFlowRateGpm` float32 (decoded; not yet observed populated). Parser: `devices/status.py::extract_status`. | high |
 | f69 | `getProgramSchedule` | h2d | unknown | `get_program_schedule` keyword confirmed; `set_program_BANG_` write patterns | high |
 | f76 | `programSchedule` | d2h | unknown | implied counterpart to `getProgramSchedule` | medium |
 | f77 | `getActivePrograms` | h2d | unknown | keyword confirmed; implied writer | medium |

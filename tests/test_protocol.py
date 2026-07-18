@@ -474,3 +474,49 @@ def test_apply_ignores_desynced_frame():
     rx.apply_status_plaintext(dev, bytes(frame))
     assert dev.battery_mv is None
     assert dev.state.is_watering is True  # unchanged from the fake's initial state
+
+
+# --- flow: #59.#4 device gpm float + Water-used accumulation ---------------
+
+def _flow_pb_with_gpm(active, total, gpm) -> bytes:
+    """A #59 flow frame carrying the device-reported gpm float:
+    { #1=flow-active, #3=cumulative, #4=float32 } — #4 is wire 5, which the
+    existing varint/bytes builders can't emit, so hand-pack its tag."""
+    import struct
+    inner = (
+        tx._pb_field_varint(rx.RX_F_WATERING_ACTIVE, active)
+        + tx._pb_field_varint(rx.RX_F_FLOW_TOTAL, total)
+        + bytes([(rx.RX_F_FLOW_RATE_GPM << 3) | 5])   # tag: field 4, wire 5
+        + struct.pack("<f", gpm)
+    )
+    return tx._pb_field_bytes(rx.RX_F_WATERING, inner)
+
+
+def test_extract_status_decodes_device_gpm_float():
+    st = rx.extract_status(_flow_pb_with_gpm(active=1, total=489, gpm=4.49))
+    assert st.flow_total == 489
+    assert st.flow_rate_gpm == 4.49        # rounded to 2dp at decode
+    # A #59 without #4 leaves it None (the so-far-observed hardware shape).
+    assert rx.extract_status(_flow_pb(active=1, total=489)).flow_rate_gpm is None
+
+
+def test_apply_stores_and_clears_device_gpm():
+    dev = _fake_device()
+    rx.apply_status_plaintext(dev, tx._build_message(_flow_pb_with_gpm(1, 489, 4.49)))
+    assert dev.state.flow_gpm_device == 4.49
+    # Idle #16 clears it alongside the other flow fields.
+    rx.apply_status_plaintext(dev, tx._build_message(_status_pb(run_state=1)))
+    assert dev.state.flow_gpm_device is None
+
+
+def test_accumulate_gallons_left_rectangle():
+    from orbit_bhyve.devices.base import accumulate_gallons
+    # 4.5 gpm over 30 s = 2.25 gal.
+    assert accumulate_gallons(10.0, 4.5, 30.0, 120.0) == pytest.approx(12.25)
+    # Interval capped: a 900 s gap at 4.5 gpm books only cap_sec worth.
+    assert accumulate_gallons(0.0, 4.5, 900.0, 120.0) == pytest.approx(4.5 * 2.0)
+    # No rate / zero rate / bogus dt -> unchanged.
+    assert accumulate_gallons(7.0, None, 30.0, 120.0) == 7.0
+    assert accumulate_gallons(7.0, 0.0, 30.0, 120.0) == 7.0
+    assert accumulate_gallons(7.0, -1.0, 30.0, 120.0) == 7.0
+    assert accumulate_gallons(7.0, 4.5, -5.0, 120.0) == 7.0

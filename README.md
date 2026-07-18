@@ -85,6 +85,14 @@ Per discovered sprinkler device:
   reads `unavailable`.
 - **Next run** sensor — the device-computed next scheduled program start
   (timestamp), with the program letter(s) as an attribute.
+- **Flow rate** and **Water used** sensors (flow-capable Gen2 valves) —
+  instantaneous GPM sampled from the inline flow sensor on each watering
+  poll, plus a cumulative gallons total integrated from it that plugs
+  straight into HA's Water dashboard (no Integration helper needed; the
+  total is restored across restarts). Calibrate with the **Flow
+  calibration** option below. A diagnostic **Flow rate (device)** sensor
+  (disabled by default) records the device's own reported GPM field to
+  confirm whether it ever populates.
 - Manufacturer / model / firmware / MAC are exposed via the device's
   "Device info" panel.
 
@@ -123,6 +131,9 @@ registry.
   station is watering
 - **Polling interval — watering** (sec) — faster polling while a station is
   active
+- **Flow calibration** (counts per gallon) — converts the Gen2 flow
+  counter to gallons; default 433 was bucket-measured. Re-calibrate by
+  comparing `Water used` against a bucket/meter over one run
 
 ## How it works
 

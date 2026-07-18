@@ -7,6 +7,7 @@ discharge approximation (`devices.base._mv_to_pct`).
 """
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from typing import Any
 
@@ -22,15 +23,22 @@ from homeassistant.const import (
     PERCENTAGE,
     SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
     UnitOfElectricPotential,
+    UnitOfVolume,
     UnitOfVolumeFlowRate,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import BHyveDeviceCoordinator
-from .devices.base import PROGRAM_SLOTS, SLOT_LETTERS, UI_SLOTS, ProgramSummary
+from .devices.base import (
+    PROGRAM_SLOTS,
+    SLOT_LETTERS,
+    UI_SLOTS,
+    ProgramSummary,
+    accumulate_gallons,
+)
 from .devices.protobuf import BHyveProtobufDevice
 
 _WEEKDAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
@@ -84,6 +92,8 @@ async def async_setup_entry(
         # Flow-rate gauge only for models with a flow sensor (Gen2, not the XD).
         if getattr(device, "has_flow", False):
             entities.append(BHyveFlowRateSensor(coord))
+            entities.append(BHyveWaterUsedSensor(coord))
+            entities.append(BHyveDeviceFlowRateSensor(coord))
     async_add_entities(entities)
 
 
@@ -188,10 +198,9 @@ class BHyveFlowRateSensor(_BHyveDeviceSensorBase):
     (Check-flow button / automation).
 
     `state_class = MEASUREMENT`: each reading is a real ~4 s slope of actual flow,
-    so long-term avg/min/max statistics are honest. For cumulative gallons, add
-    HA's built-in Riemann-sum Integration helper on this entity (see the README)
-    — that integrates the rate into a proper volume total; the raw counter can't
-    be a passive meter here. See docs/ble_protocol.md.
+    so long-term avg/min/max statistics are honest. For cumulative gallons see
+    BHyveWaterUsedSensor below, which integrates this rate over wall time — the
+    raw counter can't be a passive meter here. See docs/ble_protocol.md.
     """
 
     _attr_device_class = SensorDeviceClass.VOLUME_FLOW_RATE
@@ -209,6 +218,102 @@ class BHyveFlowRateSensor(_BHyveDeviceSensorBase):
     def native_value(self) -> float | None:
         state = self.coordinator.data or self.coordinator.device.state
         return state.flow_gpm
+
+
+class BHyveWaterUsedSensor(_RestoreLastValueSensor):
+    """Cumulative water used (gallons), integrated from the flow gauge (Gen2).
+
+    The raw #59.#3 counter only advances while a #57 subscription is live — a
+    few-second sampling window per watering poll — so exposing it directly
+    would undercount most of the run (see BHyveFlowRateSensor). Instead this
+    integrates the slope-derived `flow_gpm` over wall time between coordinator
+    updates: a left-rectangle sum (each interval booked at the rate live at
+    its start), the same rule as HA's Integration helper with `method: left`,
+    which this sensor replaces.
+
+    Gating and bounds:
+    - an interval accrues only if the PREVIOUS update was watering, so a
+      nonzero gpm left by an idle-time Check-flow press (a leak spot-check)
+      never silently accumulates for a whole idle period;
+    - each interval is capped at max(120 s, 2x the watering cadence) so a
+      restart/outage gap can't book phantom gallons;
+    - the run's final stretch is booked at the last live rate: the idle #16
+      forces flow_gpm to 0.0, which lands here one update later.
+
+    TOTAL_INCREASING + RestoreSensor keeps the total monotonic across
+    restarts, so HA's long-term statistics / Water dashboard see clean deltas.
+    Counter resets on the device are irrelevant — the raw counter is never
+    consumed here.
+    """
+
+    _attr_device_class = SensorDeviceClass.WATER
+    _attr_native_unit_of_measurement = UnitOfVolume.GALLONS
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_icon = "mdi:water"
+    _attr_suggested_display_precision = 2
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        device = coordinator.device
+        self._attr_unique_id = f"{device.unique_id}_water_used"
+        self._attr_name = "Water used"
+        self._total = 0.0
+        self._last_update: float | None = None  # time.monotonic()
+        self._prev_gpm: float | None = None
+        self._prev_watering = False
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self._restored_value is not None:
+            try:
+                self._total = float(self._restored_value)
+            except (TypeError, ValueError):
+                self._total = 0.0
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        now = time.monotonic()
+        if self._last_update is not None and self._prev_watering:
+            cap = max(120.0, 2.0 * self.coordinator.poll_watering)
+            self._total = accumulate_gallons(
+                self._total, self._prev_gpm, now - self._last_update, cap
+            )
+        state = self.coordinator.data or self.coordinator.device.state
+        self._last_update = now
+        self._prev_gpm = state.flow_gpm
+        self._prev_watering = bool(state.is_watering)
+        super()._handle_coordinator_update()
+
+    @property
+    def native_value(self) -> float:
+        return round(self._total, 3)
+
+
+class BHyveDeviceFlowRateSensor(_BHyveDeviceSensorBase):
+    """The device's own #59.#4 currentFlowRateGpm float (Gen2).
+
+    Named in the vendor schema but never yet observed populated on fw0111 —
+    disabled by default purely to gather field confirmation. If reports show
+    it live, a later release can prefer it over the slope-derived Flow rate.
+    """
+
+    _attr_device_class = SensorDeviceClass.VOLUME_FLOW_RATE
+    _attr_native_unit_of_measurement = UnitOfVolumeFlowRate.GALLONS_PER_MINUTE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
+    _attr_icon = "mdi:water"
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        device = coordinator.device
+        self._attr_unique_id = f"{device.unique_id}_flow_rate_device"
+        self._attr_name = "Flow rate (device)"
+
+    @property
+    def native_value(self) -> float | None:
+        state = self.coordinator.data or self.coordinator.device.state
+        return state.flow_gpm_device
 
 
 class BHyveRainDelayEndsSensor(_BHyveDeviceSensorBase):
