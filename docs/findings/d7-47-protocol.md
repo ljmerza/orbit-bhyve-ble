@@ -207,15 +207,31 @@ a state flag; the rest is meaningful only while active.
 | Watering | `04 c0 95 40 58 02 00`              |
 | Watering | `04 80 95 40 58 02 00` (counting down) |
 
-Working byte layout of the payload:
+Working byte layout of the payload (revised 2026-07 — the earlier "bytes 1-3
+counter / byte 4 flag / bytes 5-6 duration" reading did not match the captured
+hex, which has only seven payload bytes):
 
 - **byte 0** — state flag: `0x01` idle, `0x04` active.
-- **bytes 1-3** — remaining-time counter (24-bit LE; possibly 32-bit including
-  byte 4). Idle fills these with `ff ff ff ff` (no active run).
-- **byte 4** — `0x40` while active (alignment / part of the counter; unresolved).
-- **bytes 5-6** — requested duration uint16_LE. `58 02` = 600 s, matching the
-  labelled 10-minute run and the START payload's duration field.
-- **byte 7** — `0x00`.
+- **bytes 1-2** — remaining-time countdown, **uint16 LE in 1/64-second ticks**
+  (hypothesis, see below). Idle fills bytes 1-4 with `ff` (no active run).
+- **byte 3** — `0x40` while active. Suspected to carry countdown bits 16-21 in
+  its low 6 bits for runs longer than 1023 s (needs a >17-minute run to
+  resolve; both captures were 600 s).
+- **bytes 4-5** — requested duration uint16_LE **seconds**. `58 02` = 600 s,
+  matching the labelled 10-minute run and the START payload's duration field.
+- **byte 6** — `0x00`.
+
+**64 Hz tick-rate evidence** (from the two captured active frames alone):
+`c0 95` = 38336 = 600·64 − 64 → exactly **599 s remaining, 1 s into the 600 s
+run**; the adjacent capture `80 95` = 38272 is exactly **−64 counts = −1 s**
+(consistent with back-to-back ~1 Hz status pushes). A 24-bit reading including
+the `0x40` byte (4,232,640 counts) fits no plausible tick rate to a clean
+remaining-time for this run. Implemented in
+`devices/base.py::_apply_mesh_run_payload` behind a duration cross-check
+(countdown decoding longer than the requested run is discarded); live
+calibration on a mesh device — comparing `state.extra["mesh_status_raw"]`
+against wall clock at known offsets into a run, plus one >17-minute run for
+byte 3 — should confirm before this is considered settled.
 
 Idle is unambiguous (`01 ffffffff 0000`); active is `04 <countdown> … <dur> 00`.
 There is **no standard GATT Battery Service (0x180F)** and no separate watering
@@ -225,7 +241,12 @@ In this repo `is_watering` is driven optimistically from command stamping plus
 the START-ack: `_observe_plaintext` in `devices/ht25.py` watches for the
 `seq=0x0D` reply (`0x40` bit set), reads the echoed `04 <dur_LE> …`, and arms an
 off-timer for that duration. That makes the auto-off reliable even when the
-BLE write-response times out.
+BLE write-response times out. Additionally, the STATUS reply itself (seq
+`0x02`) is decoded in `devices/base.py` — active/idle plus the countdown
+payload above — so a run started from the app/hub syncs on any connect, and
+the opt-in **Mesh live status poll** option makes the idle coordinator poll
+perform that connect (`BHyveHT25Device.refresh_state` →
+`_connect_refresh`).
 
 ---
 
@@ -305,9 +326,10 @@ firmware byte and the battery voltage.
 
 ## Open questions
 
-- The active-STATUS counter (bytes 1-4) is not fully decoded — whether it is a
-  24-bit or 32-bit remaining-time value, and the role of byte 4 (`0x40` while
-  active), needs more captures at different durations.
+- The active-STATUS countdown is decoded as uint16 LE at 64 Hz (see the status
+  section above) — a hypothesis that fits both captures exactly but still wants
+  live confirmation at other run offsets, and byte 3's `0x40` (constant flag
+  vs. countdown bits 16-21) needs a >17-minute run to resolve.
 - Whether any of the 8 init steps are optional (a minimal "connect → start →
   stop" capture would show which acks the device actually requires).
 - The write-only characteristic in the custom service is unused; its purpose

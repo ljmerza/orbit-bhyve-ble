@@ -6,7 +6,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from ..connection import BHyveBleConnection
@@ -164,6 +164,12 @@ class BHyveBleDeviceBase(abc.ABC):
     # only per app captures; the XD has no flow screen. Verify on hardware
     # before trusting (the `flow` CLI probes both) — see docs/ble_protocol.md.
     has_flow: bool = False
+    # Opt-in "Mesh live status poll" option: when True, the mesh (HT25)
+    # refresh_state connects and runs the init's STATUS/INFO queries on each
+    # idle poll instead of staying passive. Costs battery (a BLE connect per
+    # idle tick); applied from the options flow by __init__.py. The protobuf
+    # family ignores it — its poll already connects.
+    active_status_poll: bool = False
 
     def __init__(
         self,
@@ -310,12 +316,75 @@ class BHyveBleDeviceBase(abc.ABC):
         elif seq == 0x02 and len(pt) >= 6:
             # Status reply/push: payload[0] (pt[5]) is the watering mode —
             # 0x04 = watering, 0x01 = idle. Authoritative device state, used to
-            # confirm an actuation actually took.
+            # confirm an actuation actually took and — via the active-run
+            # payload — to sync a run HA didn't start (app/hub/schedule).
             mode = pt[5]
+            was_watering = self.state.is_watering
             if mode == 0x04:
                 self.state.is_watering = True
+                self._apply_mesh_run_payload(pt)
+                if not was_watering:
+                    self._notify_state_changed()
             elif mode == 0x01:
+                # Idle: clear any run bookkeeping (mirrors the STOP-ack clears
+                # in ht25.py); idempotent when nothing was running.
                 self.state.is_watering = False
+                self.state.active_zone = None
+                self.state.seconds_remaining = None
+                self.state.started_at = None
+                self.state.expected_off_at = None
+                if was_watering:
+                    self._notify_state_changed()
+
+    # Mesh STATUS countdown tick rate — HYPOTHESIS pending live calibration.
+    # Evidence (docs/findings/d7-47-protocol.md, captured 600 s run): active
+    # payload `04 c0 95 40 58 02 00` = [state][countdown u16 LE][0x40][duration
+    # u16 LE][00]. 0x95c0 = 38336 counts with the duration echoing 600 s →
+    # 38336/64 = 599 s remaining (1 s into the run), and the adjacent capture
+    # `80 95` is exactly -64 counts = -1 s. The 24-bit reading (counter
+    # including the 0x40 byte) fails the same arithmetic. Byte 3's 0x40 needs a
+    # >1023 s run to resolve (constant flag vs. counter bits 16-21 OR'd with
+    # 0x40); until then its low 6 bits are treated as high counter bits and the
+    # result is sanity-gated against the duration echo below.
+    _MESH_COUNTDOWN_HZ = 64
+
+    def _apply_mesh_run_payload(self, pt: bytes) -> None:
+        """Decode the active-STATUS payload (mode 0x04) into the live countdown:
+        payload[1:3]+bits of [3] = remaining counts, payload[4:6] = requested
+        duration (seconds, u16 LE). Frame offsets: payload[k] = pt[5+k]."""
+        if len(pt) < 12:
+            return  # short frame: mode byte only, no countdown payload
+        counts = int.from_bytes(pt[6:8], "little") | ((pt[8] & 0x3F) << 16)
+        duration = int.from_bytes(pt[9:11], "little")
+        # Raw bytes for the calibration/diagnostics loop (mode..payload end).
+        self.state.extra["mesh_status_raw"] = pt[5:12].hex()
+        remaining = counts // self._MESH_COUNTDOWN_HZ
+        if not (0 < duration <= 0xFFFF and remaining <= duration):
+            # Fails the duration cross-check — tick-rate hypothesis doesn't fit
+            # this frame, so keep is_watering but don't trust the countdown.
+            _LOGGER.debug(
+                "%s: mesh STATUS countdown failed sanity (raw=%s counts=%d "
+                "duration=%ds) — not applied",
+                self.mac, pt[5:12].hex(), counts, duration,
+            )
+            return
+        now = datetime.now(timezone.utc)
+        self.state.seconds_remaining = remaining
+        if self.state.active_zone is None:
+            self.state.active_zone = 1  # mesh HT25 is single-station
+        if self.state.started_at is None:
+            # Run discovered externally (app/hub/schedule) — synthesize the
+            # start from the duration echo so attributes stay coherent.
+            self.state.started_at = now - timedelta(seconds=duration - remaining)
+        new_off = now + timedelta(seconds=remaining)
+        if (
+            self.state.expected_off_at is None
+            or new_off < self.state.expected_off_at - timedelta(seconds=15)
+        ):
+            # Same guard as the protobuf path (status.py): only ever move the
+            # wall-clock auto-close EARLIER, so a re-reported run can't keep
+            # postponing the close.
+            self.state.expected_off_at = new_off
 
     @abc.abstractmethod
     async def start_watering(self, station: int, duration_sec: int) -> bool:

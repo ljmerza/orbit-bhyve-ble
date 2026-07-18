@@ -44,7 +44,8 @@
           "idle_disconnect_sec": "Disconnect after idle (seconds)",
           "poll_idle_sec": "State polling interval — idle (seconds)",
           "poll_watering_sec": "State polling interval — watering (seconds)",
-          "flow_counts_per_gallon": "Flow calibration (sensor counts per gallon)"
+          "flow_counts_per_gallon": "Flow calibration (sensor counts per gallon)",
+          "mesh_status_poll": "Mesh live status poll — HT25 connects over BLE on each idle poll to read watering state and battery (costs battery: ~96 connects/day at the default cadence)"
         }
       }
     }
