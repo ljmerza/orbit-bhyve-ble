@@ -15,11 +15,41 @@ from ..const import DEFAULT_FLOW_COUNTS_PER_GALLON
 _LOGGER = logging.getLogger(__name__)
 
 
-def _mv_to_pct(mv: int) -> int:
-    """Linear approximation matching the cloud's discharge curve to within
-    a few percent: 0% at 2400 mV, 100% at 3000 mV. Tuned against three
-    live devices (Hill 33%/2602 mV, Corner 34%/2606 mV, Deck 65%/2771 mV)."""
-    pct = round((mv - 2400) * 100 / 600)
+# Per-chemistry linear fuel-gauge endpoints: (mV at 0%, mV at 100%). AA cells
+# in a 2x series (3 V nominal). See the "Battery Chemistry Options" plan for the
+# electrochemical rationale; the conservative Ni-MH 0% floor (2350 mV, well above
+# true-empty) exists to warn before solenoid-latch failure under water pressure.
+# Regulated 1.5 V Li-Ion outputs a constant ~3000 mV until it dies, so no linear
+# gauge can track it — it shares the alkaline endpoints and is documented as
+# unmeasurable by percent.
+BATTERY_CHEMISTRIES: dict[str, tuple[int, int]] = {
+    "alkaline": (2400, 3000),
+    "nimh": (2350, 2750),
+    "lithium_primary": (2600, 3400),
+    "lithium_regulated": (2400, 3000),
+}
+DEFAULT_BATTERY_CHEMISTRY = "alkaline"
+
+
+def _mv_to_pct(mv: int, chemistry: str = DEFAULT_BATTERY_CHEMISTRY) -> int:
+    """Linear voltage->percent fuel gauge for the selected battery chemistry.
+    Endpoints live in BATTERY_CHEMISTRIES.
+
+    Provenance / accuracy caveat: none of these curves are calibrated against a
+    known state of charge (that needs a controlled discharge). The alkaline
+    endpoints (2400/3000) are Orbit's stock assumption; they reproduce Orbit's
+    OWN displayed gauge — HW cross-checked 2026-07-17 on our XD (BT4ValveXD01):
+    2828 mV -> 71%, matching the 71% the B-Hyve app showed for the same device.
+    (The inherited upstream/wxfield anchor points — Hill 33%/2602 mV,
+    Corner 34%/2606 mV, Deck 65%/2771 mV — were CLOUD-reported percentages on
+    devices that are not ours, so they are a weaker cross-reference to the same
+    alkaline gauge, not measurements.) The Ni-MH / lithium endpoints are
+    engineering estimates from the discharge-profile analysis (see the
+    Battery-Chemistry-Options plan), with a deliberately conservative Ni-MH 0%
+    floor for solenoid-latch safety; there is no cheap ground truth for them
+    (Orbit's gauge assumes alkaline and mis-reports them too)."""
+    lo, hi = BATTERY_CHEMISTRIES.get(chemistry, BATTERY_CHEMISTRIES[DEFAULT_BATTERY_CHEMISTRY])
+    pct = round((mv - lo) * 100 / (hi - lo))
     return max(0, min(100, pct))
 
 
@@ -163,10 +193,13 @@ class BHyveBleDeviceBase(abc.ABC):
         # disagrees with our linear _mv_to_pct (esp. for NiMH), so seeding it
         # painted a wrong value — inconsistent with the voltage sensor — into the
         # battery sensor's long-term statistics at every startup, until the first
-        # poll replaced it. Start unknown; apply_status_plaintext fills these in
-        # from the device on the first successful poll.
-        self.battery_pct: int | None = None
+        # poll replaced it. Start unknown; apply_status_plaintext fills battery_mv
+        # in from the device on the first successful poll.
         self.battery_mv: int | None = None
+        # User-selected AA cell chemistry driving the voltage->percent gauge
+        # (battery_pct). Restored/updated by the Battery-chemistry select entity;
+        # defaults to alkaline (Orbit's stock assumption).
+        self.battery_chemistry: str = DEFAULT_BATTERY_CHEMISTRY
         self.network_key: str = record["network_key"]
         self.state = DeviceState()
         # Optional callback a coordinator registers so an out-of-band state
@@ -197,6 +230,15 @@ class BHyveBleDeviceBase(abc.ABC):
             return int(self.firmware)
         except (TypeError, ValueError):
             return 0
+
+    @property
+    def battery_pct(self) -> int | None:
+        """Voltage-derived battery percent for the selected chemistry. Computed
+        (not stored) so changing the chemistry select recalculates it immediately,
+        without waiting for the next BLE poll to re-stamp it."""
+        if self.battery_mv is None:
+            return None
+        return _mv_to_pct(self.battery_mv, self.battery_chemistry)
 
     @property
     def unique_id(self) -> str:
@@ -264,8 +306,7 @@ class BHyveBleDeviceBase(abc.ABC):
             # Info-ack: payload bytes 4-5 (pt[9:11]) are battery mV, LE.
             mv = int.from_bytes(pt[9:11], "little")
             if 1500 <= mv <= 4000:  # out-of-band => malformed; don't poison state
-                self.battery_mv = mv
-                self.battery_pct = _mv_to_pct(mv)
+                self.battery_mv = mv  # battery_pct is a chemistry-aware property
         elif seq == 0x02 and len(pt) >= 6:
             # Status reply/push: payload[0] (pt[5]) is the watering mode —
             # 0x04 = watering, 0x01 = idle. Authoritative device state, used to

@@ -12,7 +12,7 @@ import pytest
 
 from orbit_bhyve.devices import protobuf as tx
 from orbit_bhyve.devices import status as rx
-from orbit_bhyve.devices.base import DeviceState, _mv_to_pct
+from orbit_bhyve.devices.base import DeviceState
 
 
 # --- protobuf low-level helpers -------------------------------------------
@@ -327,7 +327,6 @@ def _fake_device():
     return SimpleNamespace(
         mac="AA:BB:CC:DD:EE:FF",
         battery_mv=None,
-        battery_pct=None,
         state=DeviceState(is_watering=True, active_zone=1, seconds_remaining=300),
     )
 
@@ -335,8 +334,9 @@ def _fake_device():
 def test_apply_updates_battery_and_clears_zone_on_idle():
     dev = _fake_device()
     rx.apply_status_plaintext(dev, tx._build_message(_status_pb(run_state=1, battery_mv=2700)))
+    # apply_status_plaintext stores raw mV only; percent is a chemistry-aware
+    # property on the real device (see test_devices.py::test_battery_pct_*).
     assert dev.battery_mv == 2700
-    assert dev.battery_pct == _mv_to_pct(2700)
     assert dev.state.is_watering is False
     assert dev.state.active_zone is None
     assert dev.state.seconds_remaining is None

@@ -47,10 +47,22 @@ Per discovered sprinkler device:
   **optimistic** (derived from the last command, not from a decoded
   device status).
 - **Battery (%)** sensor — live, BLE-sourced. Decoded from the device's
-  info-ack frame on every poll, no cloud round-trip after setup.
+  info-ack frame on every poll, no cloud round-trip after setup. The percent
+  is a linear voltage gauge whose discharge curve is chosen by the **Battery
+  chemistry** selector below.
 - **Battery voltage (mV)** sensor — same source as the percent sensor;
   disabled by default, enable it from the entity's settings if you want
   the raw reading.
+- **Battery chemistry** (`select`, config category) — the AA cell chemistry
+  you installed (**Alkaline** / **Ni-MH rechargeable** / **Lithium primary**
+  / **Lithium regulated 1.5 V**), which selects the voltage→percent curve.
+  Chemistry can't be auto-detected from a single voltage reading (2550 mV
+  could be alkaline at 25% or Ni-MH at 80%), so it defaults to Alkaline
+  (Orbit's stock assumption) and you set it per device; changing it re-gauges
+  the percent immediately, no device round-trip. **Note:** regulated 1.5 V
+  Li-Ion cells output a constant voltage until they abruptly cut off, so no
+  percentage gauge can track them — the percent reads full right up until the
+  valve dies. Watch the voltage sensor instead.
 - **Signal strength (RSSI)** sensor — the BLE advertisement RSSI from
   Home Assistant's bluetooth manager (works even while disconnected);
   disabled by default.
