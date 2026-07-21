@@ -297,7 +297,7 @@ Decoded: `setDateTime { currentTimeIso8601: "2026-05-31T08:36:30-04:00" }` -- sy
 | f14 | `lastChangeId` | `OrbitPbApi_InterfaceId` | |
 | f15 | `groupWateringPreDelaySec` | uint32 | |
 | f16 | `groupWateringPostDelaySec` | uint32 | |
-| f17 | `programName` | string | |
+| f17 | `programName` | string | Max **32 bytes** (UTF-8). A longer name makes the device reject the whole `setProgramSchedule` while the separate `#20` enable still lands — the slot then reports enabled but keeps its old schedule. Verified HT34A fw0107 + HT25G2 fw0111. |
 | f18 | `intervalHours` | uint32 | |
 | f19 | `basicProgramMode` | bool | |
 | f20 | `databaseId` | uint32 | |

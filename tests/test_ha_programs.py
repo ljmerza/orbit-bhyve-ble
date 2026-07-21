@@ -17,10 +17,12 @@ from orbit_bhyve.connection import BHyveBleConnection
 from orbit_bhyve.devices import protobuf as tx
 from orbit_bhyve.devices import status as rx
 from orbit_bhyve.devices.base import (
+    MAX_PROGRAM_NAME_BYTES,
     DeviceState,
     ProgramSpec,
     ProgramSummary,
     parse_start_minutes,
+    validate_program_name,
 )
 from orbit_bhyve.devices.ht25g2 import BHyveHT25G2Device
 
@@ -621,3 +623,29 @@ def test_parse_start_minutes_rejects_footguns(bad):
     # rather than wrap, and reject out-of-range / non-time tokens.
     with pytest.raises(ValueError):
         parse_start_minutes(bad)
+
+
+# --- program-name length guard (device #17 field is a fixed 32 bytes) --------
+
+def test_validate_program_name_accepts_up_to_32_bytes():
+    # HW-verified boundary: 32 bytes stored on HT34A fw0107 and HT25G2 fw0111.
+    assert MAX_PROGRAM_NAME_BYTES == 32
+    assert validate_program_name("") == ""
+    assert validate_program_name("Tomatoes And Peppers") == "Tomatoes And Peppers"
+    assert validate_program_name("A" * 32) == "A" * 32
+
+
+@pytest.mark.parametrize("name", ["A" * 33, "Squash, Beans, Cucumbers, and Herbs", "z" * 64])
+def test_validate_program_name_rejects_over_32_bytes(name):
+    # 33+ bytes: the device silently drops the whole store (keeping the old
+    # schedule) while the #20 enable lands. Reject up front instead of write-and-lose.
+    with pytest.raises(ValueError):
+        validate_program_name(name)
+
+
+def test_validate_program_name_counts_utf8_bytes_not_chars():
+    # The firmware buffer is byte-sized: 16 two-byte chars = 32 bytes is OK, but
+    # 17 (= 34 bytes) overflows even though it's only 17 characters.
+    assert validate_program_name("é" * 16) == "é" * 16
+    with pytest.raises(ValueError):
+        validate_program_name("é" * 17)

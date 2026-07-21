@@ -97,7 +97,7 @@ set_program:
         object:
     name:
       name: Program name
-      description: Optional label stored on the device.
+      description: Optional label stored on the device (max 32 bytes; longer names are rejected by the device).
       required: false
       example: Front lawn
       selector:

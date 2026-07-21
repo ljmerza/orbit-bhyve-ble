@@ -53,6 +53,7 @@ from .devices.base import (
     ProgramSpec,
     ProgramSummary,
     parse_start_minutes,
+    validate_program_name,
 )
 from .devices.protobuf import BHyveProtobufDevice
 
@@ -243,6 +244,7 @@ def _spec_from_call(call: ServiceCall) -> ProgramSpec:
         raise ServiceValidationError("interval mode needs interval_days")
     try:
         start_mins = [parse_start_minutes(tok) for tok in call.data["start_times"]]
+        name = validate_program_name(call.data.get("name", ""))
     except ValueError as err:
         raise ServiceValidationError(str(err)) from err
     zones: list[tuple[int, int]] = []
@@ -256,7 +258,7 @@ def _spec_from_call(call: ServiceCall) -> ProgramSpec:
         interval_anchor=call.data.get("interval_anchor"),
         start_mins=tuple(start_mins),
         zones=tuple(zones),
-        name=call.data.get("name", ""),
+        name=name,
         budget=int(call.data.get("budget", 100)),
         enabled=bool(call.data.get("enabled", False)),
     )

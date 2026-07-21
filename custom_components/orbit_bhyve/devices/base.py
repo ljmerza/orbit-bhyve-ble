@@ -61,6 +61,30 @@ SLOT_LETTERS = {v: k for k, v in PROGRAM_SLOTS.items()}
 # and summary sensor.
 UI_SLOTS = ("A", "B", "C", "D")
 
+# The device stores the program name (#17 in setProgramSchedule) in a fixed
+# 32-byte field. A longer name makes the device reject the WHOLE #19 store while
+# the separate #20 enable still lands, so the slot reports "enabled" but keeps its
+# OLD schedule (a silent write-and-lose). Verified on HT34A fw0107 and HT25G2
+# fw0111 (32 bytes stored; 33 rejected on both). Reject early instead.
+MAX_PROGRAM_NAME_BYTES = 32
+
+
+def validate_program_name(name: str) -> str:
+    """Return `name` unchanged, or raise ``ValueError`` if it overflows the
+    device's 32-byte program-name field (see ``MAX_PROGRAM_NAME_BYTES``). The
+    limit is UTF-8 *bytes*, not characters — the firmware buffer is byte-sized, so
+    a 16-char accented name can already be 32 bytes. Kept HA-free so it is
+    unit-testable standalone; the service layer maps ``ValueError`` to a
+    ``ServiceValidationError`` (same contract as ``parse_start_minutes``)."""
+    n = len(name.encode("utf-8"))
+    if n > MAX_PROGRAM_NAME_BYTES:
+        raise ValueError(
+            f"program name is too long: {n} bytes (max {MAX_PROGRAM_NAME_BYTES}). "
+            "The device silently rejects the whole program when the name overflows "
+            "its 32-byte field — shorten the name."
+        )
+    return name
+
 
 def parse_start_minutes(tok: object) -> int:
     """Parse one program start-time token to minutes-from-midnight (0..1439).
