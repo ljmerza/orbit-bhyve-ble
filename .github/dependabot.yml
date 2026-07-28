@@ -1,0 +1,22 @@
+version: 2
+
+updates:
+  # Action refs in .github/workflows/. Note validate.yaml tracks the shared
+  # python-test action at @main, which Dependabot cannot pin or bump — only
+  # tagged/SHA refs are actionable here.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: ci
+
+  # tests/requirements-test.txt and tests/requirements-ha.txt. The latter holds
+  # the pytest-homeassistant-custom-component pin, which drags in an exact
+  # Home Assistant version — without a bump it silently tests an ever-older HA.
+  - package-ecosystem: pip
+    directory: /tests
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: test

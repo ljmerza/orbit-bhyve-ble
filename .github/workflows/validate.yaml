@@ -48,15 +48,11 @@ jobs:
         uses: actions/checkout@v4
       # The suite itself needs no Home Assistant (see tests/requirements-test.txt),
       # and the `tests` job above proves that stays true. This job additionally
-      # installs the HA test plugin, whose autouse fixtures (verify_cleanup,
-      # socket blocking, lingering-timer detection) catch a class of defect the
-      # bare suite cannot see — e.g. a test that monkeypatches a stdlib global
-      # and leaves it in a broken state. Pinned because the plugin pulls an
-      # exact homeassistant version and pins pytest itself.
+      # installs the HA test plugin — see tests/requirements-ha.txt for why.
       - uses: ljmerza/misc-actions/actions/python-test@main
         with:
           python-version: "3.13"
           requirements-file: tests/requirements-test.txt
-          extra-packages: pytest-homeassistant-custom-component==0.13.205
+          extra-packages: -r tests/requirements-ha.txt
           # homeassistant pins aiohasupervisor==0.2.2b5, which uv rejects by default.
           prerelease: allow

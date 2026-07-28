@@ -1,0 +1,11 @@
+# Extra deps for the "Tests (HA plugin)" job in .github/workflows/validate.yaml.
+# NOT needed to run the suite — see requirements-test.txt, which stands alone.
+#
+# This plugin drags in a pinned Home Assistant and registers autouse fixtures
+# (verify_cleanup, socket blocking, lingering-timer detection) that catch a
+# class of defect the bare suite cannot see: e.g. a test that monkeypatches a
+# stdlib global and leaves it exhausted passes without it and errors with it.
+#
+# Kept in its own file rather than inline in the workflow so Dependabot's pip
+# ecosystem can see the pin and open bumps as Home Assistant moves.
+pytest-homeassistant-custom-component==0.13.205
