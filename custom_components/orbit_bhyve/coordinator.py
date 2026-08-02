@@ -74,6 +74,11 @@ class BHyveDeviceCoordinator(DataUpdateCoordinator[DeviceState]):
                 state.seconds_remaining = None
                 state.started_at = None
                 state.expected_off_at = None
+                # Let the device drop anything scoped to the run. A run that
+                # ends on the device's own timer never reaches
+                # valve.async_close_valve, so this is the common path, not a
+                # fallback.
+                self.device.on_watering_finished()
             else:
                 state.seconds_remaining = max(
                     0, int((state.expected_off_at - now).total_seconds())

@@ -107,6 +107,40 @@ Per discovered sprinkler device:
   calibration** option below. A diagnostic **Flow rate (device)** sensor
   (disabled by default) records the device's own reported GPM field to
   confirm whether it ever populates.
+- **Flow rate** and **Water used** sensors (HT25 fw0085, opt-in) — litres per
+  minute and a per-run litre total, decoded from the timer's own inline flow
+  meter over an undocumented BLE subscription. The total is a per-run counter,
+  so `TOTAL_INCREASING` treats each run as a meter reset and HA's long-term
+  statistics book clean deltas; it plugs into the Water dashboard without an
+  Integration helper. Both sensors read `unavailable` until **Flow
+  measurement** is switched on for that device.
+- **Flow measurement** (`switch`, config category, HT25) — per-device opt-in,
+  **off by default**, and worth understanding before you turn it on.
+  Measuring holds the timer's single BLE session open for the whole program
+  and re-subscribes every 240 s, because the device stops sampling about 300
+  seconds after each subscription no matter how many samples were requested.
+  That is more radio-on time than the **Mesh live status poll** below, and
+  while the session is held the B-hyve app and any status poll are locked out
+  of that timer. Flipping the switch sends nothing over BLE — it only decides
+  whether the *next* run subscribes; turning it off mid-run stops measuring
+  immediately and hands the connection back.
+- **Flow calibration** (`number`, counts per litre, config category, HT25) —
+  per-device, restored across restarts. The meter reports raw tick counts and
+  this converts them to litres, so it is specific to your plumbing. Four HT25
+  fw0085 units calibrated against the vendor app measured **113–118**; the
+  default of 112 therefore over-reports slightly until you set yours. To
+  calibrate, run the same duration twice on one tap — once from the B-hyve app
+  and once from Home Assistant — then
+  `new = current × (HA litres ÷ app litres)`. Run them back to back so mains
+  pressure doesn't drift, and use a long enough run (10 minutes is ample) that
+  single-tick resolution is negligible. The number stays settable while Flow
+  measurement is off, so a known value can be entered before the first
+  measured run.
+
+  > **Only runs started through Home Assistant are measured**, including the
+  > `orbit_bhyve.start_watering` service. The subscription is issued as part
+  > of the start sequence, so a run triggered from the timer's physical button
+  > or from the B-hyve app produces no flow data.
 - Manufacturer / model / firmware / MAC are exposed via the device's
   "Device info" panel.
 - **Download diagnostics** — the integration and each device support HA's
@@ -149,9 +183,12 @@ registry.
   station is watering
 - **Polling interval — watering** (sec) — faster polling while a station is
   active
-- **Flow calibration** (counts per gallon) — converts the Gen2 flow
+- **Flow calibration** (counts per gallon) — converts the **Gen2** flow
   counter to gallons; default 433 was bucket-measured. Re-calibrate by
-  comparing `Water used` against a bucket/meter over one run
+  comparing `Water used` against a bucket/meter over one run. This option
+  does nothing on Gen1 HT25 timers: those calibrate per device via the **Flow
+  calibration** *number entity*, in counts per **litre** — see "What you get"
+  above
 - **Mesh live status poll** (bool, default off) — HT25 mesh timers connect
   over BLE on each idle poll to read live watering state and battery.
   Battery trade-off: ~96 connects/day at the default idle cadence

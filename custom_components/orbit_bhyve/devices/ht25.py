@@ -13,6 +13,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timedelta, timezone
+import struct
 
 from bleak.exc import BleakError
 
@@ -29,6 +30,34 @@ SEQ_SUBSYSTEM = 0x01
 SEQ_MAGIC_CHECK = 0x00
 SEQ_HEARTBEAT = 0x09
 SEQ_WATER_CTRL = 0x0D
+SEQ_FLOW = 0x0B            # inbound flow sample
+# Inbound run-end frame, run duration at pt[6:8] LE. NOT part of the flow
+# subscription budget — observed arriving 46 s after a 10-sample subscription
+# had expired — so it stays reliable as a release trigger even if sampling has
+# lapsed mid-run.
+SEQ_FLOW_END = 0x0C
+SEQ_FLOW_SUBSCRIBE = 0x0E  # outbound subscribe request
+TYPE_FLOW_SUBSCRIBE = 0x89
+
+# Plausibility ceiling for a counter wrap, in ticks/second. Fastest observed on
+# hardware is 57 (a 25 L/min zone during ramp-up); 200 is deliberately generous
+# and exists only to reject a corrupt frame that would otherwise be booked as a
+# 65536-tick wrap — about 575 L, permanently.
+GEN1_MAX_TICKS_PER_SEC = 200
+
+# The device stops sampling ~300 s after a subscribe regardless of the sample
+# count requested, so a long program needs the subscription renewed. 240 s
+# leaves 60 s of margin and sustained a gapless 20.6-minute stream on hardware.
+GEN1_RENEW_SEC = 240
+# How long a renewal waits for _api_lock before skipping this cycle. Skipping is
+# correct: queueing behind an actuation would fire the write late, possibly into
+# a session STOP has already closed.
+GEN1_RENEW_LOCK_TIMEOUT = 5
+# Backstop margin on the session hold and the renewal loop, mirroring
+# coordinator.EXPIRY_GRACE_SEC. Duplicated rather than imported: devices/ is
+# deliberately free of coordinator and Home Assistant imports so the test suite
+# can run without Home Assistant installed.
+GEN1_HOLD_GRACE_SEC = 10
 
 INIT_INTER_STEP_SEC = 0.15
 
@@ -76,6 +105,7 @@ class BHyveHT25Device(BHyveBleDeviceBase):
 
     frame_magic = 0x10
     trailer_const = 0x10
+    has_flow_gen1 = True
 
     # Session-id increment between the `bind` and `rebind` init steps.
     # fw0041 (Hill) confirmed +2 via BTSnoop 2026-05-05. Firmware variants
@@ -148,6 +178,24 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         ack 0xF7, both on seq SEQ_WATER_CTRL. The START-ack echoes the accepted
         duration as [0x04][dur_LE:2][...]."""
         super()._observe_plaintext(pt)  # keep battery parsing
+        self.apply_gen1_flow_frame(pt)
+        if (
+            self.has_flow_gen1
+            and len(pt) >= 8
+            and pt[3] == SEQ_FLOW_END
+            and pt[4] == D747_ROUTING
+            and self.mesh_device_id is not None
+            and pt[0:2] == self.mesh_address
+        ):
+            # The device's own run-end frame (run duration at pt[6:8] LE). This
+            # is the earliest and most reliable signal that measuring is over —
+            # the wall-clock auto-close is up to a poll interval behind it.
+            # Both operations below are synchronous, so no add_job hop.
+            _LOGGER.debug(
+                "%s: flow run-end frame, duration=%ss",
+                self.mac, int.from_bytes(pt[6:8], "little"),
+            )
+            self._end_gen1_flow()
         if len(pt) < 6 or pt[3] != SEQ_WATER_CTRL or pt[4] != D747_ROUTING:
             return
         if not (pt[2] & 0x40):
@@ -236,12 +284,20 @@ class BHyveHT25Device(BHyveBleDeviceBase):
                 notifs = await self._send_command(plaintext, "START")
                 self._stamp_command(f"start s={station} d={duration_sec}", len(notifs))
                 self._mark_reached()  # connected + sent → device reached this cycle
+                if self.has_flow_gen1 and self.flow_gen1_enabled:
+                    await self._begin_gen1_flow(duration_sec)
                 # The off-timer is armed by the device's START-ack (_observe_plaintext),
                 # not by send()'s return — so this holds even when the write-response
                 # times out. Report whatever state the ack has produced by now.
                 return self.state.is_watering
             finally:
-                if self.connection is not None:
+                # A flow subscription needs this session for the whole program:
+                # the device pushes samples and writes nothing, and the idle
+                # timer only re-arms on writes. hold_open() disarms it, so
+                # disconnecting here would end measurement a second after it
+                # began — which is why the previous shape had to reconnect from
+                # a background task and race the coordinator refresh.
+                if self.connection is not None and not self.connection.is_held:
                     await self.connection.disconnect()
 
     async def stop_watering(self, station: int | None = None) -> bool:
@@ -254,6 +310,14 @@ class BHyveHT25Device(BHyveBleDeviceBase):
                 notifs = await self._send_command(plaintext, "STOP")
                 self._stamp_command("stop", len(notifs))
                 self._mark_reached()  # connected + sent → device reached this cycle
+                if self.has_flow_gen1:
+                    # Not gated on flow_gen1_enabled: if the switch was turned
+                    # off mid-run the hold still needs releasing. Release before
+                    # the finally so the session actually closes, and zero the
+                    # rate now rather than waiting for a zeroed sample that
+                    # won't arrive once the link is down.
+                    self._end_gen1_flow()
+                    self.state.flow_lpm_gen1 = 0.0
                 return not self.state.is_watering
             finally:
                 if self.connection is not None:
@@ -330,3 +394,203 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         fresh connect here — the on-demand refresh #24 dropped when it stopped
         forcing a connect on the button."""
         await self._connect_refresh()
+
+    def _flow_subscribe_frame(self) -> bytes:
+        # Captured reference frame from vendor app: 91eb 89 0e 40 e803 1e00
+        #   type=0x89, seq=0x0E, payload = interval_ms(1000 LE) + sample_count(30 LE)
+        # Measured on fw0085 across four units. Both fields are honoured, but
+        # the subscription also carries a ~300 s ceiling: the device stops after
+        # `count` samples or ~300 s, whichever comes first.
+        #   1000 ms x 10  -> 10 samples, stopped 45 s into a 60 s run
+        #   3000 ms x 700 -> 97 samples over ~300 s
+        #   1000 ms x 700 -> 297 samples over ~300 s
+        # 700 is deliberate: large enough that the ceiling always binds, so the
+        # stream length is predictable whatever the interval. Coverage past
+        # 300 s comes from re-subscribing — a 240 s renewal sustained a gapless
+        # 20.6-minute stream on hardware. Stretching the interval instead would
+        # be strictly worse: same 300 s, less resolution.
+        # So there is nothing to size here, and stretching the interval for a
+        # long program makes it strictly worse (same 300 s, less resolution).
+        # Coverage past 300 s comes from re-subscribing instead — a 240 s
+        # renewal sustained a gapless 20.6-minute stream on hardware.
+        payload = struct.pack("<HH", 3000, 700)
+        return self._build(TYPE_FLOW_SUBSCRIBE, SEQ_FLOW_SUBSCRIBE, payload)
+
+    def reset_gen1_flow(self) -> None:
+        self._gen1_last_elapsed = None
+        self._gen1_last_cum = None
+        self._gen1_last_total = None
+        self._gen1_wraps = 0
+        self.state.flow_lpm_gen1 = None
+        self.state.water_used_gen1_l = None
+
+    def apply_gen1_flow_frame(self, pt: bytes) -> bool:
+        """Decode one flow sample into rate + cumulative volume.
+
+        Frame: [mesh:2][push_ctr:1][seq:1][routing:1][rate u16][elapsed u16]
+        [cumulative u16], little-endian throughout.
+
+        pt[2] is a message counter cycling 0x80-0xBF, shared across flow, status
+        and battery pushes — it is NOT a type byte, and the 0x40 reply bit is
+        clear across that entire range, so neither a type check nor a TX-echo
+        guard is possible on this frame.
+
+        pt[7:9] is device-side seconds since START, advancing by exactly the
+        subscribed interval on every sample (verified over 156 in-run samples on
+        two units) and unchanged by a mid-run re-subscribe. Using it as dt keeps
+        the host clock out of the calculation entirely.
+
+        pt[5:7] is the device's own integer ticks/second and is deliberately
+        ignored: at 118 counts/L one step is 0.51 L/min, roughly three times
+        coarser than deriving the rate from the cumulative delta.
+        """
+        if self.mesh_device_id is None:
+            # No mesh id in the cloud record means there is no address to match
+            # against, so no frame can be attributed to this device. Bail before
+            # touching mesh_address, which raises rather than returning None.
+            return False
+        if (
+            len(pt) < 11
+            or pt[0:2] != self.mesh_address
+            or pt[3] != SEQ_FLOW
+            or pt[4] != D747_ROUTING
+        ):
+            return False
+        elapsed = struct.unpack("<H", pt[7:9])[0]
+        cum = struct.unpack("<H", pt[9:11])[0]
+
+        if elapsed == 0:
+            # Run over. The device keeps sampling with every field zeroed for as
+            # long as the subscription lives, so this is how flow-stopped
+            # arrives — and it must never be read as a volume of zero, or the
+            # run total is wiped the moment the valve shuts.
+            if self.state.flow_lpm_gen1 not in (None, 0.0):
+                self.state.flow_lpm_gen1 = 0.0
+                self._notify_state_changed()
+            return True
+
+        prev_elapsed = getattr(self, "_gen1_last_elapsed", None)
+        prev_cum = getattr(self, "_gen1_last_cum", None)
+        prev_total = getattr(self, "_gen1_last_total", None)
+        dt = None if prev_elapsed is None else elapsed - prev_elapsed
+
+        if dt is None or dt <= 0:
+            # First sample of a run, or elapsed went backwards — which only
+            # happens across a run boundary, since elapsed survives a
+            # re-subscribe. Anchor here instead of booking the whole counter.
+            self._gen1_wraps = 0
+        elif cum < prev_cum:
+            implied = (65536 - prev_cum) + cum
+            if implied > GEN1_MAX_TICKS_PER_SEC * dt:
+                # Far too large to be a real wrap at any flow rate this hardware
+                # can produce. Treat as a corrupt or desynced frame and
+                # re-anchor, rather than permanently booking 65536 phantom
+                # ticks (~575 L).
+                _LOGGER.debug(
+                    "%s: implausible flow counter %s->%s over %ss; re-anchoring",
+                    self.mac, prev_cum, cum, dt,
+                )
+                self._gen1_wraps = 0
+                dt = None
+            else:
+                # Genuine u16 wrap. Reachable inside a supported program: ~27
+                # min on a 40 tick/s zone, against a 1440-minute maximum.
+                self._gen1_wraps = getattr(self, "_gen1_wraps", 0) + 1
+
+        total = self._gen1_wraps * 65536 + cum
+
+        if dt is not None and prev_total is not None and total >= prev_total:
+            # inc == 0 is a legitimate reading (valve open, meter static) and
+            # must produce a rate of 0.0, not a held stale value.
+            inc = total - prev_total
+            self.state.flow_lpm_gen1 = round(
+                inc / dt * 60.0 / self.flow_counts_per_litre, 1
+            )
+        self.state.water_used_gen1_l = round(total / self.flow_counts_per_litre, 2)
+        self._gen1_last_elapsed = elapsed
+        self._gen1_last_cum = cum
+        self._gen1_last_total = total
+        self._notify_state_changed()
+        return True
+
+    async def _begin_gen1_flow(self, duration_sec: int) -> None:
+        """Subscribe to flow samples and hold the session for the run.
+
+        Runs inside start_watering's _api_lock on the session START just used,
+        so it neither races the coordinator refresh that valve.async_open_valve
+        fires nor pays a second connect and 8-step init. A failure here costs
+        this run's flow data, never the run itself.
+        """
+        self.reset_gen1_flow()
+        self.connection.hold_open(duration_sec + GEN1_HOLD_GRACE_SEC)
+        try:
+            frame = self._flow_subscribe_frame()
+            _LOGGER.debug("%s: flow subscribe tx pt=%s", self.mac, frame.hex())
+            await self.connection.send(frame, drain_ms=1200)
+        except (BleakError, asyncio.TimeoutError, OSError) as err:
+            _LOGGER.warning("%s: flow subscribe failed: %s", self.mac, err)
+            self._end_gen1_flow()
+            return
+        self._flow_sub_task = self.hass.async_create_task(
+            self._gen1_renewal_loop(duration_sec)
+        )
+
+    async def _gen1_renewal_loop(self, duration_sec: int) -> None:
+        """Re-subscribe every GEN1_RENEW_SEC for the length of the run."""
+        deadline = duration_sec + GEN1_HOLD_GRACE_SEC
+        waited = 0
+        try:
+            while waited < deadline:
+                await asyncio.sleep(GEN1_RENEW_SEC)
+                waited += GEN1_RENEW_SEC
+                if not self.state.is_watering or self.connection is None:
+                    return
+                try:
+                    await asyncio.wait_for(
+                        self._api_lock.acquire(), timeout=GEN1_RENEW_LOCK_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    _LOGGER.debug("%s: flow renewal skipped, device busy", self.mac)
+                    continue
+                try:
+                    if not self.state.is_watering:
+                        return
+                    frame = self._flow_subscribe_frame()
+                    await self.connection.send(frame, drain_ms=1200)
+                except (BleakError, asyncio.TimeoutError, OSError) as err:
+                    _LOGGER.debug("%s: flow renewal failed: %s", self.mac, err)
+                finally:
+                    self._api_lock.release()
+        finally:
+            # Ran out, saw the run end, or was cancelled — hand the session
+            # back either way. release() is idempotent, so overlapping with an
+            # explicit release path is harmless.
+            if self.connection is not None:
+                self.connection.release()
+
+    def _end_gen1_flow(self) -> None:
+        """Stop measuring: cancel the renewal task and release the session hold.
+
+        Called from every route a run can end by — the device's own run-end
+        frame, an explicit STOP, the coordinator's wall-clock auto-close,
+        stop_all, and config entry unload. Idempotent by construction, because
+        a run can end by more than one of those at effectively the same moment.
+        """
+        task = getattr(self, "_flow_sub_task", None)
+        self._flow_sub_task = None
+        if task is not None and not task.done():
+            task.cancel()
+        if self.connection is not None:
+            self.connection.release()
+
+    def on_watering_finished(self) -> None:
+        self._end_gen1_flow()
+
+    async def async_unload(self) -> None:
+        # hass.async_create_task is NOT tied to the config entry. An orphaned
+        # renewal task survives unload and keeps reconnecting, re-running the
+        # 8-step init and re-subscribing every 240 s against a device this
+        # integration no longer owns — observed on hardware, where only a full
+        # HA restart stopped it.
+        self._end_gen1_flow()
+        await super().async_unload()

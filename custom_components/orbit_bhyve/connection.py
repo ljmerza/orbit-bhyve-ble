@@ -106,6 +106,18 @@ class BHyveBleConnection:
         self._post_handshake_hook: PostHandshakeHook | None = None
         self._plaintext_observer: PlaintextObserver | None = None
         self._idle_timer: asyncio.TimerHandle | None = None
+        # Session hold. While held the idle timer stays disarmed, so a link that
+        # is only *receiving* isn't closed under it: _arm_idle_timer fires only
+        # on writes, and the Gen1 flow subscription writes nothing after the
+        # initial subscribe. See hold_open()/release().
+        self._held = False
+        self._hold_expiry: asyncio.TimerHandle | None = None
+
+    @property
+    def is_held(self) -> bool:
+        """True while a caller is holding the session open. Callers that would
+        otherwise tear the link down check this before disconnecting."""
+        return self._held
 
     @property
     def is_connected(self) -> bool:
@@ -272,6 +284,13 @@ class BHyveBleConnection:
                 _LOGGER.debug("%s: plaintext observer raised: %s", self.mac, err)
 
     async def disconnect(self) -> None:
+        # A hold refers to a live session; once the link is going down it means
+        # nothing. Clearing it here stops a stale hold surviving into the next
+        # connection and suppressing its idle timer indefinitely.
+        self._held = False
+        if self._hold_expiry is not None:
+            self._hold_expiry.cancel()
+            self._hold_expiry = None
         if self._idle_timer is not None:
             self._idle_timer.cancel()
             self._idle_timer = None
@@ -290,7 +309,54 @@ class BHyveBleConnection:
         self._last_rx_frame = None
         self._notif_pt.clear()
 
+    def hold_open(self, max_sec: float) -> None:
+        """Keep this session open past the idle timeout until release().
+
+        The idle timer is armed only by a write, so a feature that consumes
+        unsolicited notifications has its link closed under it mid-stream at the
+        default 60 s regardless of how much data is arriving. Holding disarms
+        the timer and stops later writes re-arming it.
+
+        Idempotent: calling again refreshes the expiry rather than nesting.
+        `max_sec` is a backstop, not the mechanism — if every release path is
+        missed the hold lapses on its own and hands the link back to the normal
+        idle machinery, so a leak costs one run rather than the cells.
+        """
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+        if self._hold_expiry is not None:
+            self._hold_expiry.cancel()
+        self._held = True
+        loop = asyncio.get_running_loop()
+        self._hold_expiry = loop.call_later(max_sec, self._expire_hold)
+
+    def _expire_hold(self) -> None:
+        _LOGGER.warning(
+            "%s: session hold hit its backstop and was released — a release "
+            "path was missed", self.mac,
+        )
+        self.release()
+
+    def release(self) -> None:
+        """Hand the session back to the normal idle machinery.
+
+        Never disconnects: release means "stop pinning this open", leaving the
+        existing idle path as the only place that closes a session. Safe when no
+        hold is active and safe to call repeatedly — six paths release this
+        hold, so a double release must be harmless.
+        """
+        if self._hold_expiry is not None:
+            self._hold_expiry.cancel()
+            self._hold_expiry = None
+        if not self._held:
+            return
+        self._held = False
+        self._arm_idle_timer()
+
     def _arm_idle_timer(self) -> None:
+        if self._held:
+            return
         if self._idle_sec <= 0:
             return
         if self._idle_timer is not None:

@@ -26,6 +26,7 @@ from homeassistant.const import (
     UnitOfVolume,
     UnitOfVolumeFlowRate,
 )
+
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -94,6 +95,15 @@ async def async_setup_entry(
             entities.append(BHyveFlowRateSensor(coord))
             entities.append(BHyveWaterUsedSensor(coord))
             entities.append(BHyveDeviceFlowRateSensor(coord))
+        # Gen1 (HT25) inline flow meter. The entities exist whenever the model
+        # has one — a runtime switch can't create entities after
+        # async_setup_entry, and the options flow deliberately doesn't reload
+        # (see __init__._async_update_listener) — so they report `unavailable`
+        # while the Flow measurement switch is off, which is truthful: the
+        # device genuinely isn't measuring.
+        if device.has_flow_gen1:
+            entities.append(BHyveGen1FlowRateSensor(coord))
+            entities.append(BHyveGen1WaterUsedSensor(coord))
     async_add_entities(entities)
 
 
@@ -218,7 +228,6 @@ class BHyveFlowRateSensor(_BHyveDeviceSensorBase):
     def native_value(self) -> float | None:
         state = self.coordinator.data or self.coordinator.device.state
         return state.flow_gpm
-
 
 class BHyveWaterUsedSensor(_RestoreLastValueSensor):
     """Cumulative water used (gallons), integrated from the flow gauge (Gen2).
@@ -419,6 +428,88 @@ class BHyveNextRunSensor(_BHyveDeviceSensorBase):
         flags = state.next_start_flags or 0
         slots = [SLOT_LETTERS[b + 1] for b in range(6) if flags & (1 << b) and (b + 1) in SLOT_LETTERS]
         return {"programs": slots}
+
+class _BHyveGen1FlowSensorBase(_BHyveDeviceSensorBase):
+    """Shared availability rule for the Gen1 (HT25) flow sensors.
+
+    The entities are created for every flow-capable model, but measuring is
+    per-device opt-in and off by default: it holds the timer's single BLE
+    session open for the whole program. While the Flow measurement switch is
+    off these read `unavailable` rather than a stale or zero value — the same
+    treatment BHyveProgramEnableSwitch gives a slot with no program stored.
+    """
+
+    @property
+    def available(self) -> bool:
+        return super().available and bool(self.coordinator.device.flow_gen1_enabled)
+
+
+class BHyveGen1FlowRateSensor(_BHyveGen1FlowSensorBase):
+    """Instantaneous flow (L/min), derived from the device's own sample stream.
+
+    Computed from the cumulative tick delta over the device-reported elapsed
+    delta, not from the device's own rate field (pt[5:7]): that field is integer
+    ticks/second, which at 118 counts/L quantises to 0.51 L/min per step —
+    roughly three times coarser than deriving it, and coarse enough to look
+    stuck on a low-flow drip zone.
+    """
+
+    _attr_device_class = SensorDeviceClass.VOLUME_FLOW_RATE
+    _attr_native_unit_of_measurement = UnitOfVolumeFlowRate.LITERS_PER_MINUTE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:water-flow"
+    _attr_suggested_display_precision = 1
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.device.unique_id}_flow_rate_lpm"
+        self._attr_name = "Flow rate"
+
+    @property
+    def native_value(self) -> float | None:
+        return self.coordinator.device.state.flow_lpm_gen1
+
+
+class BHyveGen1WaterUsedSensor(_BHyveGen1FlowSensorBase, _RestoreLastValueSensor):
+    """Per-run water used (litres), read from the device's cumulative counter.
+
+    The counter resets per run, so with TOTAL_INCREASING each run is a meter
+    reset and HA's statistics book the deltas cleanly. Two details matter:
+
+    - it reports 0.0 rather than None before the first sample of a run. None
+      renders as `unknown`, which long-term statistics read as a gap rather
+      than a reset;
+    - RestoreSensor carries the last value across a restart, so a restart
+      mid-run doesn't blip the total to nothing before the next sample lands.
+
+    The value comes straight from the counter (with a wrap carry) rather than
+    from summing deltas, which is what removes the old first-sample undercount
+    — the counter starts at zero each run, so the first sample's ticks are real
+    water and were previously discarded as a baseline.
+    """
+
+    _attr_device_class = SensorDeviceClass.WATER
+    _attr_native_unit_of_measurement = UnitOfVolume.LITERS
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_icon = "mdi:water"
+    _attr_suggested_display_precision = 2
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.device.unique_id}_water_used_l"
+        self._attr_name = "Water used"
+
+    @property
+    def native_value(self) -> float:
+        live = self.coordinator.device.state.water_used_gen1_l
+        if live is not None:
+            return live
+        if self._restored_value is not None:
+            try:
+                return float(self._restored_value)
+            except (TypeError, ValueError):
+                return 0.0
+        return 0.0
 
 
 class BHyveProgramSummarySensor(_BHyveDeviceSensorBase):
