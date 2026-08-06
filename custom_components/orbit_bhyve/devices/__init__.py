@@ -31,20 +31,23 @@ def resolve_device_class(*, hardware: str, firmware: str, type_: str) -> type[BH
     if type_ == "bridge":
         return BHyveHubDevice
     if (hardware or "").startswith("HT25"):
-        # Gen2 HT25G2 valves (fw0111) share the "HT25" hardware prefix but
-        # speak the protobuf protocol (frame magic 0x11) like the HT34A XD,
-        # NOT the d7-47 mesh protocol of the HT25-0000 hose timers. Route
-        # them away from the mesh classes before falling through. Match on
-        # the hardware suffix or fw so HT25-0000 (fw0041/0085) is untouched.
-        if (hardware or "").startswith("HT25G2") or firmware == "0111":
-            return BHyveHT25G2Device
-        # HT25-0000 mesh (d7-47) firmwares. fw0085 keeps upstream's thin
-        # subclass (retains _rebind_sid_delta=3, community-verified); fw0041 and
-        # any other fw use the parameterized base, which builds frames from the
-        # device's own mesh_device_id (not a hardcoded identity).
-        if firmware == "0085":
-            return BHyveHT25Fw0085Device
-        return BHyveHT25Device
+        # Mesh d7-47 hose timers are the only HT25 devices ever observed
+        # reporting the "-0000" hardware suffix — treat that as the
+        # authoritative signal rather than pinning to a firmware whitelist,
+        # which drifts every time Orbit ships a new build (e.g. a fw0098
+        # HT25G2 unit, upstream issue #47). Everything else under the HT25
+        # prefix — HT25G2-0001, the bare HT25-0001 variant, or any future
+        # firmware on either — speaks the protobuf protocol (frame magic
+        # 0x11) like the HT34A XD.
+        if (hardware or "").endswith("-0000"):
+            # fw0085 keeps upstream's thin subclass (retains
+            # _rebind_sid_delta=3, community-verified); fw0041 and any other
+            # fw use the parameterized base, which builds frames from the
+            # device's own mesh_device_id (not a hardcoded identity).
+            if firmware == "0085":
+                return BHyveHT25Fw0085Device
+            return BHyveHT25Device
+        return BHyveHT25G2Device
     if (hardware or "").startswith("HT34"):
         # Both HT34A-0001 and HT34-0001 (fw0058) use the protobuf XD protocol.
         # The older HT34 sharing it is the stuartdenne fork's claim (2026-06-27),
