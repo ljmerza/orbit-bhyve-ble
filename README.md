@@ -1,5 +1,17 @@
 # Orbit B-Hyve BLE — Home Assistant integration
 
+<p align="center">
+<img src="https://img.shields.io/github/stars/ljmerza/orbit-bhyve-ble?style=for-the-badge&label=Stars&color=orange" alt="Stars">
+<a href="https://github.com/ljmerza/orbit-bhyve-ble/releases"><img src="https://img.shields.io/github/downloads/ljmerza/orbit-bhyve-ble/total?style=for-the-badge&label=Downloads&color=blue" alt="Downloads"></a>
+<a href="https://github.com/ljmerza/orbit-bhyve-ble/releases/latest"><img src="https://img.shields.io/github/v/release/ljmerza/orbit-bhyve-ble?style=for-the-badge&color=purple" alt="Version"></a>
+<a href="https://github.com/ljmerza/orbit-bhyve-ble/actions/workflows/release.yaml"><img src="https://img.shields.io/github/actions/workflow/status/ljmerza/orbit-bhyve-ble/release.yaml?style=for-the-badge&label=Build" alt="Build"></a>
+<a href="https://github.com/ljmerza/orbit-bhyve-ble/blob/main/LICENSE"><img src="https://img.shields.io/github/license/ljmerza/orbit-bhyve-ble?style=for-the-badge&label=License&color=green" alt="License"></a>
+</p>
+
+<p align="center">
+<a href="https://www.buymeacoffee.com/JMISm06AD"><img src="https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee"></a>
+</p>
+
 **Local BLE control for Orbit B-Hyve hose-tap and XD timers.** Cloud is
 contacted only at setup to discover devices and fetch network keys. After
 setup, every command and state poll is BLE-only — your timers keep working
@@ -234,9 +246,3 @@ mobile application. The authors are not affiliated with Orbit Irrigation
 Products Inc.
 
 [MIT](LICENSE).
-
----
-
-Enjoy my work? Help me out for a couple of :beers: or a :coffee:!
-
-<a href="https://www.buymeacoffee.com/JMISm06AD"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="41" width="174"></a>
