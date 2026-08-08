@@ -12,6 +12,7 @@ when the WAN goes down.
 | Hose-tap timer    | `HT25-0000`    | `0085`           | ✅ Actuated end-to-end                   |
 | Hose-tap timer    | `HT25-0000`    | `0041`           | ✅ Actuated end-to-end (per-device mesh-ID addressing) |
 | Hose-tap timer (Gen2) | `HT25G2-0001` | `0111`          | ✅ Actuated end-to-end (protobuf protocol) |
+| Hose-tap timer (Gen2, 90205Z) | `HT25A-0001` | `0098`  | ✅ Connect/actuate verified by community member (issue #47); flow-sensor readings not yet confirmed on this variant |
 | 4-port XD         | `HT34A-0001`   | `0107`           | ✅ Battery/status decode verified on hardware; XD actuation proven via HT32A sibling |
 | 4-port XD         | `HT34-0001`    | `0058`           | ⚠️ Shares the XD protobuf protocol; not tested here |
 | 2-port XD         | `HT32A-0001`   | `0107`           | ✅ Actuated end-to-end (shares the HT34A XD protobuf protocol) |

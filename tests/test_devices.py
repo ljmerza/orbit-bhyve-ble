@@ -41,6 +41,8 @@ from orbit_bhyve.devices.protobuf import BHyveProtobufDevice
         ("HT25-0000", "0041", "", BHyveHT25Device),         # mesh base (fw0041)
         ("HT25G2-0001", "0098", "", BHyveHT25G2Device),     # Gen2, unseen firmware (issue #47)
         ("HT25-0001", "0098", "", BHyveHT25G2Device),       # Gen2, bare hardware + unseen firmware
+        ("HT25A-0001", "0098", "", BHyveHT25G2Device),      # issue #47, HW-verified (quadcom)
+        ("HT25G2-0000", "0111", "", BHyveHT25G2Device),     # explicit G2 prefix wins over -0000 suffix
     ],
 )
 def test_resolve_routes(hardware, firmware, type_, expected):

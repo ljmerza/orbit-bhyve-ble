@@ -35,10 +35,14 @@ def resolve_device_class(*, hardware: str, firmware: str, type_: str) -> type[BH
         # reporting the "-0000" hardware suffix — treat that as the
         # authoritative signal rather than pinning to a firmware whitelist,
         # which drifts every time Orbit ships a new build (e.g. a fw0098
-        # HT25G2 unit, upstream issue #47). Everything else under the HT25
-        # prefix — HT25G2-0001, the bare HT25-0001 variant, or any future
-        # firmware on either — speaks the protobuf protocol (frame magic
-        # 0x11) like the HT34A XD.
+        # HT25A-0001 unit, upstream issue #47). Everything else under the
+        # HT25 prefix — HT25G2-0001, the bare HT25-0001 variant, or any
+        # future firmware on either — speaks the protobuf protocol (frame
+        # magic 0x11) like the HT34A XD. The explicit "HT25G2" prefix is
+        # checked first since it's the strongest signal and should win over
+        # the suffix heuristic even for an (unobserved) "HT25G2-0000".
+        if (hardware or "").startswith("HT25G2"):
+            return BHyveHT25G2Device
         if (hardware or "").endswith("-0000"):
             # fw0085 keeps upstream's thin subclass (retains
             # _rebind_sid_delta=3, community-verified); fw0041 and any other
