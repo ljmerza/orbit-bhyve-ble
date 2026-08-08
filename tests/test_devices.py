@@ -36,9 +36,13 @@ from orbit_bhyve.devices.protobuf import BHyveProtobufDevice
         ("HT34A-0001", "0107", "", BHyveHT34ADevice),     # XD 4-port
         ("HT31-0001", "0058", "", BHyveHT34ADevice),      # 1-port Smart Hose Tap (XD protobuf)
         ("HT25G2-0001", "0111", "", BHyveHT25G2Device),   # Gen2 by suffix
-        ("HT25-0001", "0111", "", BHyveHT25G2Device),       # Gen2 by fw0111
-        ("HT25-0001", "0085", "", BHyveHT25Fw0085Device),   # mesh fw0085 (upstream subclass)
-        ("HT25-0001", "0041", "", BHyveHT25Device),         # mesh base (fw0041)
+        ("HT25-0001", "0111", "", BHyveHT25G2Device),       # Gen2, bare hardware string
+        ("HT25-0000", "0085", "", BHyveHT25Fw0085Device),   # mesh fw0085 (upstream subclass)
+        ("HT25-0000", "0041", "", BHyveHT25Device),         # mesh base (fw0041)
+        ("HT25G2-0001", "0098", "", BHyveHT25G2Device),     # Gen2, unseen firmware (issue #47)
+        ("HT25-0001", "0098", "", BHyveHT25G2Device),       # Gen2, bare hardware + unseen firmware
+        ("HT25A-0001", "0098", "", BHyveHT25G2Device),      # issue #47, HW-verified (quadcom)
+        ("HT25G2-0000", "0111", "", BHyveHT25G2Device),     # explicit G2 prefix wins over -0000 suffix
     ],
 )
 def test_resolve_routes(hardware, firmware, type_, expected):

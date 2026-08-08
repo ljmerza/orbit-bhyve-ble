@@ -4,8 +4,8 @@ Protobuf protocol family — the SAME framing, cipher, and timerMode start
 message as the HT34A XD timer (frame magic 0x11), NOT the d7-47 mesh
 protocol the older HT25-0000 hose timers (fw0041/0085) speak. Sharing a
 "HT25" hardware prefix with those mesh devices is the only thing they have
-in common; the dispatcher in __init__.py disambiguates by hardware-suffix /
-firmware so these land here instead of on BHyveHT25Device.
+in common; the dispatcher in __init__.py disambiguates by hardware suffix
+("-0000" = mesh) so these land here instead of on BHyveHT25Device.
 
 The protocol logic lives in `protobuf.BHyveProtobufDevice`, shared with the
 HT34A XD: both are protobuf-family valves differing only in log label and
