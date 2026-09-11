@@ -581,6 +581,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
             finally:
                 await self.connection.disconnect()
 
+    @_ble_write_guard
     async def set_rain_delay(self, minutes: int) -> bool:
         """Set the rain delay to `minutes` (0 clears). Returns True once the
         device's #16.#13 echo confirms the new state."""
@@ -627,6 +628,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
             finally:
                 await self.connection.disconnect()
 
+    @_ble_write_guard
     async def clear_rain_delay(self) -> bool:
         """Clear the rain delay (#17{#1=0}). Returns True once #16.#13 reads off."""
         async with self._api_lock:
