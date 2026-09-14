@@ -271,6 +271,22 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
 
     frame_magic = 0x11
     trailer_const = 0x11
+    # Whether the device honours `runTimeSec` in a manual run. HT25A fw0098 does
+    # not (every run is its default 1800 s), so that class sets this False and
+    # the requested duration is enforced from the host: start_watering arms a
+    # wall-clock timer that sends the stop. Any class also gets the timer when
+    # a confirmed START reports a remaining time far from the request.
+    duration_honored = True
+    # Host-side duration timer state (class-level defaults so test doubles built
+    # with object.__new__ work). The token invalidates a fire that raced a
+    # cancel: stop / new start / unload bump it.
+    _host_stop_handle: asyncio.TimerHandle | None = None
+    _host_stop_task: asyncio.Task | None = None
+    _host_stop_token: int = 0
+    _duration_warned: bool = False
+    # Why the last stop_watering() returned False ("STOP restarted the run",
+    # "device still watering after stop"); the valve entity surfaces it.
+    last_stop_error: str | None = None
     # Protobuf replies start with the inner-message header; enables the
     # connection's CTR-desync self-heal (mesh classes leave this None).
     reply_header = b"\xaa\x77\x5a\x0f"
@@ -500,6 +516,95 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                     await self.connection.disconnect()
             return self.state
 
+    # --- host-side duration enforcement ------------------------------------
+
+    def _host_stop_delay(self, duration_sec: int) -> float:
+        """Seconds until the host sends the stop for a run the device won't
+        time itself. Separate so tests can shrink it."""
+        return float(duration_sec)
+
+    def _cancel_host_stop(self) -> None:
+        self._host_stop_token += 1
+        handle = self._host_stop_handle
+        self._host_stop_handle = None
+        if handle is not None:
+            handle.cancel()
+
+    def _arm_host_stop(self, duration_sec: int) -> None:
+        """After a confirmed START: if the device ignores the requested run time
+        (class flag, or the reported remaining is > 60 s off the request), time
+        the run here and send the stop at `duration_sec`."""
+        self._cancel_host_stop()
+        reported = self.state.seconds_remaining
+        mismatch = reported is not None and abs(reported - duration_sec) > 60
+        if self.duration_honored and not mismatch:
+            self.state.duration_enforced_by_host = False
+            return
+        if not self._duration_warned:
+            _LOGGER.warning(
+                "%s: %s ignores the requested run time (asked %ss, device reports %ss) — "
+                "Home Assistant will send the stop after %ss",
+                self.mac, self.log_label, duration_sec, reported, duration_sec,
+            )
+            self._duration_warned = True
+        self.state.duration_enforced_by_host = True
+        token = self._host_stop_token
+        loop = asyncio.get_running_loop()
+        self._host_stop_handle = loop.call_later(
+            self._host_stop_delay(duration_sec), self._host_stop_fire, token
+        )
+
+    def _host_stop_fire(self, token: int) -> None:
+        if token != self._host_stop_token:
+            return
+        self._host_stop_handle = None
+        self._host_stop_task = asyncio.get_running_loop().create_task(self._host_stop(token))
+
+    async def _host_stop(self, token: int) -> None:
+        if token != self._host_stop_token:
+            return
+        _LOGGER.info("%s: %s requested run time reached — sending stop", self.mac, self.log_label)
+        ok = await self.stop_watering()
+        if not ok:
+            _LOGGER.error(
+                "%s: %s host-side stop failed: %s", self.mac, self.log_label, self.last_stop_error
+            )
+        cb = getattr(self, "_state_changed_cb", None)
+        if cb is not None:
+            cb()
+
+    async def async_unload(self) -> None:
+        self._cancel_host_stop()
+        await super().async_unload()
+
+    # --- actuation -----------------------------------------------------------
+
+    def _stop_frames(self) -> list[bytes]:
+        """Stop frames to try, in order, each at most once. The verified stop on
+        HT25G2 fw0111 / HT34A is `manualMode{}`; stop_watering escalates to
+        `offMode` if the device is still watering afterwards."""
+        return [_STOP_PB]
+
+    def _stop_restarted_run(self, remaining_before: int | None) -> bool:
+        """After a stop attempt: still watering with MORE time remaining than
+        before means the device took the frame as a start (HT25A fw0098 does
+        this with the shared STOP: a fresh default-length run every time)."""
+        after = self.state.seconds_remaining
+        if not self.state.is_watering or after is None:
+            return False
+        if remaining_before is None:
+            return after >= 1790
+        return after > remaining_before
+
+    async def _restore_auto_mode(self) -> None:
+        """A stop that went through offMode leaves the controller off; put it
+        back in autoMode so stored programs stay armed."""
+        try:
+            await self.connection.send(_build_message(_build_set_timer_mode_pb(1)), drain_ms=1500)
+            _LOGGER.debug("%s: %s autoMode restored after stop", self.mac, self.log_label)
+        except Exception as err:  # noqa: BLE001 — the stop itself succeeded
+            _LOGGER.warning("%s: %s could not restore autoMode after stop: %s", self.mac, self.log_label, err)
+
     async def start_watering(self, station: int, duration_sec: int) -> bool:
         async with self._api_lock:
             if self.connection is None:
@@ -530,6 +635,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                         if not self.state.seconds_remaining:
                             self.state.seconds_remaining = duration_sec
                         _LOGGER.debug("%s: %s START confirmed watering", self.mac, self.log_label)
+                        self._arm_host_stop(duration_sec)
                         return True
                     _LOGGER.warning(
                         "%s: %s START not confirmed (attempt %d/2) — fresh session",
@@ -545,14 +651,31 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 await self.connection.disconnect()
 
     async def stop_watering(self, station: int | None = None) -> bool:
+        # An explicit stop supersedes the host-side duration timer.
+        self._cancel_host_stop()
         async with self._api_lock:
             if self.connection is None:
                 return False
+            self.last_stop_error = None
             try:
-                plaintext = _build_message(_STOP_PB)
-                for attempt in range(2):
-                    notifs = await self.connection.send(plaintext, drain_ms=2000)
-                    self._stamp_command("stop", len(notifs))
+                mode_before = self.state.controller_mode
+                off_pb = _build_set_timer_mode_pb(0)
+                frames = list(self._stop_frames())
+                if off_pb not in frames:
+                    # Escalation for any class: offMode is the one frame verified
+                    # to stop the HT25A fw0098 run that manualMode{} restarts.
+                    frames.append(off_pb)
+                sent_off = False
+                restarted = False
+                for attempt, pb in enumerate(frames):
+                    if attempt:
+                        # Fresh session for the next frame.
+                        await self.connection.disconnect()
+                    remaining_before = self.state.seconds_remaining
+                    label = "stop" if pb == _STOP_PB else ("stop (offMode)" if pb == off_pb else "stop (zero run)")
+                    notifs = await self.connection.send(_build_message(pb), drain_ms=2000)
+                    self._stamp_command(label, len(notifs))
+                    sent_off = sent_off or pb == off_pb
                     # Give the physical valve solenoid time to actuate and settle
                     # before querying the status echo.
                     await asyncio.sleep(1.0)
@@ -566,16 +689,32 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                         self.state.seconds_remaining = None
                         self.state.started_at = None
                         self.state.expected_off_at = None
+                        self.state.duration_enforced_by_host = False
                         _LOGGER.debug("%s: %s STOP confirmed idle", self.mac, self.log_label)
+                        if sent_off and mode_before == 1:
+                            await self._restore_auto_mode()
                         return True
-                    _LOGGER.warning(
-                        "%s: %s STOP not confirmed (attempt %d/2) — fresh session",
-                        self.mac, self.log_label, attempt + 1,
-                    )
-                    if attempt < 1:
-                        await self.connection.disconnect()
+                    if self._stop_restarted_run(remaining_before):
+                        # Never re-send this frame: each send is another full run.
+                        restarted = True
+                        _LOGGER.error(
+                            "%s: %s STOP restarted the run (hardware %s fw %s: remaining %s -> %s s) "
+                            "— not re-sending this frame",
+                            self.mac, self.log_label,
+                            getattr(self, "hardware", "?"), getattr(self, "firmware", "?"),
+                            remaining_before, self.state.seconds_remaining,
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "%s: %s STOP not confirmed (attempt %d/%d) — fresh session",
+                            self.mac, self.log_label, attempt + 1, len(frames),
+                        )
                 _LOGGER.error(
-                    "%s: %s STOP failed to close after retries", self.mac, self.log_label
+                    "%s: %s STOP failed to close after %d attempt(s)",
+                    self.mac, self.log_label, len(frames),
+                )
+                self.last_stop_error = (
+                    "STOP restarted the run" if restarted else "device still watering after stop"
                 )
                 return False
             finally:

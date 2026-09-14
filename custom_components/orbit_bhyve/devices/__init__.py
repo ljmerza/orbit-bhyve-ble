@@ -10,6 +10,7 @@ from .base import BHyveBleDeviceBase, DeviceState, UnsupportedModel
 from .hub import BHyveHubDevice
 from .ht25 import BHyveHT25Device
 from .ht25_fw0085 import BHyveHT25Fw0085Device
+from .ht25a import BHyveHT25ADevice
 from .ht25g2 import BHyveHT25G2Device
 from .ht34a import BHyveHT34ADevice
 
@@ -20,6 +21,7 @@ __all__ = [
     "BHyveHubDevice",
     "BHyveHT25Device",
     "BHyveHT25Fw0085Device",
+    "BHyveHT25ADevice",
     "BHyveHT25G2Device",
     "BHyveHT34ADevice",
     "resolve_device_class",
@@ -43,6 +45,12 @@ def resolve_device_class(*, hardware: str, firmware: str, type_: str) -> type[BH
         # the suffix heuristic even for an (unobserved) "HT25G2-0000".
         if (hardware or "").startswith("HT25G2"):
             return BHyveHT25G2Device
+        if (hardware or "").startswith("HT25A"):
+            # HT25A-0001 (90205Z, fw0098): protobuf family, but its firmware
+            # ignores the requested run time and treats the shared STOP frame
+            # as "start a default run" — HW-verified 2026-09-14. Own class so
+            # it stops via offMode and enforces durations from the host.
+            return BHyveHT25ADevice
         if (hardware or "").endswith("-0000"):
             # fw0085 keeps upstream's thin subclass (retains
             # _rebind_sid_delta=3, community-verified); fw0041 and any other

@@ -173,7 +173,8 @@ Identify a message by its `OrbitPbApi_Message` field number:
 | f20 `setActivePrograms` | h2d | enable programs (uint32 bitmask, program A = bit 0) | (not implemented in this integration) |
 | f14 `timerMode {mode=autoMode, manualModeParams={}}` | h2d | enable watering / run schedules (empty f2 required) | (not implemented in this integration) |
 | f14 `timerMode {mode=manualMode, manualModeParams{stationInfo}}` | h2d | manual run-zone | `_build_start_pb()` (`devices/ht34a.py`) |
-| f14 `timerMode {mode=offMode, manualModeParams={}}` | h2d | stop watering (empty f2 required) | `_STOP_PB` constant (`devices/ht34a.py`) |
+| f14 `timerMode {mode=manualMode, manualModeParams={}}` | h2d | stop watering on HT25G2 fw0111 / HT34A (empty f2 required) | `_STOP_PB` constant (`devices/protobuf.py`) |
+| f14 `timerMode {mode=offMode, manualModeParams={}}` | h2d | controller off; the stop on HT25A-0001 fw0098 (where `manualMode{}` starts a default run instead — see `ble-reliability-and-behavior.md`) | `_build_set_timer_mode_pb(0)` (`devices/protobuf.py`) |
 | f17 `setRainDelay {rainDelayTimeMins, delayEndTimeSecEpochUtc, delayType}` | h2d | rain delay (skip schedules); `mins=0` cancels | (not implemented in this integration) |
 | f120 `setScheduledMode` | h2d | seasonal system on/off dates (empty = none) | -- |
 | f16 `deviceStatusInfo` | d2h | device status (state, schedule, rain delay) | `BHyveHT34ADevice._parse_status()` (`devices/ht34a.py`) |

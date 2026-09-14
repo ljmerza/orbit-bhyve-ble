@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from orbit_bhyve.devices import (
+    BHyveHT25ADevice,
     BHyveHT25Device,
     BHyveHT25Fw0085Device,
     BHyveHT25G2Device,
@@ -41,7 +42,8 @@ from orbit_bhyve.devices.protobuf import BHyveProtobufDevice
         ("HT25-0000", "0041", "", BHyveHT25Device),         # mesh base (fw0041)
         ("HT25G2-0001", "0098", "", BHyveHT25G2Device),     # Gen2, unseen firmware (issue #47)
         ("HT25-0001", "0098", "", BHyveHT25G2Device),       # Gen2, bare hardware + unseen firmware
-        ("HT25A-0001", "0098", "", BHyveHT25G2Device),      # issue #47, HW-verified (quadcom)
+        ("HT25A-0001", "0098", "", BHyveHT25ADevice),       # issue #47; own class (offMode stop, host-timed runs)
+        ("HT25A-0001", "0111", "", BHyveHT25ADevice),       # HT25A prefix wins regardless of firmware
         ("HT25G2-0000", "0111", "", BHyveHT25G2Device),     # explicit G2 prefix wins over -0000 suffix
     ],
 )
@@ -1033,3 +1035,338 @@ def test_mesh_passive_poll_does_not_clobber_connected():
     dev.connection = _DownConn()
     asyncio.run(dev.refresh_state())
     assert dev.state.is_connected is True   # not clobbered
+
+
+# --- HT25A-0001 fw0098: offMode stop, restart detection, host-timed runs ------
+# Hardware facts (2026-09-14, see docs/ble-reliability-and-behavior.md "HT25A-0001
+# fw0098 quirks"): the shared STOP frame (manualMode{}) (re)starts a 1800 s run
+# on this unit, offMode stops it, and the requested runTimeSec is ignored.
+
+from orbit_bhyve.devices.protobuf import _build_set_timer_mode_pb, _build_start_pb
+
+_OFF_PB = _build_set_timer_mode_pb(0)
+_AUTO_PB = _build_set_timer_mode_pb(1)
+
+
+def _status_full(run_state: int, remaining: int | None = None, mode: int | None = None) -> bytes:
+    """A #16 status with run-state, optional #6.#5 remaining and #2.#1 mode."""
+    sub = pb._pb_field_varint(rx.RX_F_STATUS_MODE, run_state)
+    if remaining is not None:
+        sub += pb._pb_field_bytes(
+            rx.RX_F_STATUS_PROGRESS, pb._pb_field_varint(rx.RX_F_PROGRESS_REMAINING, remaining)
+        )
+    if mode is not None:
+        sub += pb._pb_field_bytes(rx.RX_F_STATUS_RUNECHO, pb._pb_field_varint(rx.RX_F_RUNECHO_MODE, mode))
+    return pb._build_message(pb._pb_field_bytes(rx.RX_F_STATUS, sub))
+
+
+def _inner(frame: bytes) -> bytes:
+    return rx.decode_inner(frame) or b""
+
+
+class _ScriptConn(_FakeConn):
+    """_FakeConn whose status reply depends on which command frames were sent so
+    far: `status_for(sent_inner_pbs)` returns the #16 plaintext to feed on the
+    next status elicitor. Command frames get no reply (a bare ack)."""
+
+    def __init__(self, device, status_for):
+        super().__init__(device)
+        self.status_for = status_for
+
+    async def send(self, frame: bytes, drain_ms: int = 1500):
+        self.sent.append(frame)
+        if _is_status_elicitor(frame):
+            pt = self.status_for(self.commands())
+            if pt is not None:
+                self.device._observe_plaintext(pt)
+        return [b"\x01"]
+
+    def commands(self) -> list[bytes]:
+        # Only #14 timerMode frames (start / stop / offMode / autoMode); the
+        # #57 flow-unsubscribe that refresh_status sends on has_flow devices
+        # and the status elicitors are not actuation commands.
+        return [_inner(f) for f in self.sent if _inner(f)[:1] == b"\x72"]
+
+
+def _make_ht25a(**state_kwargs):
+    dev = object.__new__(BHyveHT25ADevice)
+    dev.mac = "AA:BB:CC:DD:EE:FF"
+    dev.hardware = "HT25A-0001"
+    dev.firmware = "0098"
+    dev.state = DeviceState(**state_kwargs)
+    dev.flow_counts_per_gallon = 433
+    return dev
+
+
+def test_ht25a_class_flags():
+    assert issubclass(BHyveHT25ADevice, BHyveHT25G2Device)
+    assert BHyveHT25ADevice.log_label == "HT25A"
+    assert BHyveHT25ADevice.duration_honored is False
+    dev = _make_ht25a()
+    assert dev._stop_frames() == [_OFF_PB, _build_start_pb(0, 0)]
+    assert pb._STOP_PB not in dev._stop_frames()
+
+
+def test_ht25a_stop_sends_offmode_then_restores_automode():
+    # Device was in autoMode (#16.#2.#1 = 1) before the stop: offMode stops the
+    # run, then autoMode is re-sent so stored programs stay armed.
+    dev = _make_ht25a(is_watering=True, active_zone=1, seconds_remaining=470, controller_mode=1)
+    dev.connection = _ScriptConn(dev, lambda cmds: _status_full(0) if _OFF_PB in cmds else _status_full(4, 470))
+
+    ok = asyncio.run(dev.stop_watering())
+
+    assert ok is True
+    assert dev.state.is_watering is False
+    assert dev.state.duration_enforced_by_host is False
+    cmds = dev.connection.commands()
+    assert cmds == [_OFF_PB, _AUTO_PB]
+    assert pb._STOP_PB not in cmds
+
+
+def test_ht25a_stop_skips_automode_restore_when_not_auto():
+    dev = _make_ht25a(is_watering=True, active_zone=1, seconds_remaining=470, controller_mode=2)
+    dev.connection = _ScriptConn(dev, lambda cmds: _status_full(0) if _OFF_PB in cmds else _status_full(4, 470))
+
+    assert asyncio.run(dev.stop_watering()) is True
+    assert dev.connection.commands() == [_OFF_PB]
+
+
+def test_ht25a_stop_falls_back_to_zero_run_once():
+    # offMode not confirmed -> the zero-second run is tried once; still watering
+    # -> False. No frame is ever sent twice.
+    dev = _make_ht25a(is_watering=True, active_zone=1, seconds_remaining=470)
+    dev.connection = _ScriptConn(dev, lambda cmds: _status_full(4, 469))
+
+    ok = asyncio.run(dev.stop_watering())
+
+    assert ok is False
+    assert dev.connection.commands() == [_OFF_PB, _build_start_pb(0, 0)]
+    assert dev.last_stop_error == "device still watering after stop"
+
+
+def test_stop_restart_detected_escalates_to_offmode_and_never_resends():
+    # Gen2 class on a unit that takes manualMode{} as a start: remaining jumps
+    # 470 -> 1800 after the STOP. The STOP frame must not be sent again;
+    # offMode is tried once and confirms idle.
+    dev = _make_device(is_watering=True, active_zone=1, seconds_remaining=470)
+    dev.hardware, dev.firmware = "HT25A-0001", "0098"
+
+    def status_for(cmds):
+        if _OFF_PB in cmds:
+            return _status_full(0)
+        if pb._STOP_PB in cmds:
+            return _status_full(4, 1800)
+        return _status_full(4, 470)
+
+    dev.connection = _ScriptConn(dev, status_for)
+    ok = asyncio.run(dev.stop_watering())
+
+    assert ok is True
+    cmds = dev.connection.commands()
+    assert cmds.count(pb._STOP_PB) == 1
+    assert cmds.count(_OFF_PB) == 1
+    assert dev.state.is_watering is False
+
+
+def test_stop_restart_still_watering_after_offmode_reports_error():
+    dev = _make_device(is_watering=True, active_zone=1, seconds_remaining=470)
+    dev.connection = _ScriptConn(dev, lambda cmds: _status_full(4, 1800) if cmds else _status_full(4, 470))
+
+    ok = asyncio.run(dev.stop_watering())
+
+    assert ok is False
+    assert dev.last_stop_error == "STOP restarted the run"
+    cmds = dev.connection.commands()
+    assert cmds == [pb._STOP_PB, _OFF_PB]          # each frame exactly once
+    assert dev.connection.disconnects == 2           # fresh session + finally
+
+
+def test_stop_unconfirmed_never_resends_same_frame():
+    # Still watering but counting down (no restart): escalate to offMode once
+    # rather than repeating the STOP frame.
+    dev = _make_device(is_watering=True, active_zone=1, seconds_remaining=470)
+    remaining = iter([469, 468, 467])
+    dev.connection = _ScriptConn(dev, lambda cmds: _status_full(4, next(remaining)))
+
+    ok = asyncio.run(dev.stop_watering())
+
+    assert ok is False
+    assert dev.connection.commands() == [pb._STOP_PB, _OFF_PB]
+    assert dev.last_stop_error == "device still watering after stop"
+
+
+def test_restart_detection_with_unknown_previous_remaining():
+    dev = _make_device(is_watering=True, seconds_remaining=None)
+    dev.state.seconds_remaining = 1800
+    assert dev._stop_restarted_run(None) is True
+    dev.state.seconds_remaining = 400
+    assert dev._stop_restarted_run(None) is False
+    assert dev._stop_restarted_run(470) is False
+    dev.state.seconds_remaining = 471
+    assert dev._stop_restarted_run(470) is True
+    dev.state.is_watering = False
+    assert dev._stop_restarted_run(470) is False
+
+
+def test_fw0111_stop_path_unchanged_when_confirmed():
+    # A Gen2 fw0111 unit confirms idle after the shared STOP: no escalation,
+    # no autoMode traffic.
+    dev = _make_device(is_watering=True, active_zone=1, seconds_remaining=600, controller_mode=1)
+    dev.connection = _ScriptConn(dev, lambda cmds: _status_full(1) if pb._STOP_PB in cmds else _status_full(4, 600))
+
+    assert asyncio.run(dev.stop_watering()) is True
+    assert dev.connection.commands() == [pb._STOP_PB]
+
+
+# --- host-side duration enforcement -------------------------------------------
+
+def _run_in_loop(coro):
+    return asyncio.run(coro)
+
+
+def _ht25a_running_conn(dev):
+    """Device reports a 1800 s run after any START; idle after offMode."""
+    def status_for(cmds):
+        if cmds and cmds[-1] == _OFF_PB:
+            return _status_full(0)
+        if any(c[:2] == b"\x72\x0a" for c in cmds):   # a manual-run frame was sent
+            return _status_full(4, 1796)
+        return _status_full(0)
+    return _ScriptConn(dev, status_for)
+
+
+def test_host_timer_sends_stop_at_requested_duration(monkeypatch):
+    monkeypatch.setattr(BHyveHT25ADevice, "_host_stop_delay", lambda self, d: 0.05)
+    dev = _make_ht25a()
+    dev.connection = _ht25a_running_conn(dev)
+
+    async def scenario():
+        ok = await dev.start_watering(1, 120)
+        assert ok is True
+        assert dev.state.duration_enforced_by_host is True
+        assert dev._host_stop_handle is not None
+        assert _OFF_PB not in dev.connection.commands()
+        await asyncio.sleep(0.2)          # timer fires, stop task starts
+        await dev._host_stop_task         # includes the 1 s solenoid settle
+        return dev.connection.commands()
+
+    cmds = _run_in_loop(scenario())
+    assert cmds.count(_OFF_PB) == 1
+    assert dev.state.is_watering is False
+    assert dev.state.duration_enforced_by_host is False
+
+
+def test_host_timer_not_armed_when_device_honours_duration():
+    dev = _make_device()
+    dev.connection = _ScriptConn(dev, lambda cmds: _status_full(4, 600) if cmds else _status_full(1))
+
+    async def scenario():
+        assert await dev.start_watering(1, 600) is True
+        assert dev._host_stop_handle is None
+        assert dev.state.duration_enforced_by_host is False
+
+    _run_in_loop(scenario())
+
+
+def test_host_timer_armed_on_any_class_when_remaining_mismatches(monkeypatch):
+    # Even the generic Gen2 class times the run when the device reports a
+    # remaining time > 60 s away from the request.
+    monkeypatch.setattr(BHyveHT25G2Device, "_host_stop_delay", lambda self, d: 0.05)
+    dev = _make_device()
+    dev.connection = _ScriptConn(dev, lambda cmds: _status_full(4, 1800) if cmds else _status_full(1))
+
+    async def scenario():
+        assert await dev.start_watering(1, 120) is True
+        assert dev.state.duration_enforced_by_host is True
+        assert dev._host_stop_handle is not None
+        dev._cancel_host_stop()
+
+    _run_in_loop(scenario())
+
+
+def test_host_timer_cancelled_by_explicit_stop(monkeypatch):
+    monkeypatch.setattr(BHyveHT25ADevice, "_host_stop_delay", lambda self, d: 0.05)
+    dev = _make_ht25a()
+    dev.connection = _ht25a_running_conn(dev)
+
+    async def scenario():
+        await dev.start_watering(1, 120)
+        assert await dev.stop_watering() is True
+        assert dev._host_stop_handle is None
+        await asyncio.sleep(0.3)
+        return dev.connection.commands()
+
+    cmds = _run_in_loop(scenario())
+    assert cmds.count(_OFF_PB) == 1   # only the explicit stop, the timer never fired
+
+
+def test_host_timer_rearmed_by_new_start(monkeypatch):
+    monkeypatch.setattr(BHyveHT25ADevice, "_host_stop_delay", lambda self, d: 0.05)
+    dev = _make_ht25a()
+    dev.connection = _ht25a_running_conn(dev)
+
+    async def scenario():
+        await dev.start_watering(1, 120)
+        first = dev._host_stop_handle
+        await dev.start_watering(1, 120)
+        assert dev._host_stop_handle is not first
+        assert first.cancelled()
+        await asyncio.sleep(0.2)
+        await dev._host_stop_task
+        return dev.connection.commands()
+
+    cmds = _run_in_loop(scenario())
+    assert cmds.count(_OFF_PB) == 1   # one timer fired for the second run only
+
+
+def test_host_timer_cancelled_by_unload(monkeypatch):
+    monkeypatch.setattr(BHyveHT25ADevice, "_host_stop_delay", lambda self, d: 0.05)
+    dev = _make_ht25a()
+    dev.connection = _ht25a_running_conn(dev)
+
+    async def scenario():
+        await dev.start_watering(1, 120)
+        await dev.async_unload()
+        assert dev._host_stop_handle is None
+        await asyncio.sleep(0.3)
+        return dev.connection.commands()
+
+    cmds = _run_in_loop(scenario())
+    assert _OFF_PB not in cmds
+
+
+# --- valve entity surfaces start/stop failures ---------------------------------
+
+def test_valve_close_and_open_raise_on_failure():
+    # The valve entity needs Home Assistant; the bare `Tests` CI job doesn't install it.
+    pytest.importorskip("homeassistant")
+    from types import SimpleNamespace
+    from homeassistant.exceptions import HomeAssistantError
+    from orbit_bhyve.valve import BHyveZoneValve
+
+    calls = {"refresh": 0}
+
+    async def refresh():
+        calls["refresh"] += 1
+
+    class _Dev:
+        name, mac, log_label = "Garden", "AA:BB:CC:DD:EE:FF", "HT25A"
+        last_stop_error = "STOP restarted the run"
+        stations = 1
+
+        async def start_watering(self, station, duration):
+            return False
+
+        async def stop_watering(self, station=None):
+            return False
+
+    valve = object.__new__(BHyveZoneValve)
+    valve.coordinator = SimpleNamespace(device=_Dev(), async_request_refresh=refresh, preferred_duration_sec=None)
+    valve._station = 1
+    valve._default_duration = 600
+
+    with pytest.raises(HomeAssistantError, match="STOP restarted the run"):
+        asyncio.run(valve.async_close_valve())
+    with pytest.raises(HomeAssistantError, match="START not confirmed"):
+        asyncio.run(valve.async_open_valve(duration=120))
+    assert calls["refresh"] == 0
