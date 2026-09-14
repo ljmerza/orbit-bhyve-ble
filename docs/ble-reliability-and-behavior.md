@@ -149,7 +149,44 @@ and use it to anchor the rain-delay `#3` expiry (§2.4). **[HW-verified]**
 |---|---|---|---|
 | Gen2 1-station | `HT25G2-0001` | `0111` | reliability §1, progress `#16.#6.#5` (remaining) / `#7` (total), stop ack, rain delay, flow `#57`/`#59`, clock |
 | XD 4-station | `HT34A-0001` | `0107` | reliability §1, progress `#16.#6.#5` (remaining) / `#7` (total), **active-zone** decode, stop ack, rain delay, **no flow** (confirmed) |
+| Gen2 hose-tap (90205Z) | `HT25A-0001` | `0098` | start/stop actuation, rain delay, programs — **with the quirks below** |
 
 Other Gen2/XD SKUs in the same families are expected-compatible but were not exercised. See
 knobunc's `PROTOCOL_SPEC.md` for the HT25 mesh (fw `0041`/`0085`) frame format, which this document
 does not cover.
+
+## HT25A-0001 fw0098 quirks
+
+Verified 2026-09-14 on one `HT25A-0001` fw `0098` unit over an ESPHome proxy, by reading the
+device's own `#16` status after each frame. **[HW-verified]** for every point below; a second unit
+of the same hardware/firmware corroborated point 5 only.
+
+1. **The shared STOP does not stop.** `timerMode{mode=manualMode, manualModeParams={}}`
+   (frame `aa775a0f0800720408021200c776`, `_STOP_PB`) is treated as *start a manual run of the
+   device default*: sent to a **running** device the run is replaced with a fresh
+   `#16.#6.#5 = 1800 s`; sent to an **idle** device the valve opens for 1800 s. Seen 4/4 times.
+   (On HT25G2 fw0111 and HT34A fw0107 this same frame stops the run.)
+2. **`offMode` stops the run.** `timerMode{mode=offMode, manualModeParams={}}`
+   (`aa775a0f0800720408001200a718`, `_build_set_timer_mode_pb(0)`) confirmed
+   `#16.#1 = 0`, not watering, on the follow-up read. Harmless on an idle device. `BHyveHT25ADevice`
+   uses it as the stop; when the device was in `autoMode` before the stop the integration re-sends
+   `autoMode` (`aa775a0f0800720408011200972f`) afterwards so programs stay armed.
+3. **A zero-second manual run also closes the valve.** `timerMode{manualMode,
+   manualModeParams{stationInfo{stationId=0, runTimeSec=0}}}` (`aa775a0f0e00720a080212061a040800100019f6`)
+   closed a running valve ~6 s later. Not tried on an idle device — it may start a run, so it is only
+   the fallback after `offMode`.
+4. **The requested `runTimeSec` is ignored.** `_build_start_pb(0, 120)` and `_build_start_pb(0, 1)`
+   both confirmed a run with `#16.#6.#5 = 1796–1800 s`; every manual run lasts the device default
+   (1800 s). The integration therefore times the run on the host: after a confirmed START whose
+   reported remaining differs from the request by more than 60 s it arms a wall-clock timer that sends
+   the stop at the requested duration (`DeviceState.duration_enforced_by_host`). The timer is cancelled
+   by an explicit stop, a new start, and unload. No captured app frame with extra `ManualModeParams`
+   fields (`startTimeSecEpochUtc`, …) exists in these docs, so whether the app sends something the
+   device honours is unknown — the bare `stationInfo` encoder stays as is for the verified devices.
+5. **Idle `#16.#1` reads `0` on this unit** (docs above say `1` = idle) and `2` on a second unit of
+   the same hardware/firmware. Both mean "not watering"; `4` still means running.
+
+Generic guard added for the whole protobuf family: after a stop attempt, if the device still reports
+watering and `#16.#6.#5` is **higher** than before the stop (or ≥ 1790 s when the previous value is
+unknown), the stop *restarted* the run — the integration logs an error, never re-sends that frame,
+escalates once to `offMode`, and reports the failure to the caller if the device is still watering.

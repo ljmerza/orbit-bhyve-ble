@@ -16,6 +16,7 @@ from homeassistant.components.valve import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -85,6 +86,9 @@ class BHyveZoneValve(CoordinatorEntity[BHyveDeviceCoordinator], ValveEntity):
             "last_command": state.last_command_label,
             "last_command_at": state.last_command_at,
             "notifications_last_cmd": state.notifications_last_cmd,
+            # True while HA is timing the run because the device ignores the
+            # requested duration (HT25A fw0098).
+            "duration_enforced_by_host": state.duration_enforced_by_host,
         }
 
     async def async_open_valve(self, **kwargs: Any) -> None:
@@ -93,9 +97,21 @@ class BHyveZoneValve(CoordinatorEntity[BHyveDeviceCoordinator], ValveEntity):
             or self.coordinator.preferred_duration_sec
             or self._default_duration
         )
-        if await self.coordinator.device.start_watering(self._station, duration):
-            await self.coordinator.async_request_refresh()
+        device = self.coordinator.device
+        if not await device.start_watering(self._station, duration):
+            # Surface the failure to the caller (service / automation) instead of
+            # silently leaving the entity in its old state.
+            raise HomeAssistantError(
+                f"{device.name} ({device.mac} {getattr(device, 'log_label', '')}): "
+                "START not confirmed by the device"
+            )
+        await self.coordinator.async_request_refresh()
 
     async def async_close_valve(self, **kwargs: Any) -> None:
-        if await self.coordinator.device.stop_watering(self._station):
-            await self.coordinator.async_request_refresh()
+        device = self.coordinator.device
+        if not await device.stop_watering(self._station):
+            reason = getattr(device, "last_stop_error", None) or "STOP not confirmed by the device"
+            raise HomeAssistantError(
+                f"{device.name} ({device.mac} {getattr(device, 'log_label', '')}): {reason}"
+            )
+        await self.coordinator.async_request_refresh()

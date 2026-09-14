@@ -226,6 +226,10 @@ class DeviceState:
     # Last fault report (#16.#7). None until a decoded status carries the block;
     # a frame WITHOUT the block keeps the last-known report (see FaultStatus).
     faults: FaultStatus | None = None
+    # True while the host is timing the current run because the device ignores
+    # the requested duration (HT25A fw0098): HA sends the stop at the requested
+    # time instead of relying on the device's own timer.
+    duration_enforced_by_host: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
 
