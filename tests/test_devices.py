@@ -1338,6 +1338,8 @@ def test_host_timer_cancelled_by_unload(monkeypatch):
 # --- valve entity surfaces start/stop failures ---------------------------------
 
 def test_valve_close_and_open_raise_on_failure():
+    # The valve entity needs Home Assistant; the bare `Tests` CI job doesn't install it.
+    pytest.importorskip("homeassistant")
     from types import SimpleNamespace
     from homeassistant.exceptions import HomeAssistantError
     from orbit_bhyve.valve import BHyveZoneValve
