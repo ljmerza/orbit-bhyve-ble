@@ -190,9 +190,4 @@ class BHyveRainDelayNumber(CoordinatorEntity[BHyveDeviceCoordinator], NumberEnti
 
     async def async_set_native_value(self, value: float) -> None:
         hours = max(0.0, min(MAX_RAIN_DELAY_HOURS, value))
-        device = self.coordinator.device
-        if hours <= 0:
-            await device.clear_rain_delay()
-        else:
-            await device.set_rain_delay(int(round(hours * 60)))
-        await self.coordinator.async_request_refresh()
+        await self.coordinator.async_apply_rain_delay(int(round(hours * 60)))

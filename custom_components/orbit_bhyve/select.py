@@ -125,13 +125,7 @@ class BHyveRainDelaySelect(CoordinatorEntity[BHyveDeviceCoordinator], SelectEnti
         return _MINUTES_TO_LABEL.get(minutes)
 
     async def async_select_option(self, option: str) -> None:
-        minutes = RAIN_DELAY_PRESETS[option]
-        device = self.coordinator.device
-        if minutes <= 0:
-            await device.clear_rain_delay()
-        else:
-            await device.set_rain_delay(minutes)
-        await self.coordinator.async_request_refresh()
+        await self.coordinator.async_apply_rain_delay(RAIN_DELAY_PRESETS[option])
 
 
 class BHyveBatteryChemistrySelect(

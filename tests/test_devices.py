@@ -449,6 +449,25 @@ def test_gpm_from_samples_zero_when_no_advance():
     assert pb._gpm_from_samples([], 433) == 0.0                         # no samples
 
 
+class _BleErrorConn(_FakeConn):
+    """A link that drops mid-write (proxy teardown after a CTR self-heal)."""
+
+    async def send(self, frame: bytes, drain_ms: int = 1500):
+        from bleak.exc import BleakError
+        raise BleakError("Not connected")
+
+
+@pytest.mark.parametrize("method, args", [("set_rain_delay", (60,)), ("clear_rain_delay", ())])
+def test_rain_delay_writes_return_false_on_ble_error(method, args):
+    # set/clear_rain_delay must carry _ble_write_guard like every other protobuf
+    # write: a transient BleakError returns False (the entity raises a clean
+    # HomeAssistantError from that) instead of surfacing a raw exception.
+    dev = _make_device(is_watering=False)
+    dev.connection = _BleErrorConn(dev)
+    assert asyncio.run(getattr(dev, method)(*args)) is False
+    assert dev.connection.disconnects >= 1
+
+
 class _DesyncThenFreshConn:
     """First flow subscribe decodes to nothing (simulates a desynced RX counter);
     after a disconnect (fresh handshake) the #59 decodes cleanly."""
