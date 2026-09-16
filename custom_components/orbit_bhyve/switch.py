@@ -146,12 +146,12 @@ class BHyveAutomaticWateringSwitch(_BHyveSwitchBase):
         return mode != 0  # 1=auto (on), 2=manual also counts as "not off"
 
     async def async_turn_on(self, **kwargs) -> None:
-        await self.coordinator.device.set_controller_mode(True)
-        await self.coordinator.async_request_refresh()
+        ok = await self.coordinator.device.set_controller_mode(True)
+        await self.coordinator.async_confirm_write(ok, "automatic watering")
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self.coordinator.device.set_controller_mode(False)
-        await self.coordinator.async_request_refresh()
+        ok = await self.coordinator.device.set_controller_mode(False)
+        await self.coordinator.async_confirm_write(ok, "automatic watering")
 
 
 class BHyveProgramEnableSwitch(_BHyveSwitchBase):
@@ -186,9 +186,9 @@ class BHyveProgramEnableSwitch(_BHyveSwitchBase):
         return bool(summary.enabled)
 
     async def async_turn_on(self, **kwargs) -> None:
-        await self.coordinator.device.set_program_enabled(self._slot, True)
-        await self.coordinator.async_request_refresh()
+        ok = await self.coordinator.device.set_program_enabled(self._slot, True)
+        await self.coordinator.async_confirm_write(ok, f"Program {self._letter}")
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self.coordinator.device.set_program_enabled(self._slot, False)
-        await self.coordinator.async_request_refresh()
+        ok = await self.coordinator.device.set_program_enabled(self._slot, False)
+        await self.coordinator.async_confirm_write(ok, f"Program {self._letter}")
