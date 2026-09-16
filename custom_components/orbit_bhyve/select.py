@@ -33,7 +33,6 @@ from .const import DOMAIN
 from .coordinator import BHyveDeviceCoordinator
 from .devices.base import BATTERY_CHEMISTRIES
 from .devices.protobuf import BHyveProtobufDevice
-from .number import async_apply_rain_delay
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -126,7 +125,7 @@ class BHyveRainDelaySelect(CoordinatorEntity[BHyveDeviceCoordinator], SelectEnti
         return _MINUTES_TO_LABEL.get(minutes)
 
     async def async_select_option(self, option: str) -> None:
-        await async_apply_rain_delay(self.coordinator, RAIN_DELAY_PRESETS[option])
+        await self.coordinator.async_apply_rain_delay(RAIN_DELAY_PRESETS[option])
 
 
 class BHyveBatteryChemistrySelect(

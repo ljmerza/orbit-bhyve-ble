@@ -16,7 +16,6 @@ from homeassistant.components.number import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory, UnitOfTime
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -191,20 +190,4 @@ class BHyveRainDelayNumber(CoordinatorEntity[BHyveDeviceCoordinator], NumberEnti
 
     async def async_set_native_value(self, value: float) -> None:
         hours = max(0.0, min(MAX_RAIN_DELAY_HOURS, value))
-        await async_apply_rain_delay(self.coordinator, int(round(hours * 60)))
-
-
-async def async_apply_rain_delay(coordinator: BHyveDeviceCoordinator, minutes: int) -> None:
-    """Write a rain delay (0 clears), re-read the device, raise if it did not
-    confirm. Shared by the hours number and the preset select so an unconfirmed
-    write (issue #52) surfaces as a service error instead of a silent revert."""
-    device = coordinator.device
-    if minutes <= 0:
-        ok = await device.clear_rain_delay()
-    else:
-        ok = await device.set_rain_delay(minutes)
-    await coordinator.async_request_refresh()
-    if not ok:
-        raise HomeAssistantError(
-            f"{device.name}: rain delay not confirmed by the device (see log)"
-        )
+        await self.coordinator.async_apply_rain_delay(int(round(hours * 60)))

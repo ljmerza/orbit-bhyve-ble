@@ -17,7 +17,9 @@ pytest.importorskip("homeassistant")
 
 from homeassistant.exceptions import HomeAssistantError  # noqa: E402
 
-from orbit_bhyve.number import async_apply_rain_delay  # noqa: E402
+from orbit_bhyve.coordinator import BHyveDeviceCoordinator  # noqa: E402
+
+async_apply_rain_delay = BHyveDeviceCoordinator.async_apply_rain_delay
 
 
 def _coordinator(ok: bool):
