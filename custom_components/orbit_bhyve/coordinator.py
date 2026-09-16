@@ -61,10 +61,19 @@ class BHyveDeviceCoordinator(DataUpdateCoordinator[DeviceState]):
             ok = await self.device.clear_rain_delay()
         else:
             ok = await self.device.set_rain_delay(minutes)
+        await self.async_confirm_write(ok, "rain delay")
+
+    async def async_confirm_write(self, ok: bool, action: str) -> None:
+        """Re-read the device after a write, then raise if the write returned False.
+
+        Shared by every entity write so an unconfirmed one surfaces as a service
+        error instead of a silent revert on the next poll. The text stays neutral:
+        False also covers a write that never went out (no connection, BLE error),
+        and the log says which."""
         await self.async_request_refresh()
         if not ok:
             raise HomeAssistantError(
-                f"{self.device.name}: rain delay write not confirmed (see log)"
+                f"{self.device.name}: {action} write not confirmed (see log)"
             )
 
     def _handle_device_state_change(self) -> None:
