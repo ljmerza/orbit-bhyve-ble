@@ -125,5 +125,18 @@
         "slot": {"name": "Program slot", "description": "Optional — a single slot (A–D). Omit to return all slots."}
       }
     }
+  },
+  "entity": {
+    "sensor": {
+      "device_status": {
+        "state": {
+          "idle": "Idle",
+          "low_battery": "Low battery",
+          "rain_delay": "Rain delay",
+          "watering": "Watering",
+          "mesh_offline": "Mesh offline"
+        }
+      }
+    }
   }
 }

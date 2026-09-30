@@ -220,6 +220,7 @@ class DeviceState:
     consecutive_timeouts: int = 0
     # Controller / program state (protobuf family).
     controller_mode: int | None = None   # #16.#2.#1 timerMode.mode: 0=off, 1=auto, 2=manual
+    device_status: int | None = None     # #16.#1 raw deviceStatus enum (2=lowBattery) — "Status" sensor
     next_start_flags: int | None = None  # #16.#9 nextStartProgramFlags (slot bitmask, A=bit0)
     next_start_at: datetime | None = None  # #16.#10 nextStartTimeSecEpochUTC as an aware datetime
     programs: dict[int, ProgramSummary] = field(default_factory=dict)  # slot(1-6) -> summary

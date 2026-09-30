@@ -86,6 +86,7 @@ async def async_setup_entry(
         # Rain delay + watering programs are protobuf-family (HT34A/HT25G2)
         # capabilities.
         if isinstance(device, BHyveProtobufDevice):
+            entities.append(BHyveDeviceStatusSensor(coord))
             entities.append(BHyveRainDelayEndsSensor(coord))
             entities.append(BHyveNextRunSensor(coord))
             for letter in UI_SLOTS:
@@ -341,6 +342,49 @@ class BHyveRainDelayEndsSensor(_BHyveDeviceSensorBase):
     def native_value(self) -> datetime | None:
         state = self.coordinator.data or self.coordinator.device.state
         return state.rain_delay_ends
+
+
+# #16.#1 deviceStatus enum -> Status sensor state, in vendor enum order
+# (docs/protocol.md): deviceOff, deviceIdle, lowBattery, rainDelayEnabled,
+# wateringInProgress, meshDeviceOffline. Healthy units idle at 0 (deviceOff) —
+# that only mirrors the controller being out of autoMode (see the "Automatic
+# watering" switch) and manual starts still work — so it reads "idle".
+DEVICE_STATUS_STATES = {
+    0: "idle",
+    1: "idle",
+    2: "low_battery",
+    3: "rain_delay",
+    4: "watering",
+    5: "mesh_offline",
+}
+
+
+class BHyveDeviceStatusSensor(_BHyveDeviceSensorBase):
+    """Device-reported status (#16.#1). Surfaces lowBattery, which otherwise
+    only shows up as START failing to confirm. An unmapped value reads
+    `unknown`; the raw number rides along as an attribute either way."""
+
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = list(dict.fromkeys(DEVICE_STATUS_STATES.values()))
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_translation_key = "device_status"
+    _attr_icon = "mdi:list-status"
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        device = coordinator.device
+        self._attr_unique_id = f"{device.unique_id}_device_status"
+        self._attr_name = "Status"
+
+    @property
+    def native_value(self) -> str | None:
+        state = self.coordinator.data or self.coordinator.device.state
+        return DEVICE_STATUS_STATES.get(state.device_status)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        state = self.coordinator.data or self.coordinator.device.state
+        return {"raw_device_status": state.device_status}
 
 
 class BHyveLastSuccessfulPollSensor(_BHyveDeviceSensorBase):
