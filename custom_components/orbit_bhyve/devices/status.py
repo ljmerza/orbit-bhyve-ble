@@ -555,6 +555,12 @@ def apply_status_plaintext(device, pt: bytes) -> None:
     if st.controller_mode is not None:
         device.state.controller_mode = st.controller_mode
 
+    # Raw device status (#16.#1) — the "Status" sensor reads this. Beyond driving
+    # is_watering it carries lowBattery (2): a low unit keeps answering polls but
+    # silently refuses START (HW-observed 2026-09-30, HT25A at ~2518 mV).
+    if st.run_state is not None:
+        device.state.device_status = st.run_state
+
     # Next scheduled program run (#16.#9/#10). The device reports it once a
     # program is stored+enabled while in autoMode; feeds the "Next run" sensor and
     # confirms the enable handshake. Absent (flags 0/None) => no next start armed.

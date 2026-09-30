@@ -112,6 +112,11 @@ Per discovered sprinkler device:
   reads `unavailable`.
 - **Next run** sensor — the device-computed next scheduled program start
   (timestamp), with the program letter(s) as an attribute.
+- **Status** sensor (protobuf family, diagnostic) — the device's own status:
+  Idle / Low battery / Rain delay / Watering / Mesh offline, with the raw
+  value as an attribute. A **Low battery** timer keeps answering polls but
+  refuses to start watering, so check this first when a start "isn't
+  confirmed".
 - **Flow rate** and **Water used** sensors (flow-capable Gen2 valves) —
   instantaneous GPM sampled from the inline flow sensor on each watering
   poll, plus a cumulative gallons total integrated from it that plugs

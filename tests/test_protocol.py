@@ -342,6 +342,18 @@ def test_apply_updates_battery_and_clears_zone_on_idle():
     assert dev.state.seconds_remaining is None
 
 
+def test_apply_stores_raw_device_status():
+    # #16.#1 lowBattery (2): the unit answers polls but refuses START, so the raw
+    # value is kept for the Status sensor (HW-observed 2026-09-30, HT25A).
+    dev = _fake_device()
+    rx.apply_status_plaintext(dev, tx._build_message(_status_pb(run_state=2, battery_mv=2518)))
+    assert dev.state.device_status == 2
+    assert dev.state.is_watering is False
+    # A frame without a #16 block leaves the last-known status in place.
+    rx.apply_status_plaintext(dev, tx._build_message(_status_pb(watering_active=0)))
+    assert dev.state.device_status == 2
+
+
 def test_apply_sets_watering_true_on_running():
     dev = _fake_device()
     dev.state.is_watering = False
