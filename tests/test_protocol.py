@@ -12,7 +12,7 @@ import pytest
 
 from orbit_bhyve.devices import protobuf as tx
 from orbit_bhyve.devices import status as rx
-from orbit_bhyve.devices.base import DeviceState
+from orbit_bhyve.devices.base import DeviceState, FaultStatus
 
 
 # --- protobuf low-level helpers -------------------------------------------
@@ -581,6 +581,26 @@ def test_extract_status_fault_hi_flags_shifted():
     st = rx.extract_status(_status_with_faults(body))
     assert st.faults.station_fault_flags == 1 << 32
     assert st.faults.station_faults == (33,)
+
+
+def test_fault_reasons_describe_every_set_fault():
+    f = rx.extract_status(
+        _status_with_faults(
+            tx._pb_field_varint(rx._FLT_BATTERY, 1)
+            + tx._pb_field_varint(rx._FLT_STATIONS_LO, 0b101)
+        )
+    ).faults
+    assert f.reasons == ("Battery fault", "Station fault (station 1, station 3)")
+
+
+def test_fault_reasons_empty_when_healthy():
+    assert FaultStatus().reasons == ()
+
+
+def test_fault_reasons_report_accessory_flags_raw():
+    assert FaultStatus(accessory_fault_flags=0x12).reasons == (
+        "Smart accessory fault (flags 0x12)",
+    )
 
 
 def test_extract_status_absent_fault_block_is_none():
