@@ -196,6 +196,29 @@ class FaultStatus:
         """1-indexed stations whose fault bit is set (bit N = station N+1)."""
         return tuple(i + 1 for i in range(64) if self.station_fault_flags >> i & 1)
 
+    @property
+    def reasons(self) -> tuple[str, ...]:
+        """Human-readable description of every fault that is set, in report order."""
+        reasons = [
+            label
+            for flag, label in (
+                (self.pump_fault, "Pump fault"),
+                (self.voltage_boost_fail, "Voltage boost circuit failure"),
+                (self.valve_off_flow, "Flow while valve closed (leak)"),
+                (self.valve_on_no_flow, "No flow while valve open"),
+                (self.valve_low_flow, "Low flow"),
+                (self.valve_high_flow, "High flow"),
+                (self.battery_fault, "Battery fault"),
+            )
+            if flag
+        ]
+        if stations := self.station_faults:
+            reasons.append(f"Station fault ({', '.join(f'station {n}' for n in stations)})")
+        if self.accessory_fault_flags:
+            # The bit meanings aren't documented, so report the raw bitmask.
+            reasons.append(f"Smart accessory fault (flags {self.accessory_fault_flags:#x})")
+        return tuple(reasons)
+
 
 @dataclass
 class DeviceState:

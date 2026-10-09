@@ -8,7 +8,7 @@ import pytest
 
 pytest.importorskip("homeassistant")
 
-from orbit_bhyve.devices.base import DeviceState  # noqa: E402
+from orbit_bhyve.devices.base import DeviceState, FaultStatus  # noqa: E402
 from orbit_bhyve.sensor import BHyveDeviceStatusSensor  # noqa: E402
 
 
@@ -44,3 +44,26 @@ def test_status_sensor_maps_device_status(raw, expected):
     assert sensor.extra_state_attributes == {"raw_device_status": raw}
     if expected is not None:
         assert expected in sensor.options
+
+
+@pytest.mark.parametrize(
+    ("faults", "expected"),
+    [
+        (FaultStatus(), "No faults"),
+        (FaultStatus(battery_fault=True, pump_fault=True), "Pump fault, Battery fault"),
+    ],
+)
+def test_problem_sensor_reason_attribute(faults, expected):
+    from orbit_bhyve.binary_sensor import BHyveProblemBinarySensor
+
+    device = SimpleNamespace(
+        name="Garden irrigation",
+        unique_id="garden",
+        cloud_id="cloud-garden",
+        hardware="HT25A-0001",
+        firmware="0098",
+        mac="44:67:55:1D:67:DB",
+        state=DeviceState(faults=faults),
+    )
+    sensor = BHyveProblemBinarySensor(SimpleNamespace(device=device, data=None))
+    assert sensor.extra_state_attributes["reason"] == expected

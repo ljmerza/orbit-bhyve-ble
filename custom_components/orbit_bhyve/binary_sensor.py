@@ -115,7 +115,8 @@ class _BHyveFaultSensorBase(_BHyveBinarySensorBase):
 class BHyveProblemBinarySensor(_BHyveFaultSensorBase):
     """Aggregate device fault: on when the device reports ANY fault — pump,
     battery, voltage-boost, flow anomalies or a per-station fault. The
-    individual flags ride along as attributes for automations; the
+    `reason` attribute says which; the individual flags ride along as
+    attributes for automations; the
     leak-specific flag also gets its own alerting entity on Gen2."""
 
     _attr_device_class = BinarySensorDeviceClass.PROBLEM
@@ -137,6 +138,7 @@ class BHyveProblemBinarySensor(_BHyveFaultSensorBase):
         if faults is None:
             return None
         return {
+            "reason": ", ".join(faults.reasons) or "No faults",
             "pump_fault": faults.pump_fault,
             "battery_fault": faults.battery_fault,
             "voltage_boost_fail": faults.voltage_boost_fail,
