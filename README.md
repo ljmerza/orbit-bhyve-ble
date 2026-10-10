@@ -249,10 +249,21 @@ Two things worth knowing:
 ## Recovering a timer stuck after a firmware update
 
 If an `HT25-0000` blinks **white every ~2 seconds** after a firmware update and
-stops responding, it is stuck in its bootloader. It is usually not bricked.
-[`scripts/recover_firmware.py`](scripts/recover_firmware.py) can re-send the
-official firmware over BLE from any machine with Bluetooth. You don't need
-Home Assistant for this:
+stops responding, it is stuck in its bootloader. It is usually not bricked:
+re-sending the official firmware over BLE brings it back. There are three ways
+to do that:
+
+- **Recover firmware button** on a configured HT25-0000. When a connect finds
+  the timer in its bootloader, its **Problem** sensor turns on and says so.
+- **`orbit_bhyve.recover_firmware` action** with the timer's MAC address. This
+  also works for a timer that is no longer on your B-hyve account.
+- **[`scripts/recover_firmware.py`](scripts/recover_firmware.py)** from any
+  machine with Bluetooth near the timer. No Home Assistant needed.
+
+In Home Assistant, the firmware downloads from the Orbit cloud using your saved
+login, and progress appears as a notification. Over an ESPHome Bluetooth proxy
+the transfer runs in an experimental mode that hasn't been tested on hardware
+yet. The CLI is the tested path:
 
 ```bash
 python3 scripts/recover_firmware.py scan

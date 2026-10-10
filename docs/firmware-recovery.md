@@ -8,7 +8,8 @@ brings it back. This procedure and protocol were worked out by @CoderBananna in
 recovered two units this way.
 
 Code: [`custom_components/orbit_bhyve/firmware.py`](../custom_components/orbit_bhyve/firmware.py)
-(protocol) and [`scripts/recover_firmware.py`](../scripts/recover_firmware.py)
+(protocol), [`recovery.py`](../custom_components/orbit_bhyve/recovery.py) (Home
+Assistant) and [`scripts/recover_firmware.py`](../scripts/recover_firmware.py)
 (CLI).
 
 ## Scope — read this first
@@ -19,12 +20,43 @@ Code: [`custom_components/orbit_bhyve/firmware.py`](../custom_components/orbit_b
 - **Not verified:** other hardware (HT25A/G2, XD), other image sizes, other
   bootloader revisions. The image-validation-failed status (2) has never been
   seen on hardware.
-- **Only for stuck timers.** The CLI refuses to flash a device that isn't in
+- **Only for stuck timers.** Every path refuses to flash a device that isn't in
   bootloader mode. Do not use this to update a working timer.
 - Disconnect the timer from water while recovering.
 - A recovered unit can still have a separate hardware fault (one unit in #61
   had a failed valve actuator). Confirm water actually flows before you trust
   it. A green LED or an "open" state is not proof.
+
+## In Home Assistant
+
+- **Problem sensor:** on HT25-0000 units, a connect that finds the timer in its
+  bootloader turns this on, with a reason saying so. Mesh polls don't connect by
+  default, so it updates when something does: Sync, watering, or the *Mesh live
+  status poll* option.
+- **Recover firmware button** on a configured HT25-0000.
+- **`orbit_bhyve.recover_firmware` action:** takes a MAC `address`, so it also
+  reaches a timer that is no longer on your account and so was never set up
+  here. If the address belongs to a configured device, it does the same as that
+  device's button.
+
+Both run in the background, with progress in a notification. They connect
+through whichever adapter or proxy reaches the timer, and download the image
+with the integration's saved login. The firmware endpoint is per hardware
+model, so the timer doesn't need to be on that account. They only send an image
+whose hash matches a known-good one. After install they reconnect to confirm
+normal mode: a configured device does a full handshake, while an address-only
+timer gets a check that the AES characteristic is back.
+
+**ESPHome proxies (experimental).** Recovery first checks whether the link
+passes back write acknowledgements. #61's procedure relies on them. If the link
+doesn't (as `connection.py` observed for proxies), recovery sends without
+acknowledgements and checks the device's offset every 16 blocks. Data frames
+carry no address, so a lost block shifts everything after it. On a mismatch the
+transfer restarts from zero (up to twice), and the device's own validation is
+the final gate before anything installs. Two things are unverified on hardware:
+whether the bootloader accepts unacknowledged writes, and whether *start*
+resets a transfer already in progress. If HA recovery fails, the timer stays in
+its bootloader, and the CLI next to the timer is the fallback.
 
 ## Using the CLI
 
