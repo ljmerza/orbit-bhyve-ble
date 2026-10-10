@@ -39,6 +39,7 @@ from .connection import (
     BleBootloaderMode,
     BleHandshakeError,
     BleNotConnectable,
+    heal_proxy_address_type,
 )
 from .const import AES_CHAR, CONF_EMAIL, CONF_PASSWORD, DOMAIN
 from .coordinator import BHyveDeviceCoordinator
@@ -201,6 +202,9 @@ async def _connect(hass, mac: str) -> BleakClient:
     # usb/pyserial, which the HA-plugin test environment doesn't have.
     from homeassistant.components.bluetooth import async_ble_device_from_address
 
+    # An address-only timer never passes through BHyveBleConnection._open, so
+    # heal a stale proxy address type here too (#60).
+    heal_proxy_address_type(hass, mac)
     ble_device = async_ble_device_from_address(hass, mac, connectable=True)
     if ble_device is None:
         raise HomeAssistantError(

@@ -60,6 +60,55 @@ PostHandshakeHook = Callable[["BHyveBleConnection"], Awaitable[None]]
 PlaintextObserver = Callable[[bytes], None]
 
 
+def heal_proxy_address_type(hass, mac: str) -> None:
+    """Correct a stale public address type on Bluetooth proxy records.
+
+    HA keeps one device record per scanner and fixes its address type at the
+    first advertisement that scanner sees. Later advertisements never update
+    it, and the record is saved across restarts. If an ESPHome proxy's record
+    holds public (0) for a timer a local adapter (BlueZ) reports as random,
+    every connection through that proxy fails with status=133 until the record
+    is flushed. Rewrite it to random before connecting. Only public -> random
+    is corrected, and only when a local adapter vouches for random, so
+    proxy-only setups are left untouched. One-way: a healed record stays
+    random, like habluetooth's own first-sighting freeze.
+
+    Module-level so every connect path can call it — BHyveBleConnection._open
+    and recovery._connect, which flashes timers that have no connection object.
+    Contributed by @FabsFabios in #60.
+    """
+    try:
+        from homeassistant.components.bluetooth import async_scanner_devices_by_address
+
+        scanner_devices = async_scanner_devices_by_address(hass, mac, True)
+        local_random = False
+        for scanner_device in scanner_devices:
+            details = scanner_device.ble_device.details
+            if isinstance(details, dict):
+                props = details.get("props")
+                if isinstance(props, dict) and props.get("AddressType") == "random":
+                    local_random = True
+                    break
+        if not local_random:
+            return
+
+        for scanner_device in scanner_devices:
+            details = scanner_device.ble_device.details
+            if not isinstance(details, dict) or details.get("address_type") != 0:
+                continue
+            try:
+                details["address_type"] = 1
+            except TypeError:  # read-only record; the others may still heal
+                continue
+            _LOGGER.warning(
+                "%s: %s held a stale public address type; corrected to random",
+                mac,
+                getattr(scanner_device.scanner, "name", "proxy"),
+            )
+    except Exception:  # noqa: BLE001 - best effort; never block a connect
+        _LOGGER.debug("%s: address-type check skipped", mac, exc_info=True)
+
+
 class BHyveBleConnection:
     """One per physical device. Reused across commands within an idle window."""
 
@@ -162,6 +211,7 @@ class BHyveBleConnection:
     async def _open(self) -> None:
         from homeassistant.components.bluetooth import async_ble_device_from_address
 
+        heal_proxy_address_type(self.hass, self.mac)
         ble_device = async_ble_device_from_address(self.hass, self.mac, connectable=True)
         if ble_device is None:
             raise BleNotConnectable(f"{self.mac}: not in range of any connectable BLE adapter")

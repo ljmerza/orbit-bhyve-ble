@@ -125,3 +125,24 @@ def test_second_start_for_same_mac_is_refused():
     rc.async_start_recovery_by_address(hass, _entry(), "11:22:33:44:55:66")
     with pytest.raises(HomeAssistantError, match="already running"):
         rc.async_start_recovery_by_address(hass, _entry(), "11:22:33:44:55:66")
+
+
+def test_connect_heals_proxy_address_type_first(monkeypatch):
+    # An address-only timer never goes through BHyveBleConnection._open, so
+    # recovery must run the #60 heal itself before resolving the device.
+    import sys
+    import types as _types
+
+    order = []
+    monkeypatch.setattr(rc, "heal_proxy_address_type", lambda hass, mac: order.append(("heal", mac)))
+    bt = _types.ModuleType("homeassistant.components.bluetooth")
+
+    def _resolve(hass, mac, connectable):
+        order.append(("resolve", mac))
+        return None
+    bt.async_ble_device_from_address = _resolve
+    monkeypatch.setitem(sys.modules, "homeassistant.components.bluetooth", bt)
+
+    with pytest.raises(HomeAssistantError, match="not in range"):
+        asyncio.run(rc._connect(None, "AA:BB:CC:DD:EE:FF"))
+    assert order == [("heal", "AA:BB:CC:DD:EE:FF"), ("resolve", "AA:BB:CC:DD:EE:FF")]
