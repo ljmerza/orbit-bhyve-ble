@@ -52,16 +52,6 @@ def _redact_urls(obj):
     return obj
 
 
-def _find_urls(obj) -> list[str]:
-    if isinstance(obj, dict):
-        return [u for v in obj.values() for u in _find_urls(v)]
-    if isinstance(obj, list):
-        return [u for v in obj for u in _find_urls(v)]
-    if isinstance(obj, str) and obj.startswith("http"):
-        return [obj]
-    return []
-
-
 def _adapter_kwargs(args) -> dict:
     # BlueZ adapter name (hci0, hci1, ...); omit to use the system default.
     return {"adapter": args.adapter} if args.adapter else {}
@@ -114,7 +104,7 @@ async def cmd_fetch(args) -> None:
         await cloud.login(args.email, password)
         meta = await cloud.get_firmware_update(args.hardware)
         print(json.dumps(_redact_urls(meta), indent=2))
-        urls = _find_urls(meta)
+        urls = fw.find_download_urls(meta)
         if len(urls) != 1:
             raise SystemExit(f"expected one download URL in the response, found {len(urls)}")
         image = await cloud.download(urls[0])
@@ -122,14 +112,11 @@ async def cmd_fetch(args) -> None:
     out = Path(args.out)
     out.write_bytes(image)
     print(f"wrote {len(image)} bytes to {out}")
-    for version in fw.KNOWN_IMAGES:
-        try:
-            fw.verify_image(image, version)
-            print(f"matches known-good fw{version:04d}")
-            return
-        except fw.FirmwareImageError:
-            continue
-    print("WARNING: image does not match any known-good image — flash will refuse it")
+    version = fw.identify_image(image)
+    if version is None:
+        print("WARNING: image does not match any known-good image — flash will refuse it")
+    else:
+        print(f"matches known-good fw{version:04d}")
 
 
 async def cmd_flash(args) -> None:

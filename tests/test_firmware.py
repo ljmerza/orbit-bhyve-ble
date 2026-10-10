@@ -106,8 +106,10 @@ def _progress_frame(status: int, version: int, size: int, offset: int) -> bytes:
 class FakeBootloader:
     """Minimal BleakClient stand-in that behaves like the HT25 bootloader."""
 
-    def __init__(self, *, status=0, version=0, size=0, offset=0, notify=True, validate=True):
+    def __init__(self, *, status=0, version=0, size=0, offset=0, notify=True, validate=True,
+                 require_response=True):
         self.status, self.version, self.size, self.offset = status, version, size, offset
+        self.require_response = require_response
         self.notify = notify
         self.validate = validate
         self.received = bytearray()
@@ -129,7 +131,8 @@ class FakeBootloader:
         return _progress_frame(self.status, self.version, self.size, self.offset)
 
     async def write_gatt_char(self, char, data, response=None):
-        assert char == WRITE_CHAR and response is True
+        assert char == WRITE_CHAR
+        assert response is True or not self.require_response
         data = bytes(data)
         assert sum(data[:-2]) & 0xFFFF == int.from_bytes(data[-2:], "little")
         flag, payload = data[0], data[2:-2]
@@ -246,3 +249,210 @@ def test_install_swallows_disconnect():
         async def write_gatt_char(self, char, data, response=None):
             raise BleakError("disconnected")
     asyncio.run(fw.BootloaderSession(Dropping()).install())
+
+
+# --- helpers -------------------------------------------------------------
+
+def test_identify_image(monkeypatch):
+    import hashlib
+    img = b"fake-image"
+    monkeypatch.setitem(fw.KNOWN_IMAGES, 7, (len(img), hashlib.sha256(img).hexdigest()))
+    assert fw.identify_image(img) == 7
+    assert fw.identify_image(b"other") is None
+
+
+def test_find_download_urls_walks_nested_metadata():
+    meta = [{"version": 85, "file": {"url": "https://x/fw?sig=1", "name": "fw"}}, "nope"]
+    assert fw.find_download_urls(meta) == ["https://x/fw?sig=1"]
+    assert fw.find_download_urls({"a": 1}) == []
+
+
+@pytest.mark.parametrize(
+    "hardware,ok",
+    [("HT25-0000", True), ("HT25A-0001", False), ("HT34A-0001", False), (None, False)],
+)
+def test_recovery_supported(hardware, ok):
+    assert fw.recovery_supported(hardware) is ok
+
+
+# --- write-response detection + unacknowledged mode ---------------------
+
+class SilentAckBootloader(FakeBootloader):
+    """Like an ESPHome proxy: a Write Request never gets its response relayed."""
+
+    async def write_gatt_char(self, char, data, response=None):
+        self.modes = getattr(self, "modes", set()) | {response}
+        if response:
+            await asyncio.sleep(3600)  # never acked
+        await FakeBootloader.write_gatt_char(self, char, data, response)
+
+
+def test_detect_write_response_true_on_direct_link(monkeypatch):
+    monkeypatch.setattr(fw, "WRITE_RESPONSE_PROBE_SEC", 0.05)
+    session = fw.BootloaderSession(FakeBootloader())
+    assert asyncio.run(session.detect_write_response()) is True
+    assert session.write_response is True
+
+
+def test_unacked_transfer_over_proxy(monkeypatch):
+    monkeypatch.setattr(fw, "WRITE_RESPONSE_PROBE_SEC", 0.05)
+    dev = SilentAckBootloader(require_response=False)
+
+    async def go():
+        session = fw.BootloaderSession(dev)
+        await session.start_notify()
+        assert await session.detect_write_response() is False
+        dev.modes = set()
+        return await session.upload(IMAGE, 85)
+
+    final = asyncio.run(go())
+    assert dev.modes == {False}
+    assert final.status == fw.STATUS_VALIDATION_PASSED
+    assert bytes(dev.received) == IMAGE
+
+
+def _dropping(dev: FakeBootloader, drop_indices: set[int]):
+    """Silently lose the given data writes, like an overrun proxy queue."""
+    original = dev._accept
+    count = {"n": 0}
+
+    def accept(payload):
+        n = count["n"]
+        count["n"] += 1
+        if n not in drop_indices:
+            original(payload)
+    dev._accept = accept
+
+
+def test_unacked_transfer_restarts_after_dropped_block():
+    dev = FakeBootloader(require_response=False)
+    _dropping(dev, {20})  # mid-transfer, between offset checks
+    session = fw.BootloaderSession(dev, write_response=False)
+
+    async def go():
+        await session.start_notify()
+        return await session.upload(IMAGE, 85)
+
+    final = asyncio.run(go())
+    assert final.status == fw.STATUS_VALIDATION_PASSED
+    assert bytes(dev.received) == IMAGE  # restart cleared the shifted data
+
+
+def test_unacked_transfer_restarts_after_drop_in_last_blocks():
+    dev = FakeBootloader(require_response=False)
+    _dropping(dev, {64})  # the final 4-byte block (index 64 of 65): no checkpoint after it
+    session = fw.BootloaderSession(dev, write_response=False)
+
+    async def go():
+        await session.start_notify()
+        return await session.upload(IMAGE, 85)
+
+    assert asyncio.run(go()).status == fw.STATUS_VALIDATION_PASSED
+    assert bytes(dev.received) == IMAGE
+
+
+def test_unacked_transfer_gives_up_after_max_restarts():
+    dev = FakeBootloader(require_response=False)
+    _dropping(dev, set(range(0, 10_000, 30)))  # drops every attempt
+    session = fw.BootloaderSession(dev, write_response=False)
+
+    async def go():
+        await session.start_notify()
+        await session.upload(IMAGE, 85)
+
+    with pytest.raises(fw.BootloaderError):
+        asyncio.run(go())
+
+
+def test_acked_transfer_does_not_restart_on_drift():
+    dev = FakeBootloader()
+    _dropping(dev, {20})
+    session = fw.BootloaderSession(dev, write_response=True)
+
+    async def go():
+        await session.start_notify()
+        await session.upload(IMAGE, 85)
+
+    with pytest.raises(fw.BootloaderError, match="expected"):
+        asyncio.run(go())
+
+
+def test_restart_rejected_by_device_says_to_pull_batteries():
+    class NoRestart(FakeBootloader):
+        async def write_gatt_char(self, char, data, response=None):
+            if data[0] == fw.FLAG_COMMAND and data[2] == fw.CMD_START and self.status:
+                return  # ignore start while a transfer is in progress
+            await super().write_gatt_char(char, data, response)
+
+    dev = NoRestart(require_response=False)
+    _dropping(dev, {20})
+    session = fw.BootloaderSession(dev, write_response=False)
+
+    async def go():
+        await session.start_notify()
+        await session.upload(IMAGE, 85)
+
+    with pytest.raises(fw.BootloaderError, match="batteries"):
+        asyncio.run(go())
+
+
+# --- bootloader detection ------------------------------------------------
+
+def _client_with_chars(*uuids):
+    from types import SimpleNamespace
+    from orbit_bhyve.const import SERVICE_UUID
+
+    service = SimpleNamespace(characteristics=[SimpleNamespace(uuid=u) for u in uuids])
+    services = SimpleNamespace(get_service=lambda uuid: service if uuid == SERVICE_UUID else None)
+    return SimpleNamespace(services=services)
+
+
+def test_is_bootloader():
+    from orbit_bhyve.const import AES_CHAR, NETWORK_CHAR
+
+    assert fw.is_bootloader(_client_with_chars(WRITE_CHAR, READ_CHAR))
+    assert not fw.is_bootloader(_client_with_chars(AES_CHAR, WRITE_CHAR, READ_CHAR, NETWORK_CHAR))
+    assert not fw.is_bootloader(object())  # no service table: never break a connect
+
+
+def test_connection_raises_bootloader_mode_without_retrying(monkeypatch):
+    import sys
+    import types as _types
+
+    from orbit_bhyve import connection as conn_mod
+
+    for name in ("homeassistant", "homeassistant.components",
+                 "homeassistant.components.bluetooth"):
+        monkeypatch.setitem(sys.modules, name, _types.ModuleType(name))
+    monkeypatch.setattr(
+        sys.modules["homeassistant.components.bluetooth"],
+        "async_ble_device_from_address",
+        lambda *a, **k: object(),
+        raising=False,
+    )
+    calls = {"connect": 0}
+
+    async def _fake_establish(*_a, **_k):
+        calls["connect"] += 1
+        client = _client_with_chars(WRITE_CHAR, READ_CHAR)
+        client.is_connected = True
+
+        async def _noop(*_a):
+            pass
+        client.disconnect = _noop
+        client.stop_notify = _noop
+        return client
+
+    async def _no_sleep(*_a, **_k):
+        pass
+
+    monkeypatch.setattr(conn_mod, "establish_connection", _fake_establish)
+    monkeypatch.setattr(conn_mod.asyncio, "sleep", _no_sleep)
+    conn = conn_mod.BHyveBleConnection(None, "AA:BB:CC:DD:EE:FF", "00" * 16)
+
+    with pytest.raises(conn_mod.BleBootloaderMode):
+        asyncio.run(conn.ensure_connected())
+    assert calls["connect"] == 1
+    assert conn.in_bootloader is True
+    # Still a BleHandshakeError, so existing handlers keep catching it.
+    assert issubclass(conn_mod.BleBootloaderMode, conn_mod.BleHandshakeError)

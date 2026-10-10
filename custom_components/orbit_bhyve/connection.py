@@ -31,6 +31,7 @@ from bleak_retry_connector import establish_connection
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from .const import AES_CHAR, READ_CHAR, WRITE_CHAR
+from .firmware import is_bootloader
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -112,6 +113,10 @@ class BHyveBleConnection:
         # initial subscribe. See hold_open()/release().
         self._held = False
         self._hold_expiry: asyncio.TimerHandle | None = None
+        # Set when the last connect found the device in its bootloader (failed
+        # firmware update); cleared by the next successful handshake. Read by the
+        # Problem sensor and the Recover firmware button.
+        self.in_bootloader = False
 
     @property
     def is_held(self) -> bool:
@@ -149,6 +154,8 @@ class BHyveBleConnection:
         # ~90-150s on a stalling device). One call = one bounded retry budget.
         try:
             await self._open()
+        except BleBootloaderMode:
+            raise
         except (BleHandshakeError, asyncio.TimeoutError) as err:
             raise BleHandshakeError(f"{self.mac}: handshake failed: {err}") from err
 
@@ -169,9 +176,19 @@ class BHyveBleConnection:
                 _LOGGER.debug("%s: connected", self.mac)
                 if self._gatt_settle_ms > 0:
                     await asyncio.sleep(self._gatt_settle_ms / 1000.0)
+                if is_bootloader(self._client):
+                    # No AES characteristic to handshake with; retrying can't help.
+                    self.in_bootloader = True
+                    await self.disconnect()
+                    raise BleBootloaderMode(
+                        f"{self.mac}: device is in its bootloader (failed firmware "
+                        "update) — use Recover firmware"
+                    )
                 # Bound the handshake: on a marginal link the connect succeeds
                 # but the GATT exchange below can hang indefinitely.
                 await asyncio.wait_for(self._handshake(), timeout=HANDSHAKE_TIMEOUT_SEC)
+            except BleBootloaderMode:
+                raise
             except (asyncio.TimeoutError, BleakError, OSError, BleHandshakeError) as err:
                 last_err = err
                 _LOGGER.debug(
@@ -213,6 +230,7 @@ class BHyveBleConnection:
         self._tx_ctr = struct.unpack("<I", buf[12:16])[0]
         self._rx_ctr = struct.unpack("<I", buf[16:20])[0]
         self._handshaken = True
+        self.in_bootloader = False
         _LOGGER.debug("%s: handshake ok, iv=%s tx_ctr=0x%08x", self.mac, self._iv.hex(), self._tx_ctr)
 
     def _on_notify(self, _sender, data) -> None:
@@ -547,3 +565,7 @@ class BleNotConnectable(Exception):
 
 class BleHandshakeError(Exception):
     """AES handshake failed (bad key, bad device, or device in weird state)."""
+
+
+class BleBootloaderMode(BleHandshakeError):
+    """Device is stuck in its bootloader: no AES characteristic to talk to."""
