@@ -28,10 +28,12 @@ from homeassistant.helpers import device_registry as dr
 from .const import (
     CONF_DEFAULT_DURATION,
     CONF_DEVICES,
+    CONF_EMAIL,
     CONF_FLOW_COUNTS_PER_GALLON,
     CONF_IDLE_DISCONNECT,
     CONF_HUB_MESH_OVERRIDES,
     CONF_MESH_STATUS_POLL,
+    CONF_PASSWORD,
     CONF_POLL_IDLE,
     CONF_POLL_WATERING,
     DEFAULT_DURATION,
@@ -55,6 +57,7 @@ from .devices.base import (
     validate_program_name,
 )
 from .devices.protobuf import BHyveProtobufDevice
+from .recovery import async_start_recovery_by_address
 from .refresh import async_refresh_entry
 
 _LOGGER = logging.getLogger(__name__)
@@ -614,4 +617,32 @@ def _register_services(hass: HomeAssistant) -> None:
             vol.Optional("slot"): vol.In(list(PROGRAM_SLOTS)),
         }),
         supports_response=SupportsResponse.ONLY,
+    )
+
+    async def recover_firmware(call: ServiceCall) -> None:
+        entries = [
+            e for e in hass.config_entries.async_entries(DOMAIN)
+            if e.state is ConfigEntryState.LOADED
+            and e.data.get(CONF_EMAIL) and e.data.get(CONF_PASSWORD)
+        ]
+        wanted = call.data.get("config_entry_id")
+        if wanted:
+            entries = [e for e in entries if e.entry_id == wanted]
+        if not entries:
+            raise ServiceValidationError(
+                "No loaded orbit_bhyve account with saved credentials to download firmware with"
+            )
+        # The firmware endpoint is per hardware model, so any account works.
+        async_start_recovery_by_address(hass, entries[0], call.data["address"])
+
+    hass.services.async_register(
+        DOMAIN,
+        "recover_firmware",
+        recover_firmware,
+        schema=vol.Schema({
+            vol.Required("address"): vol.All(
+                cv.string, vol.Match(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+            ),
+            vol.Optional("config_entry_id"): cv.string,
+        }),
     )
