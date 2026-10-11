@@ -41,6 +41,7 @@ from .devices.base import (
     accumulate_gallons,
 )
 from .devices.protobuf import BHyveProtobufDevice
+from .devices.status import app_flow_gpm, flow_gallons
 
 _WEEKDAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
@@ -300,11 +301,16 @@ class BHyveWaterUsedSensor(_RestoreLastValueSensor):
 
 
 class BHyveDeviceFlowRateSensor(_BHyveDeviceSensorBase):
-    """The device's own #59.#4 currentFlowRateGpm float (Gen2).
+    """Flow rate the way the B-hyve app computes it (Gen2): the device's own
+    #59.#4 currentFlowRateGpm when populated, otherwise the app's linear fit
+    from the #59.#1 frequency (status.app_flow_gpm).
 
-    Named in the vendor schema but never yet observed populated on fw0111 —
-    disabled by default purely to gather field confirmation. If reports show
-    it live, a later release can prefer it over the slope-derived Flow rate.
+    #59.#4 has never been observed populated on fw0111 and the Hz fit is from
+    static analysis of the app, so this stays disabled by default as a
+    comparison against the slope-derived Flow rate. The `source` attribute
+    says which input produced the value; `cycle_volume_gal` is the device's
+    #59.#5 gallons, else #59.#3 ticks over the Flow calibration. That counter
+    only advances while subscribed, so the volume undercounts a whole run.
     """
 
     _attr_device_class = SensorDeviceClass.VOLUME_FLOW_RATE
@@ -323,7 +329,26 @@ class BHyveDeviceFlowRateSensor(_BHyveDeviceSensorBase):
     @property
     def native_value(self) -> float | None:
         state = self.coordinator.data or self.coordinator.device.state
-        return state.flow_gpm_device
+        return app_flow_gpm(state.flow_gpm_device, state.flow_hz)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        state = self.coordinator.data or self.coordinator.device.state
+        if state.flow_gpm_device is not None:
+            source = "reported"
+        elif state.flow_hz is not None:
+            source = "frequency"
+        else:
+            source = None
+        return {
+            "source": source,
+            "frequency_hz": state.flow_hz,
+            "cycle_volume_gal": flow_gallons(
+                state.flow_volume_gal,
+                state.flow_total,
+                getattr(self.coordinator.device, "flow_counts_per_gallon", None),
+            ),
+        }
 
 
 class BHyveRainDelayEndsSensor(_BHyveDeviceSensorBase):

@@ -30,7 +30,13 @@ from .base import (
     BHyveBleDeviceBase,
     ProgramSpec,
 )
-from .status import MSG_HEADER, _crc16_ccitt, apply_status_plaintext, parse_sync_dump
+from .status import (
+    MSG_HEADER,
+    _crc16_ccitt,
+    app_flow_gpm,
+    apply_status_plaintext,
+    parse_sync_dump,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -143,6 +149,28 @@ def _gpm_from_samples(samples: list[tuple[float, int]], counts_per_gallon: int) 
         if dt > 0 and dcounts > 0:
             return round(dcounts / dt * 60 / counts_per_gallon, 2)
     return 0.0
+
+
+def _pick_flow_gpm(
+    samples: list[tuple[float, int]],
+    counts_per_gallon: int,
+    device_gpm: float | None,
+    hz: int | None,
+) -> float:
+    """The Flow rate gauge value for one read_flow window. Sources, first wins:
+
+    1. #59.#4 currentFlowRateGpm: the device's own number and the app's first
+       choice. Not yet seen populated on fw0111, so in practice 2 applies.
+    2. The #59.#3 counter slope: bucket-calibrated on hardware, and the only
+       source the "Flow calibration" option (counts per gallon) scales.
+    3. The app's #59.#1 Hz line, only when fewer than two counter samples
+       arrived and there is no slope to take.
+    """
+    if device_gpm is not None:
+        return device_gpm
+    if len(samples) >= 2 or hz is None:
+        return _gpm_from_samples(samples, counts_per_gallon)
+    return app_flow_gpm(None, hz) or 0.0
 
 
 def _build_rain_delay_pb(minutes: int, expiry: int | None) -> bytes:
@@ -395,7 +423,9 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
         background over ~4 s, sample the counter after each tick, and take its slope:
         gpm = Δcounts/Δt · 60 / self.flow_counts_per_gallon (the configurable
         "Flow calibration" option). No flow (or valve closed) → the counter doesn't
-        move → 0 gpm. Flow-capable models only (Gen2). Called on the watering poll
+        move → 0 gpm. A populated #59.#4 device gpm wins over the slope, and the
+        app's #59.#1 Hz line covers a window too short for a slope (see
+        _pick_flow_gpm). Flow-capable models only (Gen2). Called on the watering poll
         (live gauge) and by the Check-flow button / automation (on-demand). ALWAYS
         unsubscribes (#57{#1=0}) afterwards so it never leaves a persistent #59 stream
         that would starve the next poll's #16 read."""
@@ -416,6 +446,8 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
             # pass with no extra latency (the poll's normal case).
             for attempt in range(2):
                 self.state.flow_total = None  # ignore any stale counter from before
+                self.state.flow_gpm_device = None  # ...and stale #59.#4 / #59.#1 readings
+                self.state.flow_hz = None
                 samples: list[tuple[float, int]] = []
                 # Subscribe once
                 await self.connection.send(_build_message(_FLOW_SUBSCRIBE_PB), drain_ms=1200)
@@ -427,7 +459,10 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                     if self.state.flow_total is not None:
                         samples.append((time.monotonic(), self.state.flow_total))
                 if samples or attempt:
-                    self.state.flow_gpm = _gpm_from_samples(samples, self.flow_counts_per_gallon)
+                    self.state.flow_gpm = _pick_flow_gpm(
+                        samples, self.flow_counts_per_gallon,
+                        self.state.flow_gpm_device, self.state.flow_hz,
+                    )
                     return
                 _LOGGER.debug(
                     "%s: flow read got no decodable #59 — reconnecting to resync", self.mac

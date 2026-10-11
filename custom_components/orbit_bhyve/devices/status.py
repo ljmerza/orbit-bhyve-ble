@@ -56,9 +56,18 @@ RX_F_WATERING_ACTIVE = 1  #   #59.#1: knobunc currentFlowRateFrequency_Hz — ~0
 RX_F_FLOW_TOTAL = 3       #   #59.#3: knobunc currentCycleVolumeTicks — CUMULATIVE per-run counter (gpm
                           #     = its slope).
 RX_F_FLOW_RATE_GPM = 4    #   #59.#4: knobunc currentFlowRateGpm — float32 (wire 5). Never yet observed
-                          #     populated on fw0111, so it feeds only the disabled-by-default
-                          #     "Flow rate (device)" sensor to gather field confirmation; the primary
-                          #     gauge stays the #59.#3 slope (read_flow).
+                          #     populated on fw0111. Like the app, read_flow prefers it over the
+                          #     #59.#3 slope when present (protobuf._pick_flow_gpm); it also feeds
+                          #     the disabled-by-default "Flow rate (device)" sensor.
+RX_F_FLOW_VOLUME_GAL = 5  #   #59.#5: currentCycleVolumeGal — float32 (wire 5), app schema. Not yet
+                          #     observed populated; preferred over #3 ticks when present.
+
+# App flow math (B-hyve app `ht_hz->gpm` / `ht_ticks->gallons`, decompiled bundle
+# L981000-981012; static analysis, not hardware-verified). The app prefers the
+# device's own #59.#4 gpm and falls back to this line from the #59.#1 frequency.
+APP_GPM_PER_HZ = 0.1310135205953254
+APP_GPM_OFFSET = 0.3840268315690179
+APP_GAL_PER_TICK = 0.00228498  # ~437.6 ticks/gal; our bucket calibration measured ~433
 RX_F_WATERING_STATUS = 30  # WateringStatus notification { #1 = status enum } — the "stop ack"
 RX_F_WSTATUS_CODE = 1      #   #30.#1: 1=complete, 2=inProgress, 3=pumpDelay, 4=stationComplete,
                            #   5=stationDelay, 6=programPreDelay, 7=programPostDelay
@@ -213,6 +222,37 @@ class DeviceStatus(NamedTuple):
     next_start_flags: int | None = None    # #16.#9 nextStartProgramFlags (slot bitmask, A=bit0)
     next_start_epoch: int | None = None    # #16.#10 nextStartTimeSecEpochUTC
     faults: FaultStatus | None = None      # #16.#7 faultStatus; None = block absent
+    flow_hz: int | None = None             # #59.#1 Hz; 0 when a #59 omits it, None = no #59
+    flow_volume_gal: float | None = None   # #59.#5 device-reported cycle gallons (unconfirmed)
+
+
+def app_flow_gpm(device_gpm: float | None, hz: int | None) -> float | None:
+    """The app's flow rate: the device's #59.#4 gpm when populated, otherwise its
+    linear fit from the #59.#1 frequency (0 Hz -> 0 gpm). None when neither is
+    known (no #59 seen)."""
+    if device_gpm is not None:
+        return device_gpm
+    if hz is None:
+        return None
+    if hz <= 0:
+        return 0.0
+    return round(APP_GPM_PER_HZ * hz + APP_GPM_OFFSET, 2)
+
+
+def flow_gallons(
+    volume_gal: float | None, ticks: int | None, counts_per_gallon: float | None = None
+) -> float | None:
+    """Cycle volume: the device's #59.#5 gallons when populated, otherwise #59.#3
+    ticks converted with `counts_per_gallon` (the user's Flow calibration option,
+    so the volume and the slope gauge agree); the app's fixed 0.00228498 gal/tick
+    when no calibration is given."""
+    if volume_gal is not None:
+        return volume_gal
+    if ticks is None:
+        return None
+    if counts_per_gallon and counts_per_gallon > 0:
+        return round(ticks / counts_per_gallon, 3)
+    return round(ticks * APP_GAL_PER_TICK, 3)
 
 
 def extract_status(protobuf: bytes) -> DeviceStatus:
@@ -315,6 +355,15 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
     raw_gpm = _pb_subfield(top, RX_F_WATERING, RX_F_FLOW_RATE_GPM)
     if isinstance(raw_gpm, (bytes, bytearray)) and len(raw_gpm) == 4:
         flow_rate_gpm = round(struct.unpack("<f", bytes(raw_gpm))[0], 2)
+    # #59.#1 frequency and #59.#5 cycle gallons, for the app's flow math. Protobuf
+    # omits a zero #1, so a present #59 without it means 0 Hz.
+    flow_hz = flow_volume_gal = None
+    if isinstance(_pb_field(top, RX_F_WATERING), (bytes, bytearray)):
+        hz = _pb_subfield(top, RX_F_WATERING, RX_F_WATERING_ACTIVE)
+        flow_hz = hz if isinstance(hz, int) else 0
+        raw_gal = _pb_subfield(top, RX_F_WATERING, RX_F_FLOW_VOLUME_GAL)
+        if isinstance(raw_gal, (bytes, bytearray)) and len(raw_gal) == 4:
+            flow_volume_gal = round(struct.unpack("<f", bytes(raw_gal))[0], 3)
 
     return DeviceStatus(
         run_state=run_state,
@@ -332,6 +381,8 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
         next_start_flags=next_start_flags,
         next_start_epoch=next_start_epoch,
         faults=faults,
+        flow_hz=flow_hz,
+        flow_volume_gal=flow_volume_gal,
     )
 
 
@@ -483,6 +534,12 @@ def apply_status_plaintext(device, pt: bytes) -> None:
     # "Flow rate (device)" sensor; not yet observed populated on hardware.
     if st.flow_rate_gpm is not None:
         device.state.flow_gpm_device = st.flow_rate_gpm
+    # #59.#1 Hz / #59.#5 gallons — inputs to the app-style flow math
+    # (app_flow_gpm / flow_gallons).
+    if st.flow_hz is not None:
+        device.state.flow_hz = st.flow_hz
+    if st.flow_volume_gal is not None:
+        device.state.flow_volume_gal = st.flow_volume_gal
 
     if st.is_watering is not None:
         device.state.is_watering = st.is_watering
@@ -518,6 +575,8 @@ def apply_status_plaintext(device, pt: bytes) -> None:
             device.state.flow_total = None
             device.state.flow_gpm = 0.0  # valve closed → no flow
             device.state.flow_gpm_device = None
+            device.state.flow_hz = None
+            device.state.flow_volume_gal = None
             device.state.started_at = None
             device.state.expected_off_at = None
 
