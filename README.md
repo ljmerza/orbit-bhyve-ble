@@ -42,8 +42,10 @@ when the WAN goes down.
 3. Click **Install** on **Orbit B-Hyve BLE**
 4. Restart Home Assistant
 5. **Settings → Devices & Services → Add Integration → "Orbit B-Hyve BLE"**
-6. Enter your Orbit cloud email + password — the integration discovers all
-   devices on the account and fetches each one's BLE network key
+6. Pick **Orbit account** and enter your Orbit cloud email + password — the
+   integration discovers all devices on the account and fetches each one's BLE
+   network key. To set up without the cloud, see
+   [Setting up without the Orbit cloud](#setting-up-without-the-orbit-cloud)
 
 ## Manual install
 
@@ -186,6 +188,10 @@ registry.
   days (weekdays / even / odd / every-N-days), start time(s), per-zone
   run durations. Optionally enable it in the same call
 - `orbit_bhyve.delete_program` — clear a program slot
+- `orbit_bhyve.export_devices` — return every configured timer's record,
+  **network key included** (`SupportsResponse.ONLY`, admin only), for
+  re-importing without the cloud. Optional `config_entry_id` limits it to some
+  entries. See [Setting up without the Orbit cloud](#setting-up-without-the-orbit-cloud)
 
 > **Watering programs are for non-Smart slots.** The device stores up to six
 > program slots; this integration reads and writes their schedules over BLE.
@@ -245,6 +251,39 @@ Two things worth knowing:
   overrides** — a partial `/networks` response would otherwise drop the device
   back to the `0x0000` placeholder and your watering commands would start
   getting dropped with only a log warning to show for it.
+
+## Setting up without the Orbit cloud
+
+After setup, the integration never talks to the Orbit cloud: control, polling
+and HA restarts all use the keys and IDs stored in the config entry. The cloud
+is only needed to set the integration up, and for Refresh devices, Reconfigure
+and firmware downloads. So that a fresh install still works if the cloud is
+gone, setup also offers two no-cloud paths:
+
+- **Import an export.** While you still have a working setup, run
+  **Developer tools → Actions → `orbit_bhyve.export_devices`** and save the
+  response somewhere safe. Later, **Add Integration → Orbit B-Hyve BLE →
+  Import an export** and paste it (the YAML the UI shows, or JSON). Every timer
+  comes back with the same entities and HA devices.
+- **Enter a timer by hand.** You need its MAC, model, the 16-byte network key
+  (32 hex characters, or the base64 the cloud and the B-Hyve app store), and for
+  HT25-0000 mesh timers its mesh device ID and its hub's mesh ID. Leaving the
+  hub ID blank makes every connect write `0x0000` as the timer's hub ID, which
+  can cut it off from the B-Hyve hub and app.
+
+> ⚠️ **The export holds your network key**, which controls every timer on the
+> account. Treat it like a password. Diagnostics downloads redact it; the export
+> deliberately does not.
+
+**Reconfigure** on a no-cloud entry offers *Add or edit a timer by hand*
+(re-entering a MAC that's already there updates it), *Import more devices*, and
+*Choose which timers to keep*. **Refresh devices** has nothing to query for a
+no-cloud entry, so it refuses one targeted by `config_entry_id` and skips it
+otherwise. A MAC that's already in another B-Hyve entry is refused, so two
+entries never fight over one timer.
+
+This doesn't onboard a brand-new or factory-reset timer: the timer must
+already be on an Orbit network whose key you have.
 
 ## Recovering a timer stuck after a firmware update
 

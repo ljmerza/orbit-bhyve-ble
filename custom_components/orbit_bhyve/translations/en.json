@@ -2,11 +2,41 @@
   "config": {
     "step": {
       "user": {
+        "title": "Set up B-Hyve",
+        "description": "Sign in to the Orbit cloud to find your timers, or set up without it. Either way the timers are controlled locally over Bluetooth; the cloud is only used to fetch device IDs and network keys.",
+        "menu_options": {
+          "cloud": "Orbit account (recommended)",
+          "local_import": "Import an export (no cloud)",
+          "local_manual": "Enter a timer by hand (no cloud)"
+        }
+      },
+      "cloud": {
         "title": "B-Hyve account",
         "description": "Sign in with your Orbit B-Hyve cloud account. The integration uses cloud only at setup time to fetch device IDs and network keys, then talks to each timer over BLE — no cloud round trip after setup.",
         "data": {
           "email": "Email",
           "password": "Password"
+        }
+      },
+      "local_import": {
+        "title": "Import devices (no cloud)",
+        "description": "Paste the response of the orbit_bhyve.export_devices action (YAML or JSON), or a list of device records. Every timer in it is added. {detail}",
+        "data": {
+          "devices_import": "Export"
+        }
+      },
+      "local_manual": {
+        "title": "Add a timer (no cloud)",
+        "description": "Enter one timer; add more later with Reconfigure. The network key is the 16-byte Orbit mesh key (32 hex characters or base64). HT25-0000 mesh timers also need their mesh device ID, and should get their hub's mesh ID: if it's blank, every connect writes 0x0000 as the timer's hub ID, which can cut it off from the B-Hyve hub and app. IDs are decimal or 0x hex. {detail}",
+        "data": {
+          "name": "Name",
+          "mac": "Bluetooth MAC address",
+          "hardware": "Model (hardware version)",
+          "firmware": "Firmware version (e.g. 0085)",
+          "stations": "Number of zones",
+          "network_key": "Network key",
+          "mesh_device_id": "Mesh device ID (HT25-0000 only)",
+          "hub_mesh_device_id": "Hub mesh ID (HT25-0000 only)"
         }
       },
       "pick_devices": {
@@ -30,6 +60,43 @@
           "password": "Password"
         }
       },
+      "reconfigure": {
+        "title": "Update B-Hyve devices (no cloud)",
+        "description": "This entry was set up without an Orbit account.",
+        "menu_options": {
+          "reconfigure_manual": "Add or edit a timer by hand",
+          "reconfigure_import": "Import more devices",
+          "reconfigure_keep": "Choose which timers to keep"
+        }
+      },
+      "reconfigure_manual": {
+        "title": "Add or edit a timer",
+        "description": "A MAC address that's already in this entry replaces that timer's settings. The network key is prefilled when the entry has only one. HT25-0000 mesh timers need their mesh device ID and should get their hub's mesh ID (blank writes 0x0000 as the hub ID on every connect). IDs are decimal or 0x hex. {detail}",
+        "data": {
+          "name": "Name",
+          "mac": "Bluetooth MAC address",
+          "hardware": "Model (hardware version)",
+          "firmware": "Firmware version (e.g. 0085)",
+          "stations": "Number of zones",
+          "network_key": "Network key",
+          "mesh_device_id": "Mesh device ID (HT25-0000 only)",
+          "hub_mesh_device_id": "Hub mesh ID (HT25-0000 only)"
+        }
+      },
+      "reconfigure_import": {
+        "title": "Import more devices",
+        "description": "Paste an export_devices response or a list of device records. Timers already in this entry are updated in place. {detail}",
+        "data": {
+          "devices_import": "Export"
+        }
+      },
+      "reconfigure_keep": {
+        "title": "Timers to keep",
+        "description": "Uncheck a timer to remove it and its entities.",
+        "data": {
+          "include": "Timers to keep"
+        }
+      },
       "reconfigure_devices": {
         "title": "Update B-Hyve devices",
         "description": "Re-queried the Orbit cloud: {count} device(s), {new} new, {missing} no longer on the account. New devices are pre-checked; devices you excluded before stay unchecked. Devices marked \"no longer on the Orbit account\" keep working over BLE while they stay checked — uncheck one to remove it and its entities. If this is the first time you have reconfigured this entry, devices you excluded during the original setup may reappear checked: the entry never recorded them. Uncheck them once and the choice sticks.",
@@ -43,10 +110,18 @@
       "cannot_connect": "Cannot reach the Orbit cloud API. Check your network connection.",
       "no_devices": "Login succeeded but no devices were found on this account.",
       "unknown": "Unexpected error.",
-      "no_devices_selected": "Select at least one device — an empty selection would disable the integration."
+      "no_devices_selected": "Select at least one device — an empty selection would disable the integration.",
+      "invalid_import": "Couldn't read the export: expected YAML or JSON holding device records. {detail}",
+      "invalid_mac": "Invalid Bluetooth MAC address ({detail}).",
+      "invalid_key": "Invalid network key ({detail}): expected 32 hex characters or base64 for 16 bytes.",
+      "invalid_mesh_id": "Invalid mesh ID ({detail}): expected a number from 0 to 65535, decimal or 0x hex.",
+      "mesh_id_required": "HT25-0000 mesh timers need a mesh device ID ({detail}).",
+      "unsupported_model": "Unsupported model ({detail}).",
+      "duplicate_mac": "The same MAC address appears twice ({detail}).",
+      "mac_already_configured": "{detail} is already set up in another B-Hyve entry."
     },
     "abort": {
-      "already_configured": "An account is already configured.",
+      "already_configured": "This Orbit account or network is already configured.",
       "reauth_successful": "Re-authentication successful.",
       "reconfigure_successful": "Device list updated.",
       "cannot_connect": "Cannot reach the Orbit cloud API. Nothing was changed — try again later.",
@@ -90,6 +165,13 @@
       "description": "Re-query the Orbit cloud and merge the result into the config entry: adds newly-discovered devices, keeps devices you excluded excluded, and never overwrites a working network key or mesh ID with a blank one.",
       "fields": {
         "config_entry_id": {"name": "Account", "description": "Which B-Hyve account to refresh. Omit to refresh every configured account."}
+      }
+    },
+    "export_devices": {
+      "name": "Export devices",
+      "description": "Return every configured timer's record, network key included, so the integration can be set up again without the Orbit cloud (Add integration → Import). The network key controls every timer on the account; keep the export somewhere safe. Admin only.",
+      "fields": {
+        "config_entry_id": {"name": "Account", "description": "Which entries to export. Omit to export all of them."}
       }
     },
     "recover_firmware": {

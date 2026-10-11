@@ -252,3 +252,19 @@ recover_firmware:
       selector:
         config_entry:
           integration: orbit_bhyve
+
+export_devices:
+  name: Export devices
+  description: >-
+    Return every configured timer's record, network key included, so the
+    integration can be set up again without the Orbit cloud (Add integration →
+    Import). The network key controls every timer on the account; keep the
+    export somewhere safe. Admin only.
+  fields:
+    config_entry_id:
+      name: Account
+      description: Which entries to export. Omit to export all of them.
+      required: false
+      selector:
+        config_entry:
+          integration: orbit_bhyve

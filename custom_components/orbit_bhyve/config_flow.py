@@ -1,13 +1,16 @@
 """Config flow for the Orbit B-Hyve BLE integration.
 
-Two-step setup:
-  1. Email + password → cloud login + device discovery.
-  2. Device picker — uncheck any to exclude.
+Setup starts with a menu:
+  - Orbit account: email + password → cloud login + device discovery, then a
+    device picker — uncheck any to exclude.
+  - No cloud: paste an `export_devices` response, or enter one timer by hand.
+    The entry is marked CONF_LOCAL and never talks to the cloud.
 
 Reconfigure flow (⋮ → Reconfigure) re-runs discovery against the same account
 and re-shows the picker, so a device bought after setup can be added without
 deleting the entry — entry.data[CONF_DEVICES] is otherwise a frozen snapshot
-that async_setup_entry never refreshes.
+that async_setup_entry never refreshes. On a no-cloud entry it instead offers
+adding/editing a timer by hand, importing more, or picking which to keep.
 
 Reauth flow re-prompts only the password.
 Options flow exposes polling intervals + idle disconnect.
@@ -27,6 +30,9 @@ from homeassistant.helpers.selector import (
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
+    TextSelector,
+    TextSelectorConfig,
+    TextSelectorType,
 )
 
 from .cloud import CloudAuthError, CloudConnectionError, CloudKeyNotFound, OrbitCloudClient
@@ -39,7 +45,9 @@ from .const import (
     CONF_MESH_STATUS_POLL,
     CONF_IDLE_DISCONNECT,
     CONF_INCLUDE,
+    CONF_IMPORT,
     CONF_KNOWN_CLOUD_IDS,
+    CONF_LOCAL,
     CONF_PASSWORD,
     CONF_POLL_IDLE,
     CONF_POLL_WATERING,
@@ -51,6 +59,14 @@ from .const import (
     DEFAULT_POLL_IDLE,
     DEFAULT_POLL_WATERING,
     DOMAIN,
+)
+from .local_setup import (
+    KNOWN_HARDWARE,
+    LocalRecordError,
+    local_unique_id,
+    merge_local,
+    normalize_record,
+    records_from_import,
 )
 from .merge import default_selection, merge_device_lists, next_known_ids
 
@@ -92,6 +108,12 @@ class BHyveConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return None if self._discovered else "no_devices"
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """First screen: the Orbit account, or one of the two no-cloud paths."""
+        return self.async_show_menu(
+            step_id="user", menu_options=["cloud", "local_import", "local_manual"]
+        )
+
+    async def async_step_cloud(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -110,7 +132,101 @@ class BHyveConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             vol.Required(CONF_EMAIL, default=self._email or ""): str,
             vol.Required(CONF_PASSWORD): str,
         })
-        return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
+        return self.async_show_form(step_id="cloud", data_schema=schema, errors=errors)
+
+    # --- no-cloud setup ------------------------------------------------------
+
+    async def async_step_local_import(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        errors: dict[str, str] = {}
+        detail = ""
+        if user_input is not None:
+            try:
+                records = records_from_import(user_input[CONF_IMPORT])
+                self._check_not_configured(records)
+            except LocalRecordError as err:
+                errors["base"], detail = err.key, err.detail
+            else:
+                return await self._async_create_local_entry(records)
+        return self._local_import_form("local_import", errors, detail)
+
+    async def async_step_local_manual(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        errors: dict[str, str] = {}
+        detail = ""
+        if user_input is not None:
+            try:
+                records = [normalize_record(dict(user_input))]
+                self._check_not_configured(records)
+            except LocalRecordError as err:
+                errors["base"], detail = err.key, err.detail
+            else:
+                return await self._async_create_local_entry(records)
+        return self._local_manual_form("local_manual", errors, detail, user_input)
+
+    async def _async_create_local_entry(self, records: list[dict[str, Any]]) -> ConfigFlowResult:
+        await self.async_set_unique_id(local_unique_id(records))
+        self._abort_if_unique_id_configured()
+        return self.async_create_entry(
+            title="B-Hyve (no cloud)",
+            data={CONF_LOCAL: True, CONF_DEVICES: records},
+            options=_default_options(),
+        )
+
+    def _check_not_configured(
+        self, records: list[dict[str, Any]], own_entry_id: str | None = None
+    ) -> None:
+        """Refuse a MAC another entry already controls — two entries driving the
+        same timer would fight over its single BLE connection."""
+        taken = {
+            r.get("mac")
+            for e in self.hass.config_entries.async_entries(DOMAIN)
+            if e.entry_id != own_entry_id
+            for r in e.data.get(CONF_DEVICES, [])
+        }
+        for r in records:
+            if r["mac"] in taken:
+                raise LocalRecordError("mac_already_configured", r["mac"])
+
+    def _local_import_form(self, step_id: str, errors: dict[str, str], detail: str) -> ConfigFlowResult:
+        schema = vol.Schema({
+            vol.Required(CONF_IMPORT): TextSelector(TextSelectorConfig(multiline=True)),
+        })
+        return self.async_show_form(
+            step_id=step_id, data_schema=schema, errors=errors,
+            description_placeholders={"detail": detail},
+        )
+
+    def _local_manual_form(
+        self,
+        step_id: str,
+        errors: dict[str, str],
+        detail: str,
+        user_input: dict[str, Any] | None,
+        default_key: str = "",
+    ) -> ConfigFlowResult:
+        u = user_input or {}
+        schema = vol.Schema({
+            vol.Required("name", default=u.get("name", "")): str,
+            vol.Required("mac", default=u.get("mac", "")): str,
+            vol.Required("hardware", default=u.get("hardware", KNOWN_HARDWARE[0])): SelectSelector(
+                SelectSelectorConfig(
+                    options=KNOWN_HARDWARE,
+                    custom_value=True,
+                    mode=SelectSelectorMode.DROPDOWN,
+                )
+            ),
+            vol.Optional("firmware", default=u.get("firmware", "")): str,
+            vol.Required("stations", default=u.get("stations", 1)):
+                vol.All(vol.Coerce(int), vol.Range(min=1, max=16)),
+            vol.Required("network_key", default=u.get("network_key", default_key)): TextSelector(
+                TextSelectorConfig(type=TextSelectorType.PASSWORD)
+            ),
+            vol.Optional("mesh_device_id", default=u.get("mesh_device_id", "")): str,
+            vol.Optional("hub_mesh_device_id", default=u.get("hub_mesh_device_id", "")): str,
+        })
+        return self.async_show_form(
+            step_id=step_id, data_schema=schema, errors=errors,
+            description_placeholders={"detail": detail},
+        )
 
     def _picker_form(
         self, step_id: str, errors: dict[str, str] | None = None
@@ -192,6 +308,11 @@ class BHyveConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         user to a password prompt.
         """
         entry = self._get_reconfigure_entry()
+        if entry.data.get(CONF_LOCAL):
+            return self.async_show_menu(
+                step_id="reconfigure",
+                menu_options=["reconfigure_manual", "reconfigure_import", "reconfigure_keep"],
+            )
         self._email = entry.data.get(CONF_EMAIL)
         self._password = entry.data.get(CONF_PASSWORD)
         self._stored = list(entry.data.get(CONF_DEVICES, []))
@@ -269,6 +390,84 @@ class BHyveConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self._picker_form("reconfigure_devices")
 
+    # --- no-cloud reconfigure -------------------------------------------------
+
+    async def async_step_reconfigure_manual(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        entry = self._get_reconfigure_entry()
+        stored = list(entry.data.get(CONF_DEVICES, []))
+        errors: dict[str, str] = {}
+        detail = ""
+        if user_input is not None:
+            try:
+                records = [normalize_record(dict(user_input))]
+                self._check_not_configured(records, entry.entry_id)
+            except LocalRecordError as err:
+                errors["base"], detail = err.key, err.detail
+            else:
+                return await self._async_update_local_entry(entry, merge_local(stored, records))
+        # Prefill the key when the entry has exactly one — the usual case, since
+        # a key is per Orbit mesh, and it saves pasting it again.
+        keys = {r.get("network_key") for r in stored}
+        default_key = next(iter(keys)) if len(keys) == 1 else ""
+        return self._local_manual_form(
+            "reconfigure_manual", errors, detail, user_input, default_key
+        )
+
+    async def async_step_reconfigure_import(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        entry = self._get_reconfigure_entry()
+        errors: dict[str, str] = {}
+        detail = ""
+        if user_input is not None:
+            try:
+                records = records_from_import(user_input[CONF_IMPORT])
+                self._check_not_configured(records, entry.entry_id)
+            except LocalRecordError as err:
+                errors["base"], detail = err.key, err.detail
+            else:
+                stored = list(entry.data.get(CONF_DEVICES, []))
+                return await self._async_update_local_entry(entry, merge_local(stored, records))
+        return self._local_import_form("reconfigure_import", errors, detail)
+
+    async def async_step_reconfigure_keep(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        entry = self._get_reconfigure_entry()
+        stored = list(entry.data.get(CONF_DEVICES, []))
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            included = set(user_input[CONF_INCLUDE] or [])
+            if included:
+                return await self._async_update_local_entry(
+                    entry, [r for r in stored if r["cloud_id"] in included]
+                )
+            errors["base"] = "no_devices_selected"
+
+        schema = vol.Schema({
+            vol.Required(CONF_INCLUDE, default=[r["cloud_id"] for r in stored]): SelectSelector(
+                SelectSelectorConfig(
+                    options=[
+                        SelectOptionDict(
+                            value=r["cloud_id"],
+                            label=f"{r['name']} ({r['hardware']}, {r['mac']})",
+                        )
+                        for r in stored
+                    ],
+                    multiple=True,
+                    mode=SelectSelectorMode.LIST,
+                )
+            ),
+        })
+        return self.async_show_form(
+            step_id="reconfigure_keep", data_schema=schema, errors=errors
+        )
+
+    async def _async_update_local_entry(
+        self, entry: ConfigEntry, devices: list[dict[str, Any]]
+    ) -> ConfigFlowResult:
+        self.hass.config_entries.async_update_entry(
+            entry, data={**entry.data, CONF_DEVICES: devices}
+        )
+        await self.hass.config_entries.async_reload(entry.entry_id)
+        return self.async_abort(reason="reconfigure_successful")
+
     def _get_reconfigure_entry(self) -> ConfigEntry:
         # Deliberately shadows HA >= 2024.11's ConfigFlow._get_reconfigure_entry
         # so this flow still works on the 2024.6 floor declared in hacs.json —
@@ -311,6 +510,19 @@ class BHyveConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     @callback
     def async_get_options_flow(entry: ConfigEntry) -> "BHyveOptionsFlow":
         return BHyveOptionsFlow(entry)
+
+
+def _default_options() -> dict[str, Any]:
+    """Options a no-cloud entry starts with — the same defaults the cloud
+    setup writes in async_step_pick_devices."""
+    return {
+        CONF_DEFAULT_DURATION: DEFAULT_DURATION,
+        CONF_IDLE_DISCONNECT: DEFAULT_IDLE_DISCONNECT,
+        CONF_POLL_IDLE: DEFAULT_POLL_IDLE,
+        CONF_POLL_WATERING: DEFAULT_POLL_WATERING,
+        CONF_FLOW_COUNTS_PER_GALLON: DEFAULT_FLOW_COUNTS_PER_GALLON,
+        CONF_MESH_STATUS_POLL: DEFAULT_MESH_STATUS_POLL,
+    }
 
 
 class BHyveOptionsFlow(config_entries.OptionsFlow):
