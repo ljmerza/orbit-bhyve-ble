@@ -153,7 +153,7 @@ class BHyveHT25Device(BHyveBleDeviceBase):
 
     # Decoded from the mesh replies in _observe_mesh_settings. None until the
     # device has sent one. manual_preset_sec is the physical button's run time.
-    device_info: MeshDeviceInfo | None = None
+    mesh_device_info: MeshDeviceInfo | None = None
     last_run: MeshLastRun | None = None
     manual_preset_sec: int | None = None
     # (device UTC secs, host UTC secs) from the last utc-time ack — the clock the
@@ -652,8 +652,8 @@ class BHyveHT25Device(BHyveBleDeviceBase):
             # device-info: the init's "subsystem" read, also pushed unprompted
             # (fw0041 sends `a0 01 40 0029 0001 ...` after magic1).
             info = parse_device_info(body)
-            if info is not None and info != self.device_info:
-                self.device_info = info
+            if info is not None and info != self.mesh_device_info:
+                self.mesh_device_info = info
                 changed = True
         elif msg == SEQ_INFO:
             # device-health: the init's "info" read. Battery is parsed in base.

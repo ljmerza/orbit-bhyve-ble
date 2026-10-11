@@ -613,24 +613,24 @@ class BHyveMeshFirmwareSensor(_RestoreLastValueSensor):
     Hardware version, device type and station count ride along."""
 
     _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_translation_key = "mesh_firmware"
+    _attr_translation_key = "firmware_version"
     _attr_icon = "mdi:chip"
 
     def __init__(self, coordinator: BHyveDeviceCoordinator):
         super().__init__(coordinator)
-        self._attr_unique_id = f"{coordinator.device.unique_id}_firmware"
-        self._attr_name = "Firmware"
+        self._attr_unique_id = f"{coordinator.device.unique_id}_firmware_version"
+        self._attr_name = "Firmware version"
 
     @property
     def native_value(self) -> str | None:
-        info = self.coordinator.device.device_info
+        info = self.coordinator.device.mesh_device_info
         if info is None:
             return self._restored_value
         return f"{info.firmware_version:04d}"
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
-        info = self.coordinator.device.device_info
+        info = self.coordinator.device.mesh_device_info
         if info is None:
             return None
         return {

@@ -128,7 +128,7 @@ def test_firmware_sensor_formats_like_the_cloud_record():
     dev = _mesh()
     fw = sensor.BHyveMeshFirmwareSensor(SimpleNamespace(device=dev, data=None))
     assert fw.native_value is None
-    dev.device_info = MeshDeviceInfo(device_type=0, hardware_version=0, firmware_version=41, stations=1)
+    dev.mesh_device_info = MeshDeviceInfo(device_type=0, hardware_version=0, firmware_version=41, stations=1)
     assert fw.native_value == "0041"
     assert fw.extra_state_attributes == {
         "hardware_version": 0, "device_type": "hose_tap", "stations": 1,

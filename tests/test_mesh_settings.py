@@ -124,24 +124,24 @@ def test_device_info_capture_decodes():
 def test_device_info_reply_and_push_are_observed():
     dev = _dev()
     dev._observe_plaintext(DECK_DEVICE_INFO)
-    assert dev.device_info.firmware_version == 85
+    assert dev.mesh_device_info.firmware_version == 85
     # fw0041 also pushes device-info unprompted as a write (byte 2 = 0xa0).
     hill = _dev(HILL)
     hill._observe_plaintext(HILL_DEVICE_INFO_PUSH)
-    assert hill.device_info.firmware_version == 41
+    assert hill.mesh_device_info.firmware_version == 41
 
 
 def test_our_own_read_echo_is_not_device_data():
     # The init's subsystem read (command 0) carries zeros; never decode it.
     dev = _dev()
     dev._observe_plaintext(bytes.fromhex("d74704014000000000"))
-    assert dev.device_info is None
+    assert dev.mesh_device_info is None
 
 
 def test_foreign_mesh_address_is_ignored():
     dev = _dev()
     dev._observe_plaintext(HILL_DEVICE_INFO_PUSH)
-    assert dev.device_info is None
+    assert dev.mesh_device_info is None
 
 
 def test_health_capture_has_no_faults_and_keeps_battery():
