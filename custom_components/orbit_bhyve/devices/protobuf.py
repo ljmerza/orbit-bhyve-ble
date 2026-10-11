@@ -28,6 +28,7 @@ from bleak.exc import BleakError
 from .base import (
     SLOT_LETTERS,
     BHyveBleDeviceBase,
+    DeviceInfoReport,
     ProgramSpec,
 )
 from .status import (
@@ -35,7 +36,9 @@ from .status import (
     _crc16_ccitt,
     app_flow_gpm,
     apply_status_plaintext,
+    extract_device_info,
     parse_sync_dump,
+    split_inner_messages,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -130,6 +133,14 @@ _FLOW_SUBSCRIBE_PB = bytes.fromhex("ca030508e807100a")
 # (hardware, 2026-07-03). Interval 0 cancels the stream. read_flow always sends
 # this after sampling so we never leave a persistent subscription behind.
 _FLOW_UNSUBSCRIBE_PB = bytes.fromhex("ca030408001002")
+
+# #22 getDeviceInfo {} — the device answers #23 DeviceInfo (fw/hw/bootloader/BLE
+# versions, station count). The app sends it from device settings and its
+# bootloader check. NOT hardware-verified. Read on an idle poll: once soon after
+# startup, then daily; a silent request retries after the shorter interval.
+_GET_DEVICE_INFO_PB = bytes.fromhex("b20100")
+_DEVICE_INFO_REFRESH_SEC = 24 * 3600
+_DEVICE_INFO_RETRY_SEC = 6 * 3600
 
 # #21 skipCurrentStation {} — skip the zone that is watering now (the app's
 # watering-screen skip). The schema has #1 stationId, but the app's serializer
@@ -330,6 +341,9 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
     _host_stop_task: asyncio.Task | None = None
     _host_stop_token: int = 0
     _duration_warned: bool = False
+    # time.monotonic() at which the next idle poll should read #22 device info
+    # (0 = on the first idle poll).
+    _device_info_due: float = 0.0
     # Why the last stop_watering() returned False ("STOP restarted the run",
     # "device still watering after stop"); the valve entity surfaces it.
     last_stop_error: str | None = None
@@ -546,6 +560,8 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                                 _LOGGER.debug(
                                     "%s: program refresh skipped: %s", self.mac, err
                                 )
+                            # Versions (#22 -> #23): first idle poll, then daily.
+                            await self._maybe_read_device_info()
                     else:
                         # Reached the device but it returned NO status (a wedge
                         # recovery couldn't clear this cycle). Do NOT stamp a
@@ -568,6 +584,38 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 finally:
                     await self.connection.disconnect()
             return self.state
+
+    async def _read_device_info(self) -> DeviceInfoReport | None:
+        """#22 getDeviceInfo -> #23 DeviceInfo, reassembled across the reply
+        burst (the version strings can outrun one frame). Stores it on
+        state.device_info. Caller holds _api_lock."""
+        stream = await self.connection.send_stream(
+            _build_message(_GET_DEVICE_INFO_PB), drain_ms=2000
+        )
+        for msg in split_inner_messages(stream):
+            info = extract_device_info(msg)
+            if info is not None:
+                self.state.device_info = info
+                self.state.device_info_at = datetime.now(timezone.utc)
+                return info
+        return None
+
+    async def _maybe_read_device_info(self) -> None:
+        """Idle-poll hook: read device info when due (first idle poll, then
+        daily). Best-effort; a silent or failed read retries after
+        _DEVICE_INFO_RETRY_SEC so a unit that never answers costs a few requests
+        a day, not one per poll."""
+        now = time.monotonic()
+        if now < self._device_info_due:
+            return
+        try:
+            info = await self._read_device_info()
+        except Exception as err:  # noqa: BLE001
+            info = None
+            _LOGGER.debug("%s: device info read skipped: %s", self.mac, err)
+        self._device_info_due = now + (
+            _DEVICE_INFO_REFRESH_SEC if info is not None else _DEVICE_INFO_RETRY_SEC
+        )
 
     # --- host-side duration enforcement ------------------------------------
 

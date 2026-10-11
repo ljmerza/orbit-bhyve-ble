@@ -155,3 +155,30 @@ def test_skip_zone_button_available_only_while_watering():
     assert button.available is False
     device.state.is_watering = True
     assert button.available is True
+
+
+# --- Firmware version (#23 DeviceInfo) -----------------------------------------
+
+def test_firmware_version_sensor():
+    from datetime import datetime, timezone
+
+    from orbit_bhyve.devices.base import DeviceInfoReport
+    from orbit_bhyve.sensor import BHyveFirmwareVersionSensor
+
+    device = _device()
+    sensor = BHyveFirmwareVersionSensor(_coord(device))
+    assert sensor.native_value is None and sensor.extra_state_attributes == {}
+    device.state.device_info = DeviceInfoReport(
+        fw_version="0111", hw_version="HT25G2-0001", num_stations=1,
+        bootloader_version=5, ble_bootloader_version=3, ble_app_version=7,
+    )
+    device.state.device_info_at = datetime(2026, 10, 11, tzinfo=timezone.utc)
+    assert sensor.native_value == "0111"
+    assert sensor.extra_state_attributes == {
+        "hardware_version": "HT25G2-0001",
+        "bootloader_version": 5,
+        "ble_app_version": 7,
+        "ble_bootloader_version": 3,
+        "stations": 1,
+        "read_at": "2026-10-11T00:00:00+00:00",
+    }

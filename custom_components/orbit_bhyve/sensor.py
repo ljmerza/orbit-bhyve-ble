@@ -92,6 +92,8 @@ async def async_setup_entry(
             entities.append(BHyveNextRunSensor(coord))
             for letter in UI_SLOTS:
                 entities.append(BHyveProgramSummarySensor(coord, letter))
+            # Device-reported versions (#23 DeviceInfo, read about daily).
+            entities.append(BHyveFirmwareVersionSensor(coord))
         # Flow-rate gauge only for models with a flow sensor (Gen2, not the XD).
         if getattr(device, "has_flow", False):
             entities.append(BHyveFlowRateSensor(coord))
@@ -622,4 +624,41 @@ class BHyveProgramSummarySensor(_BHyveDeviceSensorBase):
                 {"zone": sid + 1, "minutes": round(sec / 60, 2)} for sid, sec in summary.zones
             ],
             "budget": summary.budget,
+        }
+
+
+class BHyveFirmwareVersionSensor(_BHyveDeviceSensorBase):
+    """Firmware version the device itself reports (#23 DeviceInfo.fwVersion),
+    with the hardware, bootloader and BLE versions and station count as
+    attributes. Read on an idle poll soon after startup, then about daily;
+    `unknown` until the first reply. Not hardware-verified (app schema)."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:chip"
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        device = coordinator.device
+        self._attr_unique_id = f"{device.unique_id}_firmware_version"
+        self._attr_name = "Firmware version"
+
+    @property
+    def native_value(self) -> str | None:
+        state = self.coordinator.data or self.coordinator.device.state
+        info = state.device_info
+        return info.fw_version if info is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        state = self.coordinator.data or self.coordinator.device.state
+        info = state.device_info
+        if info is None:
+            return {}
+        return {
+            "hardware_version": info.hw_version,
+            "bootloader_version": info.bootloader_version,
+            "ble_app_version": info.ble_app_version,
+            "ble_bootloader_version": info.ble_bootloader_version,
+            "stations": info.num_stations,
+            "read_at": state.device_info_at.isoformat() if state.device_info_at else None,
         }

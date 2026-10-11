@@ -17,7 +17,7 @@ import struct
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 
-from .base import FaultStatus, ProgramSummary
+from .base import DeviceInfoReport, FaultStatus, ProgramSummary
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -108,6 +108,15 @@ _PRG_BUDGET = 10         # #19.#10 seasonal budget %
 _PRG_NAME = 17           # #19.#17 name (UTF-8)
 RX_F_ACTIVE_PROGRAMS = 20  # #20 setActivePrograms { #1 activeProgramFlags bitmask }
 _AP_FLAGS = 1              # #20.#1 activeProgramFlags
+
+# --- #23 DeviceInfo (reply to #22 getDeviceInfo; app schema, not HW-verified) ---
+RX_F_DEVICE_INFO = 23
+_DI_NUM_STATIONS = 1       # #23.#1 numStations (int32)
+_DI_HW_VERSION = 2         # #23.#2 hwVersion (string)
+_DI_FW_VERSION = 3         # #23.#3 fwVersion (string)
+_DI_BOOTLOADER = 11        # #23.#11 bootloaderVersion
+_DI_BLE_BOOTLOADER = 14    # #23.#14 bleBootloaderVersion
+_DI_BLE_APP = 15           # #23.#15 bleAppVersion
 
 
 def _crc16_ccitt(data: bytes, init: int = 0) -> int:
@@ -383,6 +392,33 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
         faults=faults,
         flow_hz=flow_hz,
         flow_volume_gal=flow_volume_gal,
+    )
+
+
+def extract_device_info(protobuf: bytes) -> DeviceInfoReport | None:
+    """Decode a #23 DeviceInfo message, or None if `protobuf` doesn't carry one."""
+    blob = _pb_field(pb_parse(protobuf), RX_F_DEVICE_INFO)
+    if not isinstance(blob, (bytes, bytearray)):
+        return None
+    f = pb_parse(blob)
+    if f is None:
+        return None
+
+    def _str(num):
+        v = _pb_field(f, num)
+        return v.decode(errors="replace") if isinstance(v, (bytes, bytearray)) else None
+
+    def _int(num):
+        v = _pb_field(f, num)
+        return v if isinstance(v, int) else None
+
+    return DeviceInfoReport(
+        fw_version=_str(_DI_FW_VERSION),
+        hw_version=_str(_DI_HW_VERSION),
+        num_stations=_int(_DI_NUM_STATIONS),
+        bootloader_version=_int(_DI_BOOTLOADER),
+        ble_bootloader_version=_int(_DI_BLE_BOOTLOADER),
+        ble_app_version=_int(_DI_BLE_APP),
     )
 
 

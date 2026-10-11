@@ -312,3 +312,82 @@ def test_skip_ignored_when_not_watering():
     dev.connection = _FakeConn(dev, pb._build_message(_status_msg(1)))
     assert asyncio.run(dev.skip_current_station()) is False
     assert dev.connection.sent == []
+
+
+# --- device info (#22 getDeviceInfo -> #23 DeviceInfo) -------------------------
+
+def _device_info_msg() -> bytes:
+    body = pb._pb_field_varint(1, 1)                       # numStations
+    body += pb._pb_field_bytes(2, b"HT25G2-0001")          # hwVersion
+    body += pb._pb_field_bytes(3, b"0111")                 # fwVersion
+    body += pb._pb_field_varint(11, 5)                     # bootloaderVersion
+    body += pb._pb_field_varint(14, 3)                     # bleBootloaderVersion
+    body += pb._pb_field_varint(15, 7)                     # bleAppVersion
+    return pb._pb_field_bytes(23, body)
+
+
+def test_get_device_info_byte_ref():
+    assert pb._GET_DEVICE_INFO_PB.hex() == "b20100"   # #22 {}
+    assert rx._pb_field(rx.pb_parse(pb._GET_DEVICE_INFO_PB), 22) == b""
+
+
+def test_extract_device_info_decodes_versions():
+    info = rx.extract_device_info(_device_info_msg())
+    assert info.fw_version == "0111"
+    assert info.hw_version == "HT25G2-0001"
+    assert info.num_stations == 1
+    assert (info.bootloader_version, info.ble_bootloader_version, info.ble_app_version) == (5, 3, 7)
+    # Omitted fields stay None; a non-#23 message isn't device info.
+    sparse = rx.extract_device_info(pb._pb_field_bytes(23, pb._pb_field_bytes(3, b"0098")))
+    assert sparse.fw_version == "0098" and sparse.hw_version is None
+    assert rx.extract_device_info(_status_msg(1)) is None
+
+
+class _InfoConn(_FakeConn):
+    """Answers status elicitors with an idle #16, and a #22 (via send_stream)
+    with `info_stream`. Counts the #22 requests."""
+
+    def __init__(self, device, info_stream: bytes):
+        super().__init__(device, pb._build_message(_status_msg(1)))
+        self.info_stream = info_stream
+        self.info_requests = 0
+
+    async def send_stream(self, frame: bytes, drain_ms: int = 4000):
+        self.sent.append(frame)
+        if frame == pb._build_message(pb._GET_DEVICE_INFO_PB):
+            self.info_requests += 1
+            return self.info_stream
+        return b""
+
+
+def test_idle_poll_reads_device_info_then_waits_a_day():
+    dev = _make_gen2(is_watering=False)
+    dev.has_flow = False
+    dev.connection = _InfoConn(dev, pb._build_message(_device_info_msg()))
+    asyncio.run(dev.refresh_state())
+    assert dev.connection.info_requests == 1
+    assert dev.state.device_info.fw_version == "0111"
+    assert dev.state.device_info_at is not None
+    asyncio.run(dev.refresh_state())          # next poll: not due yet
+    assert dev.connection.info_requests == 1
+    assert dev._device_info_due - pb.time.monotonic() > pb._DEVICE_INFO_RETRY_SEC
+
+
+def test_silent_device_info_retries_sooner():
+    dev = _make_gen2(is_watering=False)
+    dev.has_flow = False
+    dev.connection = _InfoConn(dev, b"")      # device never answers #22
+    asyncio.run(dev.refresh_state())
+    asyncio.run(dev.refresh_state())
+    assert dev.connection.info_requests == 1  # not every poll
+    assert dev.state.device_info is None
+    assert dev._device_info_due - pb.time.monotonic() <= pb._DEVICE_INFO_RETRY_SEC
+
+
+def test_device_info_not_read_while_watering():
+    dev = _make_gen2(is_watering=False)
+    dev.has_flow = False
+    dev.connection = _InfoConn(dev, pb._build_message(_device_info_msg()))
+    dev.connection.reply = _running_status(0, 300)
+    asyncio.run(dev.refresh_state())
+    assert dev.connection.info_requests == 0

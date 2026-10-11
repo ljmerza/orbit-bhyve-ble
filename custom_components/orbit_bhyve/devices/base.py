@@ -220,6 +220,20 @@ class FaultStatus:
         return tuple(reasons)
 
 
+@dataclass(frozen=True)
+class DeviceInfoReport:
+    """Decoded #23 DeviceInfo, the reply to a #22 getDeviceInfo (app schema
+    OrbitPbApi_DeviceInfo). Protobuf omits empty and zero fields, so any of these
+    can be None."""
+
+    fw_version: str | None = None              # #3 fwVersion
+    hw_version: str | None = None              # #2 hwVersion
+    num_stations: int | None = None            # #1 numStations
+    bootloader_version: int | None = None      # #11 bootloaderVersion
+    ble_bootloader_version: int | None = None  # #14 bleBootloaderVersion
+    ble_app_version: int | None = None         # #15 bleAppVersion
+
+
 @dataclass
 class DeviceState:
     is_watering: bool = False
@@ -256,6 +270,9 @@ class DeviceState:
     # the requested duration (HT25A fw0098): HA sends the stop at the requested
     # time instead of relying on the device's own timer.
     duration_enforced_by_host: bool = False
+    # Last #23 DeviceInfo (protobuf family), read on an idle poll about daily.
+    device_info: DeviceInfoReport | None = None
+    device_info_at: datetime | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
