@@ -21,7 +21,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import CONF_DEFAULT_DURATION, DEFAULT_DURATION, DOMAIN
 from .coordinator import BHyveDeviceCoordinator
-from .devices import BHyveHubDevice
+from .devices import BHyveHT25Device, BHyveHubDevice
 from .devices.protobuf import BHyveProtobufDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -37,6 +37,10 @@ MAX_COUNTS_PER_LITRE = 500
 
 MAX_RAIN_DELAY_HOURS = 168  # 7 days — matches the B-Hyve app's ceiling
 
+# Mesh button run time (manual-preset-run {run-time-secs u16}), in minutes.
+MIN_BUTTON_MINUTES = 1
+MAX_BUTTON_MINUTES = 0xFFFF // 60  # 1092: the u16 seconds field's ceiling
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -50,9 +54,14 @@ async def async_setup_entry(
         if isinstance(coord.device, BHyveHubDevice):
             continue
         entities.append(BHyveDurationNumber(coord, default_duration_sec))
-        # Rain delay is a protobuf-family (HT34A/HT25G2) capability.
+        # Protobuf-family (HT34A/HT25G2) rain delay.
         if isinstance(coord.device, BHyveProtobufDevice):
             entities.append(BHyveRainDelayNumber(coord))
+        # Mesh (HT25) rain delay and button run time, written over the d7-47
+        # mesh messages. A key-less record has no session to write over.
+        if isinstance(coord.device, BHyveHT25Device) and coord.device.connection is not None:
+            entities.append(BHyveRainDelayNumber(coord))
+            entities.append(BHyveButtonRunTimeNumber(coord))
         # Flow calibration — Gen1 (HT25) devices with an inline flow sensor.
         # A key-less record has no BLE connection and therefore no flow sensors,
         # so there would be nothing to calibrate.
@@ -191,3 +200,46 @@ class BHyveRainDelayNumber(CoordinatorEntity[BHyveDeviceCoordinator], NumberEnti
     async def async_set_native_value(self, value: float) -> None:
         hours = max(0.0, min(MAX_RAIN_DELAY_HOURS, value))
         await self.coordinator.async_apply_rain_delay(int(round(hours * 60)))
+
+
+class BHyveButtonRunTimeNumber(CoordinatorEntity[BHyveDeviceCoordinator], NumberEntity):
+    """Mesh HT25: how long a press of the timer's physical button waters, in
+    minutes (sent as seconds in manual-preset-run). Reflects the device, so it
+    is not a RestoreNumber: unknown until a Sync reads it or a write is acked.
+    The write is decoded from the app's mesh spec, not HW-verified."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Button run time"
+    _attr_translation_key = "button_run_time"
+    _attr_icon = "mdi:gesture-tap-button"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_native_min_value = MIN_BUTTON_MINUTES
+    _attr_native_max_value = MAX_BUTTON_MINUTES
+    _attr_native_step = 1
+    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
+    _attr_mode = NumberMode.BOX
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        device = coordinator.device
+        self._attr_unique_id = f"{device.unique_id}_button_run_time"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, device.cloud_id)},
+            "name": device.name,
+            "manufacturer": "Orbit Irrigation",
+            "model": device.hardware,
+            "sw_version": device.firmware,
+            "connections": {("mac", device.mac)} if device.mac else set(),
+        }
+
+    @property
+    def native_value(self) -> float | None:
+        secs = self.coordinator.device.manual_preset_sec
+        if secs is None:
+            return None
+        return round(secs / 60, 1)
+
+    async def async_set_native_value(self, value: float) -> None:
+        minutes = max(MIN_BUTTON_MINUTES, min(MAX_BUTTON_MINUTES, int(value)))
+        ok = await self.coordinator.device.set_manual_preset_runtime(minutes * 60)
+        await self.coordinator.async_confirm_write(ok, "button run time")

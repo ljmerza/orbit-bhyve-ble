@@ -53,7 +53,8 @@ async def async_setup_entry(
                 entities.append(BHyveNoFlowBinarySensor(coord))
         elif recovery_supported(coord.device.hardware):
             # Mesh HT25s don't report the #16.#7 fault block; their Problem
-            # sensor covers the one fault we can see: stuck in the bootloader.
+            # sensor covers a timer stuck in the bootloader plus the
+            # device-health fault bits.
             entities.append(BHyveBootloaderProblemBinarySensor(coord))
     async_add_entities(entities)
 
@@ -158,9 +159,11 @@ class BHyveProblemBinarySensor(_BHyveFaultSensorBase):
 
 class BHyveBootloaderProblemBinarySensor(_BHyveBinarySensorBase):
     """Problem sensor for mesh HT25s: on when the last connect found the timer
-    stuck in its bootloader after a failed firmware update. Mesh polls are
-    passive by default, so this only updates when something actually connects
-    (Sync, watering, or the live status poll option)."""
+    stuck in its bootloader after a failed firmware update, or when the
+    device-health reply (read on every connect) flags a fault: boost circuit,
+    no flow while open, or flow while closed. Mesh polls are passive by
+    default, so this only updates when something actually connects (Sync,
+    watering, or the live status poll option)."""
 
     _attr_device_class = BinarySensorDeviceClass.PROBLEM
     _attr_entity_category = EntityCategory.DIAGNOSTIC
@@ -171,16 +174,35 @@ class BHyveBootloaderProblemBinarySensor(_BHyveBinarySensorBase):
         self._attr_name = "Problem"
 
     @property
+    def _faults(self) -> FaultStatus | None:
+        return self.coordinator.device.state.faults
+
+    @property
     def is_on(self) -> bool:
-        return self.coordinator.device.connection.in_bootloader
+        faults = self._faults
+        return bool(
+            self.coordinator.device.connection.in_bootloader
+            or (faults is not None and faults.any_fault)
+        )
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        if self.is_on:
-            reason = "Stuck in bootloader after a failed firmware update - press Recover firmware"
-        else:
-            reason = "No faults"
-        return {"reason": reason}
+        reasons: list[str] = []
+        if self.coordinator.device.connection.in_bootloader:
+            reasons.append(
+                "Stuck in bootloader after a failed firmware update - press Recover firmware"
+            )
+        faults = self._faults
+        if faults is not None:
+            reasons.extend(faults.reasons)
+        attrs: dict[str, Any] = {"reason": ", ".join(reasons) or "No faults"}
+        if faults is not None:
+            attrs.update({
+                "voltage_boost_fail": faults.voltage_boost_fail,
+                "valve_off_flow_detected": faults.valve_off_flow,
+                "valve_on_no_flow_detected": faults.valve_on_no_flow,
+            })
+        return attrs
 
 
 class BHyveLeakBinarySensor(_BHyveFaultSensorBase):
