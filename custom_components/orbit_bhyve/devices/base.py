@@ -124,6 +124,19 @@ def accumulate_gallons(
     return total + prev_gpm * (min(dt_sec, cap_sec) / 60.0)
 
 
+def ha_local_now() -> datetime:
+    """Aware 'now' in HA's configured time zone, for setting a device clock.
+
+    HA's setting, not the container OS timezone, which can diverge from it and
+    would skew the device's schedule math. Local import so the module still
+    loads without Home Assistant (the standalone protocol tests)."""
+    try:
+        from homeassistant.util import dt as dt_util
+        return dt_util.now()
+    except ImportError:
+        return datetime.now().astimezone()
+
+
 @dataclass
 class ProgramSpec:
     """A watering program to WRITE (#19 setProgramSchedule).

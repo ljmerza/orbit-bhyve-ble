@@ -29,6 +29,7 @@ from .base import (
     SLOT_LETTERS,
     BHyveBleDeviceBase,
     ProgramSpec,
+    ha_local_now,
 )
 from .status import MSG_HEADER, _crc16_ccitt, apply_status_plaintext, parse_sync_dump
 
@@ -184,14 +185,7 @@ def _build_set_epoch_time_pb(epoch_utc: int | None = None, tz_offset_sec: int | 
     timezone, which can diverge from the user's HA setting and would skew the
     device's schedule next-start computation."""
     if epoch_utc is None or tz_offset_sec is None:
-        try:
-            # HA's configured local time, not the container OS timezone. Local
-            # import so the module still loads without Home Assistant (the
-            # standalone protocol tests, which pass explicit epoch/offset).
-            from homeassistant.util import dt as dt_util
-            now = dt_util.now()
-        except ImportError:
-            now = datetime.now().astimezone()
+        now = ha_local_now()
         if epoch_utc is None:
             epoch_utc = int(now.timestamp())
         if tz_offset_sec is None:
