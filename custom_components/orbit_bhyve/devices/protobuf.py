@@ -131,6 +131,11 @@ _FLOW_SUBSCRIBE_PB = bytes.fromhex("ca030508e807100a")
 # this after sampling so we never leave a persistent subscription behind.
 _FLOW_UNSUBSCRIBE_PB = bytes.fromhex("ca030408001002")
 
+# #21 skipCurrentStation {} — skip the zone that is watering now (the app's
+# watering-screen skip). The schema has #1 stationId, but the app's serializer
+# always sends the body empty, so we do too. NOT hardware-verified.
+_SKIP_STATION_PB = bytes.fromhex("aa0100")
+
 # read_flow re-subscribes this many times (~1 s each) to sample the cumulative
 # #59.#3 counter over a few seconds and derive an instantaneous rate from its
 # slope. 4 → ~4 s window: enough counts for a clean slope without holding the
@@ -1088,6 +1093,36 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                     self._arm_host_stop(run_sec)
                 _LOGGER.debug("%s: %s run program %s confirmed", self.mac, self.log_label, letter)
                 return True
+            finally:
+                await self.connection.disconnect()
+
+    @_ble_write_guard
+    async def skip_current_station(self) -> bool:
+        """Skip the zone that is watering now (#21 skipCurrentStation {}). Returns
+        True once a #16 shows the run moved to another zone or ended. Meant for
+        multi-station units; on a single-station unit a skip would end the run."""
+        if not self.state.is_watering:
+            _LOGGER.debug("%s: %s skip zone ignored — not watering", self.mac, self.log_label)
+            return False
+        async with self._api_lock:
+            if self.connection is None:
+                return False
+            try:
+                zone_before = self.state.active_zone
+                # The skipped zone's end time no longer applies. Clear it so the
+                # next #16 re-anchors the wall-clock close to the new zone (the
+                # observer only ever moves it earlier).
+                off_before = self.state.expected_off_at
+                self.state.expected_off_at = None
+                notifs = await self.connection.send(_build_message(_SKIP_STATION_PB), drain_ms=2000)
+                self._stamp_command(f"skip zone {zone_before}", len(notifs))
+                await asyncio.sleep(1.0)
+                await self.refresh_status()
+                if not self._status_parsed:
+                    if self.state.expected_off_at is None:
+                        self.state.expected_off_at = off_before
+                    return False
+                return not self.state.is_watering or self.state.active_zone != zone_before
             finally:
                 await self.connection.disconnect()
 

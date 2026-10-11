@@ -106,3 +106,52 @@ def test_run_program_button_press_runs_slot_and_surfaces_failure(ok):
         with pytest.raises(HomeAssistantError):
             asyncio.run(button.async_press())
     assert calls == [("run", 3), ("refresh",)]
+
+
+# --- button gating (async_setup_entry) ------------------------------------------
+
+def _real_device(cls, hardware, stations):
+    dev = object.__new__(cls)  # real class for the isinstance gates, no HA __init__
+    dev.cloud_id, dev.name, dev.mac = f"cloud-{hardware}", hardware, "AA:BB:CC:DD:EE:10"
+    dev.hardware, dev.firmware, dev.stations = hardware, "0107", stations
+    dev.connection = object()  # any non-None BLE connection
+    dev.state = DeviceState()
+    return dev
+
+
+def _setup_platform(module, *devices):
+    from orbit_bhyve.const import DOMAIN
+
+    coords = {
+        d.cloud_id: SimpleNamespace(device=d, data=None, last_update_success=True)
+        for d in devices
+    }
+    hass = SimpleNamespace(data={DOMAIN: {"e1": SimpleNamespace(coordinators=coords)}})
+    added: list = []
+    asyncio.run(module.async_setup_entry(hass, SimpleNamespace(entry_id="e1"), added.extend))
+    return added
+
+
+def test_skip_zone_button_only_on_multi_station_units():
+    from orbit_bhyve import button
+    from orbit_bhyve.devices import BHyveHT25G2Device, BHyveHT34ADevice
+
+    xd = _real_device(BHyveHT34ADevice, "HT34A-0001", 4)
+    g2 = _real_device(BHyveHT25G2Device, "HT25G2-0001", 1)
+    names = {(e.coordinator.device.hardware, e.name) for e in _setup_platform(button, xd, g2)}
+    assert ("HT34A-0001", "Skip zone") in names
+    assert ("HT25G2-0001", "Skip zone") not in names
+    for hw in ("HT34A-0001", "HT25G2-0001"):
+        for letter in "ABCD":
+            assert (hw, f"Run program {letter}") in names
+
+
+def test_skip_zone_button_available_only_while_watering():
+    from orbit_bhyve.button import BHyveSkipZoneButton
+
+    device = _device(is_watering=False)
+    coord = SimpleNamespace(device=device, data=None, last_update_success=True)
+    button = BHyveSkipZoneButton(coord)
+    assert button.available is False
+    device.state.is_watering = True
+    assert button.available is True

@@ -245,3 +245,70 @@ def test_run_program_returns_false_on_ble_error():
     dev.state = DeviceState()
     dev.connection = _Broken(dev)
     assert asyncio.run(dev.run_program(1)) is False
+
+
+# --- skip current zone (#21 skipCurrentStation) ------------------------------
+
+def _running_status(station_0idx: int, remaining: int) -> bytes:
+    progress = pb._pb_field_varint(rx.RX_F_PROGRESS_STATION, station_0idx)
+    progress += pb._pb_field_varint(rx.RX_F_PROGRESS_REMAINING, remaining)
+    sub = pb._pb_field_varint(rx.RX_F_STATUS_MODE, 4)
+    sub += pb._pb_field_bytes(rx.RX_F_STATUS_PROGRESS, progress)
+    return pb._build_message(pb._pb_field_bytes(rx.RX_F_STATUS, sub))
+
+
+def _make_xd(**state_kwargs):
+    dev = object.__new__(BHyveHT34ADevice)
+    dev.mac = "AA:BB:CC:DD:EE:03"
+    dev.stations = 4
+    dev.state = DeviceState(**state_kwargs)
+    return dev
+
+
+def test_skip_station_byte_ref():
+    # The app sends #21 with an EMPTY body (no #1 stationId).
+    assert pb._SKIP_STATION_PB.hex() == "aa0100"
+    assert rx._pb_field(rx.pb_parse(pb._SKIP_STATION_PB), 21) == b""
+
+
+def test_skip_confirms_when_zone_moves_and_reanchors_close():
+    from datetime import datetime, timedelta, timezone
+
+    old_off = datetime.now(timezone.utc) + timedelta(seconds=30)
+    dev = _make_xd(is_watering=True, active_zone=1, expected_off_at=old_off)
+    dev.connection = _FakeConn(dev, _running_status(station_0idx=1, remaining=600))
+    assert asyncio.run(dev.skip_current_station()) is True
+    assert dev.connection.sent[0] == pb._build_message(pb._SKIP_STATION_PB)
+    assert dev.state.active_zone == 2
+    # Re-anchored to zone 2's remaining time, not left at zone 1's end.
+    assert dev.state.expected_off_at > old_off + timedelta(seconds=300)
+
+
+def test_skip_confirms_when_run_ends():
+    dev = _make_xd(is_watering=True, active_zone=4)
+    dev.connection = _FakeConn(dev, pb._build_message(_status_msg(1)))
+    assert asyncio.run(dev.skip_current_station()) is True
+    assert dev.state.is_watering is False
+
+
+def test_skip_not_confirmed_when_zone_unchanged():
+    dev = _make_xd(is_watering=True, active_zone=1)
+    dev.connection = _FakeConn(dev, _running_status(station_0idx=0, remaining=200))
+    assert asyncio.run(dev.skip_current_station()) is False
+
+
+def test_skip_without_status_restores_close_time():
+    from datetime import datetime, timedelta, timezone
+
+    old_off = datetime.now(timezone.utc) + timedelta(seconds=30)
+    dev = _make_xd(is_watering=True, active_zone=1, expected_off_at=old_off)
+    dev.connection = _FakeConn(dev, None)  # device never answers
+    assert asyncio.run(dev.skip_current_station()) is False
+    assert dev.state.expected_off_at == old_off
+
+
+def test_skip_ignored_when_not_watering():
+    dev = _make_xd(is_watering=False)
+    dev.connection = _FakeConn(dev, pb._build_message(_status_msg(1)))
+    assert asyncio.run(dev.skip_current_station()) is False
+    assert dev.connection.sent == []

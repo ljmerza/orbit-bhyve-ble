@@ -60,6 +60,9 @@ async def async_setup_entry(
             # A-D switches).
             for letter in UI_SLOTS:
                 entities.append(BHyveRunProgramButton(coord, letter))
+            # Skip only means something with a next zone to move to.
+            if coord.device.stations > 1:
+                entities.append(BHyveSkipZoneButton(coord))
         # Bootloader recovery is only verified on HT25-0000 (see firmware.py).
         if recovery_supported(coord.device.hardware):
             entities.append(BHyveRecoverFirmwareButton(coord, entry))
@@ -229,3 +232,36 @@ class BHyveRunProgramButton(CoordinatorEntity[BHyveDeviceCoordinator], ButtonEnt
         _LOGGER.info("%s: run program %s requested via button", self.coordinator.device.mac, self._letter)
         ok = await self.coordinator.device.run_program(self._slot)
         await self.coordinator.async_confirm_write(ok, f"Run program {self._letter}")
+
+
+class BHyveSkipZoneButton(CoordinatorEntity[BHyveDeviceCoordinator], ButtonEntity):
+    """Skip the zone that is watering now and move on to the next (#21
+    skipCurrentStation, the app's watering-screen skip). Multi-station units
+    only; available while watering. The write is not hardware-verified."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Skip zone"
+    _attr_icon = "mdi:skip-next"
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        device = coordinator.device
+        self._attr_unique_id = f"{device.unique_id}_skip_zone"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, device.cloud_id)},
+            "name": device.name,
+            "manufacturer": "Orbit Irrigation",
+            "model": device.hardware,
+            "sw_version": device.firmware,
+            "connections": {("mac", device.mac)} if device.mac else set(),
+        }
+
+    @property
+    def available(self) -> bool:
+        state = self.coordinator.data or self.coordinator.device.state
+        return super().available and bool(state.is_watering)
+
+    async def async_press(self) -> None:
+        _LOGGER.info("%s: skip zone requested via button", self.coordinator.device.mac)
+        ok = await self.coordinator.device.skip_current_station()
+        await self.coordinator.async_confirm_write(ok, "Skip zone")
