@@ -41,7 +41,6 @@ SEQ_STATUS = 0x02
 SEQ_INFO = 0x03
 SEQ_SUBSYSTEM = 0x01
 SEQ_MAGIC_CHECK = 0x00
-SEQ_HEARTBEAT = 0x09
 SEQ_WATER_CTRL = 0x0D
 SEQ_FLOW = 0x0B            # inbound flow sample
 # Inbound run-end frame, run duration at pt[6:8] LE. NOT part of the flow
@@ -277,10 +276,14 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         self._notify_state_changed()
 
     async def _post_handshake(self, conn: BHyveBleConnection) -> None:
-        """8-step init the phone runs after the AES handshake. Sending the
-        watering command without it produces a silent drop. Only `bind`,
-        `status`, and `info` are confirmed required; the others may be
-        prunable but are kept for safety until empirically tested."""
+        """Init the phone runs after the AES handshake. Sending the watering
+        command without it produces a silent drop. Only `bind`, `status`, and
+        `info` are confirmed required; the others may be prunable but are kept
+        for safety until empirically tested.
+
+        The phone's "heartbeat" step (`85/09 00`) is left out: per the app's
+        mesh spec it writes active-programs = 0, which would disable every
+        program stored on the timer on every connect."""
         # Surface resolved addresses so a test run self-verifies the prefix is
         # the device's own id and NOT the legacy hardcoded d747.
         _LOGGER.debug(
@@ -301,7 +304,6 @@ class BHyveHT25Device(BHyveBleDeviceBase):
             (0x04, SEQ_SUBSYSTEM, b"\x00" * 3, "subsystem"),
             (0x85, SEQ_MAGIC_CHECK, magic1_payload, "magic1"),
             (0x85, SEQ_MAGIC_CHECK, magic2_payload, "magic2"),
-            (0x85, SEQ_HEARTBEAT, b"\x00", "heartbeat"),
             (0x86, SEQ_BIND, None, "rebind"),
         ]
         for type_byte, seq, payload, label in steps:

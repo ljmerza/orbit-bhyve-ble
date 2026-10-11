@@ -79,6 +79,5 @@ def test_init_bind_and_rebind_stamp_the_time_each_is_sent(monkeypatch, cls):
         MESH + bytes([0x04, 0x01, 0x40]) + b"\x00" * 3,
         MESH + bytes([0x85, 0x00, 0x40, 0x01]) + MESH + b"\x00" * 4,
         MESH + bytes([0x85, 0x00, 0x40, 0x00]) + HUB + b"\x00" * 4,
-        MESH + bytes([0x85, 0x09, 0x40, 0x00]),
         MESH + bytes([0x86, 0x05, 0x40]) + clock(t0 + 2),
     ]
