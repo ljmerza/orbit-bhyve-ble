@@ -144,6 +144,13 @@
           "watering": "Watering",
           "mesh_offline": "Mesh offline"
         }
+      },
+      "rain_sensor": {
+        "state": {
+          "disabled": "Disabled",
+          "not_raining": "Not raining",
+          "raining": "Raining"
+        }
       }
     }
   }

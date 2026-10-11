@@ -123,12 +123,13 @@ def _setup_platform(module, *devices):
     from orbit_bhyve.const import DOMAIN
 
     coords = {
-        d.cloud_id: SimpleNamespace(device=d, data=None, last_update_success=True)
+        d.cloud_id: _ListenerCoord(device=d, data=None, last_update_success=True, listeners=[])
         for d in devices
     }
     hass = SimpleNamespace(data={DOMAIN: {"e1": SimpleNamespace(coordinators=coords)}})
+    entry = SimpleNamespace(entry_id="e1", async_on_unload=lambda cb: None)
     added: list = []
-    asyncio.run(module.async_setup_entry(hass, SimpleNamespace(entry_id="e1"), added.extend))
+    asyncio.run(module.async_setup_entry(hass, entry, added.extend))
     return added
 
 
@@ -182,3 +183,91 @@ def test_firmware_version_sensor():
         "stations": 1,
         "read_at": "2026-10-11T00:00:00+00:00",
     }
+
+
+# --- Battery (device reported) and the Rain sensor ----------------------------
+
+def test_device_battery_sensor():
+    from orbit_bhyve.sensor import BHyveDeviceBatterySensor
+
+    device = _device(battery_pct_device=80, externally_powered=False)
+    sensor = BHyveDeviceBatterySensor(_coord(device))
+    assert sensor.native_value == 80
+    assert sensor.extra_state_attributes == {"externally_powered": False}
+    assert sensor.entity_registry_enabled_default is False
+
+
+def test_rain_sensor_entity_states():
+    from orbit_bhyve.sensor import BHyveRainSensorStatusSensor
+
+    device = _device(rain_sensor="raining")
+    sensor = BHyveRainSensorStatusSensor(_coord(device))
+    assert sensor.native_value == "raining"
+    assert sensor.options == ["disabled", "not_raining", "raining"]
+
+
+class _ListenerCoord(SimpleNamespace):
+    def async_add_listener(self, cb):
+        self.listeners.append(cb)
+
+        def remove():
+            self.listeners.remove(cb)
+        return remove
+
+
+def _rain_setup(monkeypatch, device, *, in_registry=False):
+    from orbit_bhyve import sensor
+
+    registry = SimpleNamespace(
+        async_get_entity_id=lambda *a: "sensor.garden_rain_sensor" if in_registry else None
+    )
+    monkeypatch.setattr(sensor.er, "async_get", lambda hass: registry)
+    coord = _ListenerCoord(device=device, data=None, listeners=[])
+    unloads: list = []
+    entry = SimpleNamespace(async_on_unload=unloads.append)
+    added: list = []
+    sensor._add_rain_sensor_when_reported(None, entry, coord, added.extend)
+    return coord, added, unloads
+
+
+def test_rain_sensor_created_only_once_reported(monkeypatch):
+    device = _device()
+    coord, added, unloads = _rain_setup(monkeypatch, device)
+    assert added == [] and len(coord.listeners) == 1
+    coord.listeners[0]()                      # a poll without a rain sensor
+    assert added == []
+    device.state.rain_sensor = "not_raining"
+    coord.listeners[0]()                      # first report -> entity added once
+    assert [e.unique_id for e in added] == ["garden_rain_sensor"]
+    assert coord.listeners == []              # listener removed after adding
+    unloads[0]()                              # unload after that is a no-op
+
+
+def test_rain_sensor_unload_before_report_removes_listener(monkeypatch):
+    coord, added, unloads = _rain_setup(monkeypatch, _device())
+    unloads[0]()
+    assert coord.listeners == [] and added == []
+
+
+@pytest.mark.parametrize("reported,in_registry", [(True, False), (False, True)])
+def test_rain_sensor_added_at_setup_when_known(monkeypatch, reported, in_registry):
+    device = _device(rain_sensor="disabled" if reported else None)
+    coord, added, _ = _rain_setup(monkeypatch, device, in_registry=in_registry)
+    assert len(added) == 1 and coord.listeners == []
+
+
+def test_sensor_setup_gates_new_protobuf_sensors(monkeypatch):
+    from orbit_bhyve import sensor
+    from orbit_bhyve.devices import BHyveHT25Device, BHyveHT34ADevice
+
+    registry = SimpleNamespace(async_get_entity_id=lambda *a: None)
+    monkeypatch.setattr(sensor.er, "async_get", lambda hass: registry)
+    xd = _real_device(BHyveHT34ADevice, "HT34A-0001", 4)
+    mesh = _real_device(BHyveHT25Device, "HT25-0000", 1)
+    mesh.cloud_id = "cloud-mesh"
+    names = {(e.coordinator.device.hardware, e.name) for e in _setup_platform(sensor, xd, mesh)}
+    for name in ("Firmware version", "Battery (device reported)"):
+        assert ("HT34A-0001", name) in names
+        assert ("HT25-0000", name) not in names
+    assert not any(n == "Rain sensor" for _hw, n in names)  # never reported
+

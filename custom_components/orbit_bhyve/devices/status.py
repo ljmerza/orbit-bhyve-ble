@@ -49,6 +49,13 @@ RX_F_RD_ENABLED = 4       #   #16.#13.#4: rain-delay flag (knobunc: delayType en
                           #     any nonzero value = a delay is set). Often absent on a bare clear.
 RX_F_STATUS_BATT = 14     #   #16.#14: battery block { #3 = mV }
 RX_F_BATT_MV = 3          #   battery millivolts (#16.#14.#3 or #46.#3)
+RX_F_BATT_PCT = 2         #   #16.#14.#2 / #46.#2 batteryLevelPercent (device's own gauge; app schema,
+                          #     not yet observed populated)
+RX_F_BATT_EXTERNAL = 4    #   #16.#14.#4 / #46.#4 externallyPowered (bool; omitted when false)
+RX_F_STATUS_SENSORS = 17  #   #16.#17: sensors { repeated #1 SensorInfo { #1 type, #2 rainSensor
+                          #     { #1 status }, #3 sensorId } } (app schema; not yet observed)
+_SI_RAIN = 2              #     SensorInfo.#2 rainSensor
+RAIN_SENSOR_STATES = {0: "disabled", 1: "not_raining", 2: "raining"}  # RainSensor.Status
 RX_F_BATTERY_REPORT = 46  # standalone battery report { #3 = mV }
 RX_F_WATERING = 59        # flow sensor data (knobunc: FlowSensorData). Gen2 only; XD emits none.
 RX_F_WATERING_ACTIVE = 1  #   #59.#1: knobunc currentFlowRateFrequency_Hz — ~0 when no water moving,
@@ -233,6 +240,22 @@ class DeviceStatus(NamedTuple):
     faults: FaultStatus | None = None      # #16.#7 faultStatus; None = block absent
     flow_hz: int | None = None             # #59.#1 Hz; 0 when a #59 omits it, None = no #59
     flow_volume_gal: float | None = None   # #59.#5 device-reported cycle gallons (unconfirmed)
+    rain_sensor: str | None = None         # #16.#17 rain sensor status (RAIN_SENSOR_STATES); None = not reported
+    battery_pct_device: int | None = None  # #16.#14.#2 / #46.#2 device-reported battery percent
+    externally_powered: bool | None = None  # #16.#14.#4 / #46.#4; None = no battery block
+
+
+def _rain_sensor_status(sensors: bytes) -> str | None:
+    """The rain-sensor status from a #16.#17 sensors block, or None if it lists no
+    rain sensor. A rainSensor block with its status omitted is 0 = disabled."""
+    for num, _wire, entry in pb_parse(sensors) or ():
+        if num != 1 or not isinstance(entry, (bytes, bytearray)):
+            continue
+        ef = pb_parse(entry)
+        rain = _pb_field(ef, _SI_RAIN)
+        if isinstance(rain, (bytes, bytearray)):
+            return RAIN_SENSOR_STATES.get(_pb_field(pb_parse(rain), 1) or 0)
+    return None
 
 
 def app_flow_gpm(device_gpm: float | None, hz: int | None) -> float | None:
@@ -272,6 +295,7 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
     run_state = battery_mv = is_watering = seconds_remaining = None
     active_station = rd_minutes = rd_expiry = rd_active = None
     controller_mode = next_start_flags = next_start_epoch = faults = None
+    rain_sensor = None
 
     device_clock = _pb_field(top, RX_F_CLOCK)     # #7 wrapper field
     status = _pb_field(top, RX_F_STATUS)          # #16 submessage
@@ -314,6 +338,9 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
                 | ((_pb_field(ff, _FLT_STATIONS_HI) or 0) << 32),
                 accessory_fault_flags=_pb_field(ff, _FLT_ACCESSORY) or 0,
             )
+        sens = _pb_field(sfields, RX_F_STATUS_SENSORS)   # #16.#17
+        if isinstance(sens, (bytes, bytearray)):
+            rain_sensor = _rain_sensor_status(sens)
         rd = _pb_field(sfields, RX_F_STATUS_RAINDELAY)   # #16.#13
         if isinstance(rd, (bytes, bytearray)):
             rdf = pb_parse(rd)
@@ -338,6 +365,19 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
 
     if battery_mv is None:                         # standalone #46.#3
         battery_mv = _pb_subfield(top, RX_F_BATTERY_REPORT, RX_F_BATT_MV)
+
+    # Device-reported percent + external power from the same BatteryStatus block
+    # (#16.#14, else a standalone #46). Protobuf omits a false #4, so a present
+    # block without it means battery-powered.
+    battery_pct_device = externally_powered = None
+    batt = _pb_path(top, RX_F_STATUS, RX_F_STATUS_BATT)
+    if not isinstance(batt, (bytes, bytearray)):
+        batt = _pb_field(top, RX_F_BATTERY_REPORT)
+    if isinstance(batt, (bytes, bytearray)):
+        bf = pb_parse(batt)
+        pct = _pb_field(bf, RX_F_BATT_PCT)
+        battery_pct_device = pct if isinstance(pct, int) and 0 <= pct <= 100 else None
+        externally_powered = bool(_pb_field(bf, RX_F_BATT_EXTERNAL))
 
     # ONLY #16.#1 run_state drives is_watering — it is authoritative for whether
     # the valve is open. #59.#1 ("water currently flowing") deliberately does NOT
@@ -392,6 +432,9 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
         faults=faults,
         flow_hz=flow_hz,
         flow_volume_gal=flow_volume_gal,
+        rain_sensor=rain_sensor,
+        battery_pct_device=battery_pct_device,
+        externally_powered=externally_powered,
     )
 
 
@@ -559,6 +602,18 @@ def apply_status_plaintext(device, pt: bytes) -> None:
 
     if st.battery_mv is not None and 1500 <= st.battery_mv <= 4000:
         device.battery_mv = st.battery_mv  # battery_pct is a chemistry-aware property
+
+    # Device's own battery gauge / external power (#16.#14.#2/#4) — shown beside,
+    # not instead of, the chemistry-aware mV gauge above.
+    if st.battery_pct_device is not None:
+        device.state.battery_pct_device = st.battery_pct_device
+    if st.externally_powered is not None:
+        device.state.externally_powered = st.externally_powered
+
+    # Rain sensor status (#16.#17). Kept when a status omits the block, like the
+    # fault report below; the Rain sensor entity is created once this is set.
+    if st.rain_sensor is not None:
+        device.state.rain_sensor = st.rain_sensor
 
     # Raw cumulative flow counter (#59.#3) — record whenever a #59 carries it,
     # regardless of the flow-active flag, so read_flow can sample its slope even

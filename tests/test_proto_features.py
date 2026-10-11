@@ -391,3 +391,83 @@ def test_device_info_not_read_while_watering():
     dev.connection.reply = _running_status(0, 300)
     asyncio.run(dev.refresh_state())
     assert dev.connection.info_requests == 0
+
+
+# --- more #16 status fields: rain sensor (#17), battery % / external (#14) ----
+
+def _status_with(*, sensors: bytes | None = None, battery: bytes | None = None) -> bytes:
+    sub = pb._pb_field_varint(rx.RX_F_STATUS_MODE, 1)
+    if battery is not None:
+        sub += pb._pb_field_bytes(rx.RX_F_STATUS_BATT, battery)
+    if sensors is not None:
+        sub += pb._pb_field_bytes(rx.RX_F_STATUS_SENSORS, sensors)
+    return pb._pb_field_bytes(rx.RX_F_STATUS, sub)
+
+
+def _sensor_info(*, type_=1, rain_status=None, rain_block=True, sensor_id=None) -> bytes:
+    """One #16.#17.#1 SensorInfo entry."""
+    body = pb._pb_field_varint(1, type_) if type_ else b""
+    if rain_block:
+        rain = pb._pb_field_varint(1, rain_status) if rain_status else b""
+        body += pb._pb_field_bytes(2, rain)
+    if sensor_id is not None:
+        body += pb._pb_field_varint(3, sensor_id)
+    return pb._pb_field_bytes(1, body)
+
+
+@pytest.mark.parametrize(
+    "sensors,expected",
+    [
+        (_sensor_info(rain_status=2), "raining"),
+        (_sensor_info(rain_status=1, sensor_id=7), "not_raining"),
+        (_sensor_info(rain_status=None), "disabled"),          # status 0 omitted
+        (_sensor_info(type_=0, rain_block=False, sensor_id=1), None),  # no rain sensor
+        (b"", None),                                           # empty sensors block
+    ],
+)
+def test_extract_status_rain_sensor(sensors, expected):
+    assert rx.extract_status(_status_with(sensors=sensors)).rain_sensor == expected
+
+
+def test_extract_status_without_sensors_block_has_no_rain_sensor():
+    assert rx.extract_status(_status_msg(1)).rain_sensor is None
+
+
+def test_apply_keeps_last_rain_sensor_when_block_absent():
+    dev = _make_gen2()
+    rx.apply_status_plaintext(dev, pb._build_message(_status_with(sensors=_sensor_info(rain_status=2))))
+    assert dev.state.rain_sensor == "raining"
+    rx.apply_status_plaintext(dev, pb._build_message(_status_msg(1)))
+    assert dev.state.rain_sensor == "raining"
+    rx.apply_status_plaintext(dev, pb._build_message(_status_with(sensors=_sensor_info(rain_status=1))))
+    assert dev.state.rain_sensor == "not_raining"
+
+
+def test_extract_status_battery_percent_and_external_power():
+    batt = pb._pb_field_varint(2, 80) + pb._pb_field_varint(3, 2800) + pb._pb_field_varint(4, 1)
+    st = rx.extract_status(_status_with(battery=batt))
+    assert (st.battery_pct_device, st.externally_powered, st.battery_mv) == (80, True, 2800)
+    # Only mV (today's hardware shape): no device percent, and an omitted #4 = false.
+    st = rx.extract_status(_status_with(battery=pb._pb_field_varint(3, 2800)))
+    assert (st.battery_pct_device, st.externally_powered) == (None, False)
+    # An out-of-range percent is ignored.
+    st = rx.extract_status(_status_with(battery=pb._pb_field_varint(2, 250)))
+    assert st.battery_pct_device is None
+    # No battery block at all -> unknown, not "battery-powered".
+    assert rx.extract_status(_status_msg(1)).externally_powered is None
+
+
+def test_extract_status_battery_from_standalone_46():
+    batt = pb._pb_field_varint(2, 55) + pb._pb_field_varint(3, 2700)
+    st = rx.extract_status(pb._pb_field_bytes(rx.RX_F_BATTERY_REPORT, batt))
+    assert (st.battery_pct_device, st.externally_powered, st.battery_mv) == (55, False, 2700)
+
+
+def test_apply_stores_device_battery_beside_mv_gauge():
+    dev = _make_gen2()
+    dev.battery_mv = None
+    batt = pb._pb_field_varint(2, 80) + pb._pb_field_varint(3, 2800)
+    rx.apply_status_plaintext(dev, pb._build_message(_status_with(battery=batt)))
+    assert dev.battery_mv == 2800                    # mV gauge path unchanged
+    assert dev.state.battery_pct_device == 80
+    assert dev.state.externally_powered is False

@@ -273,6 +273,13 @@ class DeviceState:
     # Last #23 DeviceInfo (protobuf family), read on an idle poll about daily.
     device_info: DeviceInfoReport | None = None
     device_info_at: datetime | None = None
+    # #16.#17 rain sensor status ("disabled"/"not_raining"/"raining"); None until
+    # the device reports a rain sensor (most never do).
+    rain_sensor: str | None = None
+    # #16.#14.#2 device-reported battery percent and #16.#14.#4 externallyPowered.
+    # Beside, not instead of, the chemistry-aware battery_pct from mV.
+    battery_pct_device: int | None = None
+    externally_powered: bool | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
