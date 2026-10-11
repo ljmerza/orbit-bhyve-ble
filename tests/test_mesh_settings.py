@@ -23,7 +23,6 @@ from orbit_bhyve.devices.mesh import (
     parse_device_info,
     parse_health_faults,
     parse_last_water_cycle,
-    rain_delay_body,
     run_mode_body,
 )
 
@@ -50,8 +49,9 @@ def _dev(mesh_id: int = DECK) -> BHyveHT25Device:
 
 class _AckConn:
     """Answers each write with its write-ack (command 3: 0x40 set on byte 2,
-    body echoed), as the device does for bind/magic/heartbeat. send_actuation
-    first plays the init's utc-time ack when `device_clock` is set."""
+    body echoed), as the device does for bind/magic/heartbeat. ensure_connected
+    and send_actuation first play the init's utc-time ack when `device_clock`
+    is set."""
 
     def __init__(self, dev, *, ack: bool = True, device_clock: int | None = None):
         self.dev = dev
@@ -62,13 +62,19 @@ class _AckConn:
         self.disconnects = 0
         self.is_held = False
 
-    async def send_actuation(self, pt, *, drain_ms=1500):
-        self.actuations += 1
+    def _play_clock_ack(self):
         if self.device_clock is not None:
             self.dev._observe_plaintext(
                 MESH + bytes([0xC1, 0x05, 0x40])
                 + self.device_clock.to_bytes(4, "little") + b"\x10\xff\x00"
             )
+
+    async def ensure_connected(self):
+        self._play_clock_ack()
+
+    async def send_actuation(self, pt, *, drain_ms=1500):
+        self.actuations += 1
+        self._play_clock_ack()
         return await self.send(pt)
 
     async def send(self, pt, *, drain_ms=1500):
@@ -92,7 +98,6 @@ def _wired(**kw) -> tuple[BHyveHT25Device, _AckConn]:
 # --- body encoders (app spec, not HW-verified) ------------------------------
 
 def test_body_encoders():
-    assert rain_delay_body(7200).hex() == "201c0000"
     assert delay_end_body(0x69F693DE).hex() == "de93f669"
     assert run_mode_body(True).hex() == "0501"   # cmd 5 | _4, run-mode 1 = auto
     assert run_mode_body(False).hex() == "0500"
@@ -192,6 +197,9 @@ def test_device_clock_falls_back_to_host_time():
     assert abs(dev._device_utc_now() - now) <= 1
 
 
+DECK_STATUS_OFF = MESH + bytes.fromhex("420240") + bytes.fromhex("00000000000000")
+
+
 def test_status_idle_capture_means_auto_and_no_rain_delay():
     dev = _dev()
     dev.state.rain_delay_minutes = 60
@@ -203,8 +211,26 @@ def test_status_idle_capture_means_auto_and_no_rain_delay():
 
 def test_status_off_means_run_mode_off():
     dev = _dev()
-    dev._observe_plaintext(MESH + bytes.fromhex("420240") + bytes.fromhex("00ffffffff0000"))
+    dev._observe_plaintext(DECK_STATUS_OFF)
     assert dev.state.controller_mode == 0
+
+
+@pytest.mark.parametrize(("on", "stale"), [(False, DECK_STATUS_IDLE), (True, DECK_STATUS_OFF)])
+def test_stale_status_right_after_a_mode_write_does_not_flip_it(monkeypatch, on, stale):
+    # HW (Deck fw0085): device-status follows a set-run-mode ~2.5 s after the
+    # ack, so a status read inside MODE_STATUS_LAG_SEC still shows the old mode.
+    from orbit_bhyve.devices import ht25
+
+    clock = [1000.0]
+    monkeypatch.setattr(ht25.time, "monotonic", lambda: clock[0])
+    dev, _conn = _wired()
+    assert asyncio.run(dev.set_controller_mode(on)) is True
+    clock[0] += 2.0
+    dev._observe_plaintext(stale)
+    assert dev.state.controller_mode == (1 if on else 0)
+    clock[0] += ht25.MODE_STATUS_LAG_SEC
+    dev._observe_plaintext(stale)  # past the window the status wins again
+    assert dev.state.controller_mode == (0 if on else 1)
 
 
 def test_status_rain_delay_reads_minutes_left():
@@ -252,15 +278,15 @@ def test_short_last_water_cycle_is_ignored():
 
 # --- writes (frames decoded from the app's spec; not HW-verified) -----------
 
-def test_set_rain_delay_sends_both_messages_anchored_to_device_clock():
+def test_set_rain_delay_sends_end_time_anchored_to_device_clock():
     # Device clock deliberately ~5 months behind the host, as on main before
     # the clock fix: the end time must follow the device's clock.
     dev, conn = _wired(device_clock=0x69F693DE)
     before = datetime.now(timezone.utc)
     assert asyncio.run(dev.set_rain_delay(120)) is True
     assert conn.actuations == 1  # first write gets the fresh bind
-    assert conn.sent[0].hex() == "d7478a0a40201c0000"
-    end = conn.sent[1]
+    assert len(conn.sent) == 1  # msg 10 is rejected by fw0085; end time only
+    end = conn.sent[0]
     assert end[:5].hex() == "d747981840"
     assert abs(int.from_bytes(end[5:9], "little") - (0x69F693DE + 7200)) <= 1
     assert dev.state.rain_delay_minutes == 120
@@ -272,7 +298,7 @@ def test_set_rain_delay_sends_both_messages_anchored_to_device_clock():
 def test_rain_delay_unacked_is_not_confirmed():
     dev, conn = _wired(ack=False)
     assert asyncio.run(dev.set_rain_delay(60)) is False
-    assert len(conn.sent) == 2
+    assert len(conn.sent) == 1
     assert dev.state.rain_delay_minutes is None
 
 
@@ -281,7 +307,7 @@ def test_clear_rain_delay_writes_zeros():
     dev.state.rain_delay_minutes = 60
     dev.state.rain_delay_ends = datetime.now(timezone.utc) + timedelta(hours=1)
     assert asyncio.run(dev.set_rain_delay(0)) is True
-    assert [f.hex() for f in conn.sent] == ["d7478a0a4000000000", "d747981840" "00000000"]
+    assert [f.hex() for f in conn.sent] == ["d747981840" "00000000"]
     assert dev.state.rain_delay_minutes == 0
     assert dev.state.rain_delay_ends is None
 

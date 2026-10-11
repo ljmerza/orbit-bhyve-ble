@@ -95,11 +95,6 @@ def parse_last_water_cycle(body: bytes) -> MeshLastRun | None:
     )
 
 
-def rain_delay_body(delay_secs: int) -> bytes:
-    """rain-delay (msg 10): {delay-secs u32}. The app sends hours x 3600."""
-    return struct.pack("<I", delay_secs)
-
-
 def delay_end_body(epoch_secs: int) -> bytes:
     """watering-delay-end-time (msg 24): {delay-until-epoch-secs u32}."""
     return struct.pack("<I", epoch_secs)

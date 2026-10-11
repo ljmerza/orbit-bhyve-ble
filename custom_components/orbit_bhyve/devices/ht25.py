@@ -14,6 +14,7 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 import struct
+import time
 from collections.abc import Callable
 
 from bleak.exc import BleakError
@@ -27,7 +28,6 @@ from .mesh import (
     parse_device_info,
     parse_health_faults,
     parse_last_water_cycle,
-    rain_delay_body,
     run_mode_body,
 )
 from ..connection import BHyveBleConnection
@@ -55,22 +55,25 @@ TYPE_FLOW_SUBSCRIBE = 0x89
 # Mesh settings/diagnostics, decoded from the B-hyve app's mesh spec. The type
 # byte is really seq(6 bits) | command<<6 and the "seq" byte is the message id;
 # each write below uses its own seq so its write-ack (command 3, seq echoed) can
-# be matched. None of these writes is HW-verified.
+# be matched. HW-verified on fw0085 (Deck, 2026-10-11): the delay-end, run-mode
+# and button-run-time writes are acked. rain-delay (msg 10) is answered with
+# invalid-message (msg id 0xFFF), even to a read, so it isn't sent.
 MESH_CMD_READ = 0
 MESH_CMD_WRITE_ACK = 3
 SEQ_MANUAL_PRESET = 0x07   # button run time {run-time-secs u16}
-SEQ_RAIN_DELAY = 0x0A      # {delay-secs u32}
 SEQ_DELAY_END = 0x18       # watering-delay-end-time {delay-until-epoch-secs u32}
 TYPE_MANUAL_PRESET_WRITE = 0x87
 TYPE_MANUAL_PRESET_READ = 0x17
 TYPE_LAST_RUN_READ = 0x1C
-TYPE_RAIN_DELAY = 0x8A
 TYPE_DELAY_END = 0x98
 TYPE_RUN_MODE = 0xB8       # device-control set-run-mode, on SEQ_WATER_CTRL
 # device-status `status` (low nibble; the high nibble is padding for these).
 STATUS_OFF = 0x00
 STATUS_IDLE = 0x01
 STATUS_RAIN_DELAY = 0x03
+# device-status reflects a set-run-mode ~2-2.5 s after its ack (HW, Deck fw0085);
+# status read sooner still shows the old mode.
+MODE_STATUS_LAG_SEC = 5.0
 
 # The device stops sampling ~300 s after a subscribe regardless of the sample
 # count requested, so a long program needs the subscription renewed. 240 s
@@ -159,6 +162,8 @@ class BHyveHT25Device(BHyveBleDeviceBase):
     # (device UTC secs, host UTC secs) from the last utc-time ack — the clock the
     # device itself runs, which is what watering-delay-end-time is judged by.
     _clock_ref: tuple[int, float] | None = None
+    # time.monotonic() of the last acked set-run-mode; device-status lags it.
+    _mode_written_at: float | None = None
     # (seq, msg_id) of every write-ack seen; immutable so instances never share it.
     _write_acks: frozenset[tuple[int, int]] = frozenset()
 
@@ -682,15 +687,6 @@ class BHyveHT25Device(BHyveBleDeviceBase):
             if secs != self.manual_preset_sec:
                 self.manual_preset_sec = secs
                 changed = True
-        elif msg == SEQ_RAIN_DELAY and len(body) >= 4:
-            secs = int.from_bytes(body[0:4], "little")
-            minutes = secs // 60
-            if minutes != state.rain_delay_minutes:
-                state.rain_delay_minutes = minutes
-                state.rain_delay_ends = (
-                    datetime.now(timezone.utc) + timedelta(seconds=secs) if minutes else None
-                )
-                changed = True
         elif (
             msg == SEQ_WATER_CTRL
             and len(body) >= 2
@@ -704,13 +700,19 @@ class BHyveHT25Device(BHyveBleDeviceBase):
 
     def _apply_mesh_status_settings(self, body: bytes) -> bool:
         """Rain delay and run mode from a device-status body. The watering
-        variants stay with base._observe_plaintext. Off/idle -> run mode is
-        inferred from the status names (0 off, 1 idle), not HW-verified."""
+        variants stay with base._observe_plaintext. Status 0 is off and 1 (idle)
+        is auto: HW-verified on the Deck (fw0085, 2026-10-11), with status lagging
+        a set-run-mode by ~2.5 s, so for MODE_STATUS_LAG_SEC after an acked mode
+        write the status doesn't override the mode just written."""
         if not body:
             return False
         state = self.state
         before = (state.rain_delay_minutes, state.controller_mode)
         status = body[0]
+        mode_settled = (
+            self._mode_written_at is None
+            or time.monotonic() - self._mode_written_at >= MODE_STATUS_LAG_SEC
+        )
         if status == STATUS_RAIN_DELAY and len(body) >= 4:
             # {_4, delay-remaining-mins u24}
             minutes = int.from_bytes(body[1:4], "little")
@@ -722,8 +724,9 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         elif status == STATUS_IDLE:
             state.rain_delay_minutes = 0
             state.rain_delay_ends = None
-            state.controller_mode = 1
-        elif status == STATUS_OFF:
+            if mode_settled:
+                state.controller_mode = 1
+        elif status == STATUS_OFF and mode_settled:
             state.controller_mode = 0
         return (state.rain_delay_minutes, state.controller_mode) != before
 
@@ -746,6 +749,9 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         async with self._api_lock:
             acked = True
             try:
+                # Connect (running the init's utc-time write) before building
+                # anything, so the first frame already sees this session's clock.
+                await self.connection.ensure_connected()
                 n = 0
                 for i, build in enumerate(builders):
                     frame = build()
@@ -771,17 +777,17 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         return acked
 
     async def set_rain_delay(self, minutes: int) -> bool:
-        """Rain delay, the app's way: rain-delay {delay-secs} then
-        watering-delay-end-time {epoch}. The end time is anchored to the
-        device's clock, not the host's, so a timer whose clock is off still
-        gets the delay length asked for. Decoded from the app's mesh spec,
-        not HW-verified."""
+        """Rain delay via watering-delay-end-time {epoch}. The app also sends
+        rain-delay {delay-secs} first, but fw0085 rejects that message as
+        invalid; the end time alone sets the delay (device-status then reports
+        rain delay with the minutes left; HW-verified on the Deck, 2026-10-11).
+        The end time is anchored to the device's clock, not the host's, so a
+        timer whose clock is off still gets the delay length asked for."""
         if minutes <= 0:
             return await self.clear_rain_delay()
         secs = minutes * 60
         ok = await self._send_mesh_writes(
             f"rain_delay set {minutes}m",
-            lambda: self._build(TYPE_RAIN_DELAY, SEQ_RAIN_DELAY, rain_delay_body(secs)),
             lambda: self._build(
                 TYPE_DELAY_END, SEQ_DELAY_END, delay_end_body(self._device_utc_now() + secs)
             ),
@@ -792,11 +798,10 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         return ok
 
     async def clear_rain_delay(self) -> bool:
-        """Clear the rain delay: both messages written as 0. An end time of 0
-        is in the past on any clock. Not HW-verified."""
+        """Clear the rain delay: an end time of 0, in the past on any clock.
+        HW-verified on the Deck (device-status back to idle)."""
         ok = await self._send_mesh_writes(
             "rain_delay clear",
-            lambda: self._build(TYPE_RAIN_DELAY, SEQ_RAIN_DELAY, rain_delay_body(0)),
             lambda: self._build(TYPE_DELAY_END, SEQ_DELAY_END, delay_end_body(0)),
         )
         if ok:
@@ -806,18 +811,20 @@ class BHyveHT25Device(BHyveBleDeviceBase):
 
     async def set_controller_mode(self, on: bool) -> bool:
         """Automatic watering: device-control set-run-mode, 1 auto / 0 off.
-        Decoded from the app's mesh spec, not HW-verified."""
+        HW-verified on the Deck (2026-10-11): write-acked, and device-status
+        follows (0 off / 1 idle) about 2.5 s later."""
         ok = await self._send_mesh_writes(
             f"controller mode {'auto' if on else 'off'}",
             lambda: self._build(TYPE_RUN_MODE, SEQ_WATER_CTRL, run_mode_body(on)),
         )
         if ok:
             self.state.controller_mode = 1 if on else 0
+            self._mode_written_at = time.monotonic()
         return ok
 
     async def set_manual_preset_runtime(self, seconds: int) -> bool:
         """Run time the timer's physical button starts (manual-preset-run).
-        Decoded from the app's mesh spec, not HW-verified."""
+        HW-verified on the Deck: write-acked and read back (2026-10-11)."""
         body = manual_preset_body(seconds)
         ok = await self._send_mesh_writes(
             f"button run time {seconds}s",
