@@ -5,20 +5,20 @@ fw0041 (Hill) 2026-05-05 — same protocol, the 2-byte frame prefix is the
 device's own mesh_device_id in little-endian (Deck's old "D747_MAGIC"
 constant was just Deck's mesh_id 18391 = 0x47D7 LE).
 
-Firmware variants subclass this and override _rebind_sid_delta only.
+The bind/rebind init steps are the app's utc-time write (mesh message 5); they
+carry the real clock, not a session id.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from datetime import datetime, timedelta, timezone
 import struct
 
 from bleak.exc import BleakError
 
 from ..connection import BHyveBleConnection
-from .base import BHyveBleDeviceBase
+from .base import BHyveBleDeviceBase, ha_local_now
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -61,7 +61,17 @@ GEN1_HOLD_GRACE_SEC = 10
 
 INIT_INTER_STEP_SEC = 0.15
 
-BIND_TAIL = bytes.fromhex("f66910ff")
+
+def clock_payload(now: datetime) -> bytes:
+    """utc-time body sent by bind/rebind: {utc_secs u32 LE, local_offset_mins i16 LE}.
+
+    This is the app's set-date-time. The old "sid + f6 69 10 ff" was a captured
+    clock write with the low 16 bits randomized, which set the timer ~5 months
+    back with a fixed EDT offset (HW-verified on fw0041 and fw0085, 2026-10-11)."""
+    off = now.utcoffset()
+    offset_mins = int(off.total_seconds()) // 60 if off is not None else 0
+    return struct.pack("<Ih", int(now.timestamp()), offset_mins)
+
 
 def parse_hub_mesh_overrides(raw: str) -> dict[str, int]:
     """Parse the `hub_mesh_overrides` option into {MAC: hub_mesh_id}.
@@ -106,11 +116,6 @@ class BHyveHT25Device(BHyveBleDeviceBase):
     frame_magic = 0x10
     trailer_const = 0x10
     has_flow_gen1 = True
-
-    # Session-id increment between the `bind` and `rebind` init steps.
-    # fw0041 (Hill) confirmed +2 via BTSnoop 2026-05-05. Firmware variants
-    # override this attribute in a subclass rather than branching in code.
-    _rebind_sid_delta: int = 2
 
     # Duration/zone of the most recent START we sent, stashed so the device's
     # async START-ack (f60d) can arm the off-timer even when the BLE
@@ -239,27 +244,26 @@ class BHyveHT25Device(BHyveBleDeviceBase):
             self.mac, self.mesh_address.hex(), self.hub_mesh_address.hex(),
         )
 
-        sid = os.urandom(2)
-        # Rebind reuses the session id incremented by a firmware-specific delta
-        # (fw0041=+2; see _rebind_sid_delta / subclasses).
-        sid2 = ((int.from_bytes(sid, "little") + self._rebind_sid_delta) & 0xFFFF).to_bytes(2, "little")
-
         # magic1 payload: 0x01 || self mesh_id LE || 4 zero bytes
         # magic2 payload: 0x00 || hub  mesh_id LE || 4 zero bytes
         magic1_payload = b"\x01" + self.mesh_address + b"\x00\x00\x00\x00"
         magic2_payload = b"\x00" + self.hub_mesh_address + b"\x00\x00\x00\x00"
 
-        steps: list[tuple[bytes, str]] = [
-            (self._build(0x81, SEQ_BIND, sid + BIND_TAIL), "bind"),
-            (self._build(0x02, SEQ_STATUS, b"\x00"), "status"),
-            (self._build(0x03, SEQ_INFO, b"\x00" * 7), "info"),
-            (self._build(0x04, SEQ_SUBSYSTEM, b"\x00" * 3), "subsystem"),
-            (self._build(0x85, SEQ_MAGIC_CHECK, magic1_payload), "magic1"),
-            (self._build(0x85, SEQ_MAGIC_CHECK, magic2_payload), "magic2"),
-            (self._build(0x85, SEQ_HEARTBEAT, b"\x00"), "heartbeat"),
-            (self._build(0x86, SEQ_BIND, sid2 + BIND_TAIL), "rebind"),
+        # A None payload is a clock write (bind/rebind), stamped as it's sent.
+        steps: list[tuple[int, int, bytes | None, str]] = [
+            (0x81, SEQ_BIND, None, "bind"),
+            (0x02, SEQ_STATUS, b"\x00", "status"),
+            (0x03, SEQ_INFO, b"\x00" * 7, "info"),
+            (0x04, SEQ_SUBSYSTEM, b"\x00" * 3, "subsystem"),
+            (0x85, SEQ_MAGIC_CHECK, magic1_payload, "magic1"),
+            (0x85, SEQ_MAGIC_CHECK, magic2_payload, "magic2"),
+            (0x85, SEQ_HEARTBEAT, b"\x00", "heartbeat"),
+            (0x86, SEQ_BIND, None, "rebind"),
         ]
-        for plaintext, label in steps:
+        for type_byte, seq, payload, label in steps:
+            if payload is None:
+                payload = clock_payload(ha_local_now())
+            plaintext = self._build(type_byte, seq, payload)
             _LOGGER.debug("%s: init → %s pt=%s", self.mac, label, plaintext.hex())
             # _write_locked, not send_raw — we're already inside conn's lock
             # (post-handshake hook runs from _open() called by send()).

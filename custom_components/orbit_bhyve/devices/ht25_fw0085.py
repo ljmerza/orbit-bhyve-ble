@@ -5,8 +5,9 @@ timer mesh_id (0x47D7 → on-wire prefix "d747") into every frame, so the timer'
 application parser silently dropped commands whose prefix didn't match its own
 id — while the BLE link layer still ack'd every write, masking the fault during
 init. That fix already lives in ht25.BHyveHT25Device (dynamic per-device
-mesh_address). This class now INHERITS that single source of truth and overrides
-only the one value that is claimed to differ for fw0085.
+mesh_address). This class now INHERITS that single source of truth. Its one
+override, a rebind "sid delta" of 3, was dropped once bind/rebind were found to
+be clock writes (2026-10-11); the class is kept so routing and tests stay put.
 """
 from __future__ import annotations
 
@@ -17,8 +18,3 @@ class BHyveHT25Fw0085Device(BHyveHT25Device):
     """HT25 single-station timer, firmware 0085.
     Identical to the base HT25 protocol in every frame, payload, and opcode.
     """
-
-    # Base = 2 (fw0041 Hill, BTSnoop-confirmed). 3 retained from the legacy
-    # fw0085 path purely to minimise change from the deployed version — NOT
-    # confirmed. Flip to 2 if START is dropped. See module docstring.
-    _rebind_sid_delta = 3

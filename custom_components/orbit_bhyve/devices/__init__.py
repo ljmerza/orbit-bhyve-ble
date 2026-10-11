@@ -52,8 +52,8 @@ def resolve_device_class(*, hardware: str, firmware: str, type_: str) -> type[BH
             # it stops via offMode and enforces durations from the host.
             return BHyveHT25ADevice
         if (hardware or "").endswith("-0000"):
-            # fw0085 keeps upstream's thin subclass (retains
-            # _rebind_sid_delta=3, community-verified); fw0041 and any other
+            # fw0085 keeps upstream's thin subclass (no overrides left);
+            # fw0041 and any other
             # fw use the parameterized base, which builds frames from the
             # device's own mesh_device_id (not a hardcoded identity).
             if firmware == "0085":
