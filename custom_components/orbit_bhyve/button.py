@@ -1,7 +1,7 @@
 """Button platform — per-device sync button.
 
 One ButtonEntity per non-hub device. Pressing it forces a fresh BLE
-connect + 8-step init, then requests a coordinator refresh — which for
+connect + 7-step init, then requests a coordinator refresh — which for
 protobuf devices issues a solicited #15 status read (real run-state,
 battery, rain-delay, seconds-remaining), the reliable way to pull live
 state on demand (e.g. to see a program run the poll hasn't caught yet).

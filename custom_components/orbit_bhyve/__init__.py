@@ -445,7 +445,7 @@ def _register_services(hass: HomeAssistant) -> None:
     )
 
     async def probe_status(call: ServiceCall) -> None:
-        """Force a fresh BLE connect + 8-step init on the named device, no
+        """Force a fresh BLE connect + 7-step init on the named device, no
         actuation. connection._on_notify already decrypts and logs every
         plaintext at INFO, so the captured init responses land in
         `docker logs hass`. Used to gather data for offline byte-by-byte
