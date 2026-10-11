@@ -150,6 +150,13 @@
       },
       "last_run_water_used": {
         "name": "Last run water used"
+      },
+      "rain_sensor": {
+        "state": {
+          "disabled": "Disabled",
+          "not_raining": "Not raining",
+          "raining": "Raining"
+        }
       }
     },
     "number": {

@@ -25,6 +25,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
 from .coordinator import BHyveDeviceCoordinator
 from .devices import BHyveHubDevice
+from .devices.base import PROGRAM_SLOTS, UI_SLOTS
 from .devices.protobuf import BHyveProtobufDevice
 from .firmware import recovery_supported
 from .recovery import async_start_recovery
@@ -54,6 +55,14 @@ async def async_setup_entry(
         # but harmless, so expose it on the whole family for a consistent card.
         if isinstance(coord.device, BHyveProtobufDevice):
             entities.append(BHyveIdentifyButton(coord))
+            # Run a stored program now, one button per app-visible slot; each is
+            # only available while its slot holds a program (like the Program
+            # A-D switches).
+            for letter in UI_SLOTS:
+                entities.append(BHyveRunProgramButton(coord, letter))
+            # Skip only means something with a next zone to move to.
+            if coord.device.stations > 1:
+                entities.append(BHyveSkipZoneButton(coord))
         # Bootloader recovery is only verified on HT25-0000 (see firmware.py).
         if recovery_supported(coord.device.hardware):
             entities.append(BHyveRecoverFirmwareButton(coord, entry))
@@ -186,3 +195,73 @@ class BHyveRecoverFirmwareButton(CoordinatorEntity[BHyveDeviceCoordinator], Butt
     async def async_press(self) -> None:
         _LOGGER.info("%s: firmware recovery requested via button", self.coordinator.device.mac)
         async_start_recovery(self.hass, self._entry, self.coordinator)
+
+
+class BHyveRunProgramButton(CoordinatorEntity[BHyveDeviceCoordinator], ButtonEntity):
+    """Run one stored program (A-D) now: #14 manualMode with the program's
+    activeProgramFlags bit, the app's "water program". Available only while the
+    slot holds a program, which the idle-poll #10 sync read reports. The write
+    is not hardware-verified (see protobuf._build_run_program_pb)."""
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:play-circle-outline"
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator, letter: str):
+        super().__init__(coordinator)
+        device = coordinator.device
+        self._letter = letter
+        self._slot = PROGRAM_SLOTS[letter]
+        self._attr_unique_id = f"{device.unique_id}_run_program_{letter.lower()}"
+        self._attr_name = f"Run program {letter}"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, device.cloud_id)},
+            "name": device.name,
+            "manufacturer": "Orbit Irrigation",
+            "model": device.hardware,
+            "sw_version": device.firmware,
+            "connections": {("mac", device.mac)} if device.mac else set(),
+        }
+
+    @property
+    def available(self) -> bool:
+        state = self.coordinator.data or self.coordinator.device.state
+        summary = state.programs.get(self._slot)
+        return super().available and summary is not None and not summary.empty
+
+    async def async_press(self) -> None:
+        _LOGGER.info("%s: run program %s requested via button", self.coordinator.device.mac, self._letter)
+        ok = await self.coordinator.device.run_program(self._slot)
+        await self.coordinator.async_confirm_write(ok, f"Run program {self._letter}")
+
+
+class BHyveSkipZoneButton(CoordinatorEntity[BHyveDeviceCoordinator], ButtonEntity):
+    """Skip the zone that is watering now and move on to the next (#21
+    skipCurrentStation, the app's watering-screen skip). Multi-station units
+    only; available while watering. The write is not hardware-verified."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Skip zone"
+    _attr_icon = "mdi:skip-next"
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        device = coordinator.device
+        self._attr_unique_id = f"{device.unique_id}_skip_zone"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, device.cloud_id)},
+            "name": device.name,
+            "manufacturer": "Orbit Irrigation",
+            "model": device.hardware,
+            "sw_version": device.firmware,
+            "connections": {("mac", device.mac)} if device.mac else set(),
+        }
+
+    @property
+    def available(self) -> bool:
+        state = self.coordinator.data or self.coordinator.device.state
+        return super().available and bool(state.is_watering)
+
+    async def async_press(self) -> None:
+        _LOGGER.info("%s: skip zone requested via button", self.coordinator.device.mac)
+        ok = await self.coordinator.device.skip_current_station()
+        await self.coordinator.async_confirm_write(ok, "Skip zone")

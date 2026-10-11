@@ -415,8 +415,17 @@ def test_flow_subscribe_pb_round_trips_and_matches_capture():
     frame = pb._build_message(pb._FLOW_SUBSCRIBE_PB)
     assert rx.decode_inner(frame) == pb._FLOW_SUBSCRIBE_PB
     sub = rx.pb_parse(rx._pb_field(rx.pb_parse(pb._FLOW_SUBSCRIBE_PB), 57))
-    assert rx._pb_field(sub, 1) == 1000   # intervalMs (app capture)
-    assert rx._pb_field(sub, 2) == 2      # type (app capture)
+    assert rx._pb_field(sub, 1) == 1000   # sendDataIntervalMilliSec (app capture)
+    assert rx._pb_field(sub, 2) == 10     # sendDataDurationSec: covers read_flow's ~4.8 s window
+
+
+def test_flow_subscribe_and_unsubscribe_byte_refs():
+    # #57 #2 is sendDataDurationSec (app schema). Subscribe streams for 10 s;
+    # the unsubscribe keeps interval 0 (the HW-verified cancel) unchanged.
+    assert pb._FLOW_SUBSCRIBE_PB == bytes.fromhex("ca030508e807100a")
+    assert pb._FLOW_UNSUBSCRIBE_PB == bytes.fromhex("ca030408001002")
+    unsub = rx.pb_parse(rx._pb_field(rx.pb_parse(pb._FLOW_UNSUBSCRIBE_PB), 57))
+    assert rx._pb_field(unsub, 1) == 0
 
 
 def test_read_flow_noop_on_flowless_device():

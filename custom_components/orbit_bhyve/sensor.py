@@ -28,6 +28,7 @@ from homeassistant.const import (
 )
 
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -42,6 +43,7 @@ from .devices.base import (
 )
 from .devices import BHyveHT25Device
 from .devices.protobuf import BHyveProtobufDevice
+from .devices.status import RAIN_SENSOR_STATES, app_flow_gpm, flow_gallons
 
 _WEEKDAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
@@ -92,6 +94,12 @@ async def async_setup_entry(
             entities.append(BHyveNextRunSensor(coord))
             for letter in UI_SLOTS:
                 entities.append(BHyveProgramSummarySensor(coord, letter))
+            # Device-reported versions (#23 DeviceInfo, read about daily).
+            entities.append(BHyveFirmwareVersionSensor(coord))
+            # Device's own battery gauge (#16.#14.#2/#4), beside the mV-derived one.
+            entities.append(BHyveDeviceBatterySensor(coord))
+            # Rain sensor (#16.#17): only once the device reports one.
+            _add_rain_sensor_when_reported(hass, entry, coord, async_add_entities)
         # Flow-rate gauge only for models with a flow sensor (Gen2, not the XD).
         if getattr(device, "has_flow", False):
             entities.append(BHyveFlowRateSensor(coord))
@@ -307,11 +315,16 @@ class BHyveWaterUsedSensor(_RestoreLastValueSensor):
 
 
 class BHyveDeviceFlowRateSensor(_BHyveDeviceSensorBase):
-    """The device's own #59.#4 currentFlowRateGpm float (Gen2).
+    """Flow rate the way the B-hyve app computes it (Gen2): the device's own
+    #59.#4 currentFlowRateGpm when populated, otherwise the app's linear fit
+    from the #59.#1 frequency (status.app_flow_gpm).
 
-    Named in the vendor schema but never yet observed populated on fw0111 —
-    disabled by default purely to gather field confirmation. If reports show
-    it live, a later release can prefer it over the slope-derived Flow rate.
+    #59.#4 has never been observed populated on fw0111 and the Hz fit is from
+    static analysis of the app, so this stays disabled by default as a
+    comparison against the slope-derived Flow rate. The `source` attribute
+    says which input produced the value; `cycle_volume_gal` is the device's
+    #59.#5 gallons, else #59.#3 ticks over the Flow calibration. That counter
+    only advances while subscribed, so the volume undercounts a whole run.
     """
 
     _attr_device_class = SensorDeviceClass.VOLUME_FLOW_RATE
@@ -330,7 +343,26 @@ class BHyveDeviceFlowRateSensor(_BHyveDeviceSensorBase):
     @property
     def native_value(self) -> float | None:
         state = self.coordinator.data or self.coordinator.device.state
-        return state.flow_gpm_device
+        return app_flow_gpm(state.flow_gpm_device, state.flow_hz)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        state = self.coordinator.data or self.coordinator.device.state
+        if state.flow_gpm_device is not None:
+            source = "reported"
+        elif state.flow_hz is not None:
+            source = "frequency"
+        else:
+            source = None
+        return {
+            "source": source,
+            "frequency_hz": state.flow_hz,
+            "cycle_volume_gal": flow_gallons(
+                state.flow_volume_gal,
+                state.flow_total,
+                getattr(self.coordinator.device, "flow_counts_per_gallon", None),
+            ),
+        }
 
 
 class BHyveRainDelayEndsSensor(_BHyveDeviceSensorBase):
@@ -676,3 +708,124 @@ class BHyveLastRunWaterSensor(_RestoreLastValueSensor):
             "program": "manual" if run.program == 0 else "ABCDEFG"[run.program - 1],
             "water_volume_ticks": run.water_volume_ticks,
         }
+
+
+class BHyveFirmwareVersionSensor(_BHyveDeviceSensorBase):
+    """Firmware version the device itself reports (#23 DeviceInfo.fwVersion),
+    with the hardware, bootloader and BLE versions and station count as
+    attributes. Read on an idle poll soon after startup, then about daily;
+    `unknown` until the first reply. Not hardware-verified (app schema)."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:chip"
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        device = coordinator.device
+        self._attr_unique_id = f"{device.unique_id}_firmware_version"
+        self._attr_name = "Firmware version"
+
+    @property
+    def native_value(self) -> str | None:
+        state = self.coordinator.data or self.coordinator.device.state
+        info = state.device_info
+        return info.fw_version if info is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        state = self.coordinator.data or self.coordinator.device.state
+        info = state.device_info
+        if info is None:
+            return {}
+        return {
+            "hardware_version": info.hw_version,
+            "bootloader_version": info.bootloader_version,
+            "ble_app_version": info.ble_app_version,
+            "ble_bootloader_version": info.ble_bootloader_version,
+            "stations": info.num_stations,
+            "read_at": state.device_info_at.isoformat() if state.device_info_at else None,
+        }
+
+
+class BHyveDeviceBatterySensor(_BHyveDeviceSensorBase):
+    """The device's own battery percent (#16.#14.#2 batteryLevelPercent), with
+    #16.#14.#4 externallyPowered as an attribute. The Battery sensor keeps the
+    chemistry-aware mV gauge; this one is disabled by default as a comparison.
+    App schema fields, not yet observed populated."""
+
+    _attr_device_class = SensorDeviceClass.BATTERY
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        device = coordinator.device
+        self._attr_unique_id = f"{device.unique_id}_battery_device"
+        self._attr_name = "Battery (device reported)"
+
+    @property
+    def native_value(self) -> int | None:
+        state = self.coordinator.data or self.coordinator.device.state
+        return state.battery_pct_device
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        state = self.coordinator.data or self.coordinator.device.state
+        return {"externally_powered": state.externally_powered}
+
+
+class BHyveRainSensorStatusSensor(_BHyveDeviceSensorBase):
+    """Rain sensor status from #16.#17: disabled / not raining / raining. Only
+    created once the device reports a rain sensor (see
+    _add_rain_sensor_when_reported). App schema field, not yet observed."""
+
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = list(RAIN_SENSOR_STATES.values())
+    _attr_translation_key = "rain_sensor"
+    _attr_icon = "mdi:weather-pouring"
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        device = coordinator.device
+        self._attr_unique_id = f"{device.unique_id}_rain_sensor"
+        self._attr_name = "Rain sensor"
+
+    @property
+    def native_value(self) -> str | None:
+        state = self.coordinator.data or self.coordinator.device.state
+        return state.rain_sensor
+
+
+def _add_rain_sensor_when_reported(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    coord: BHyveDeviceCoordinator,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Add the Rain sensor entity once the device reports a rain sensor; most
+    timers never do, so it isn't created up front. One created in an earlier run
+    is in the entity registry and is re-added at startup straight away, rather
+    than sitting orphaned until the first poll."""
+    unique_id = f"{coord.device.unique_id}_rain_sensor"
+    if coord.device.state.rain_sensor is not None or er.async_get(hass).async_get_entity_id(
+        "sensor", DOMAIN, unique_id
+    ):
+        async_add_entities([BHyveRainSensorStatusSensor(coord)])
+        return
+
+    remove = None
+
+    @callback
+    def _on_update() -> None:
+        nonlocal remove
+        state = coord.data or coord.device.state
+        if remove is None or state.rain_sensor is None:
+            return
+        remove()
+        remove = None
+        async_add_entities([BHyveRainSensorStatusSensor(coord)])
+
+    remove = coord.async_add_listener(_on_update)
+    entry.async_on_unload(lambda: remove() if remove is not None else None)
