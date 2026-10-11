@@ -108,12 +108,15 @@ _STOP_PB = bytes.fromhex("720408021200")
 # (no #16), so without this poll a healthy stop can never be confirmed.
 _REQUEST_STATUS_PB = bytes.fromhex("7a00")
 
-# #57 { #1=1000 (intervalMs); #2=2 } — flow-sensor subscribe. The device then
-# streams periodic #59 { #1=flow-active, #3=cumulative } frames that
-# apply_status_plaintext folds into state.flow_total. Byte-identical to the app's
-# flow-screen subscribe (Gen2 capture). Gen2-only in the captures; gated by
-# has_flow so we don't poke a flow-less XD.
-_FLOW_SUBSCRIBE_PB = bytes.fromhex("ca030508e8071002")
+# #57 EnableFlowSensorData { #1 sendDataIntervalMilliSec=1000; #2 sendDataDurationSec=10 }
+# — flow-sensor subscribe. The device then streams periodic #59 { #1=flow-active,
+# #3=cumulative } frames that apply_status_plaintext folds into state.flow_total.
+# Gen2-only in the captures; gated by has_flow so we don't poke a flow-less XD.
+# #2 is a DURATION in seconds (app schema), not a mode: the old capture value 2
+# asked for 2 s of streaming while read_flow samples for ~4.8 s. 10 s covers the
+# sampling window with margin; the unsubscribe below still ends it early. The
+# value 10 is not hardware-verified (the frame shape is).
+_FLOW_SUBSCRIBE_PB = bytes.fromhex("ca030508e807100a")
 
 # #57 { #1=0 (intervalMs=0); #2=2 } — flow UNSUBSCRIBE. A subscribe leaves the
 # device streaming #59 continuously (it persists across reconnects), which starves
