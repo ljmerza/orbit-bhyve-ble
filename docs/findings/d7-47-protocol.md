@@ -97,8 +97,8 @@ Implemented per-device in `custom_components/orbit_bhyve/devices/ht25.py`:
 - `_build_start` / `_build_stop` build the two watering commands on top of
   `_build`.
 
-The device also carries a **hub** mesh address, used only inside the "magic
-check" init payloads (below). It resolves per network key; two topologies were
+The device also carries a **hub** mesh address, used only inside the
+configure-device init payloads (below; historically called "magic check"). It resolves per network key; two topologies were
 observed with distinct hub mesh ids (shown here generically as
 `<hub-mesh-addr>`).
 
@@ -112,19 +112,18 @@ session; match requests to responses by `seq`.
 
 | seq  | name          | dir | payload (hex)                     | meaning                                                    |
 |------|---------------|-----|-----------------------------------|------------------------------------------------------------|
-| `05` | BIND          | TX  | `<sid:2> f6 69 10 ff`             | Bind session to the timer                                  |
-| `05` | BIND          | RX  | `<sid:2> f6 69 10 ff <status>`    | Bind ack; echoes the session id, trailing byte varies by fw |
+| `05` | UTC_TIME      | TX  | `<utc_secs_LE:4> <tz_mins_LE:2>`  | Set the timer clock: UTC seconds + signed local offset in minutes (`10 ff` = −240 = EDT). HW-confirmed 2026-10-11 |
+| `05` | UTC_TIME      | RX  | echo + `<status>`                 | Write-ack; trailing byte varies by fw                      |
 | `02` | STATUS        | TX  | `00`                              | Status request                                             |
 | `02` | STATUS        | RX  | `01 ffffffff 0000` (idle)         | See [status / is_watering](#status--is_watering-decode)    |
-| `03` | INFO          | TX  | `00 00 00 00 00 00 00`            | Device-info request                                        |
-| `03` | INFO          | RX  | `<sid:2> f6 69 <mv_LE:2> 00`      | Device info — **payload bytes 4-5 = battery_mV (LE)**      |
-| `01` | SUBSYSTEM     | TX  | `00 00 00`                        | Subsystem init                                             |
-| `01` | SUBSYSTEM     | RX  | `00 <fw> 00 01 00 00 00`          | byte 1 = **firmware version as a decimal byte**            |
-| `00` | MAGIC_CHECK   | TX  | `01 <mesh-addr> 00 00 00 00`      | Self mesh-address ping                                     |
-| `00` | MAGIC_CHECK   | TX  | `00 <hub-mesh-addr> 00 00 00 00`  | Hub mesh-address ping                                      |
-| `00` | MAGIC_CHECK   | RX  | (echoes both of the above)        |                                                            |
-| `09` | HEARTBEAT     | TX  | `00`                              | Heartbeat                                                  |
-| `09` | HEARTBEAT     | RX  | `00 00 00 00 7f <b5> 7c`          | byte 5 tracks firmware (see notes); last byte `7c` constant |
+| `03` | DEVICE_HEALTH | TX  | `00 00 00 00 00 00 00`            | Device-health read                                         |
+| `03` | DEVICE_HEALTH | RX  | `<local_secs_LE:4> <mv_LE:2> <flags>` | Device's local clock, **battery_mV (LE)**, then flag bits boost-circuit / valve-on-no-flow / valve-off-flow |
+| `01` | DEVICE_INFO   | TX  | `00 00 00`                        | Device-info read                                           |
+| `01` | DEVICE_INFO   | RX  | `<type/hw> <fw_LE:2> <stations>`  | `00 55 00 01` = hose tap, hw 0, **fw 85**, 1 station       |
+| `00` | CONFIGURE_DEVICE | TX | `01 <mesh-addr> 00 00 00 00`    | Write set-mesh-device-id (not a ping)                      |
+| `00` | CONFIGURE_DEVICE | TX | `00 <hub-mesh-addr> 00 00 00 00` | Write set-server-bridge-id (not a ping)                   |
+| `00` | CONFIGURE_DEVICE | RX | (echoes both of the above)      | Write-acks                                                 |
+| `09` | ACTIVE_PROGRAMS | TX | `00`                             | Write the enabled-program bitmap (A–G); `00` disables every stored program. **Not sent by this integration** |
 | `0d` | WATER_CTRL    | TX  | `04 <dur_LE:2> 00 00 00 00`       | **Start watering — confirmed by labelled capture**        |
 | `0d` | WATER_CTRL    | TX  | `02 00 00 00`                     | Stop / cancel                                              |
 | `0d` | WATER_CTRL    | RX  | echo with `0x40` reply bit set    | Ack; start-ack echoes the accepted `04 <dur_LE> …`        |
@@ -160,29 +159,33 @@ STATUS response, so a started run reports back the duration it accepted.
 
 ---
 
-## Init-response sequence (8 steps)
+## Init sequence (7 steps)
 
-The device is driven through a fixed 8-step handshake before it will accept a
+The device is driven through a fixed 7-step handshake before it will accept a
 watering command. Each step is a TX frame; the device replies with a matching
 frame carrying the `0x40` reply bit. In this repo the sequence is
 `BHyveHT25Device._post_handshake` in `devices/ht25.py`, written via
 `connection._write_locked` (never `send()` from inside the hook — the connection
 lock is already held).
 
-The reply payloads, after the `<mesh-addr> [type] [seq] 40` header. `<sid>` is a
-per-session id echoed back; it is random-ish and increments across the two bind
-steps.
+The reply payloads, after the `<mesh-addr> [type] [seq] 40` header. The step
+labels are the ones this repo logs. What was once read as a per-session "sid" is
+the low 16 bits of the timer's clock: bind and rebind are utc-time writes, and
+info returns the device's local time.
 
 | Step        | seq  | reply payload (fw0085 example)   | notes                                                                 |
 |-------------|------|----------------------------------|----------------------------------------------------------------------|
-| bind        | `05` | `<sid> f6 69 10 ff 00`           | echoes session id; trailing byte differs by firmware (`00` vs `ff`)  |
+| bind        | `05` | `<utc_secs:4> <tz_mins:2> 00`    | utc-time write-ack; trailing byte differs by firmware (`00` vs `ff`)  |
 | status      | `02` | `01 ffffffff 0000`               | idle baseline — identical across all devices, no per-device data      |
-| info        | `03` | `<sid> f6 69 <mv_LE> 00`         | **battery_mV in payload bytes 4-5**; bytes 0-1 vary per session       |
-| subsystem   | `01` | `00 55 00 01 00 00 00`           | **byte 1 = firmware version** (`0x55`=85 → fw0085)                    |
-| magic1      | `00` | echoes `01 <mesh-addr> 00000000` | self-address ping                                                    |
-| magic2      | `00` | echoes `00 <hub-mesh-addr> 0…`   | hub-address ping; hub mesh id varies by network topology             |
-| heartbeat   | `09` | `0000 00 7f fb 7c`               | byte 5 (`fb`) tracks firmware; last byte `7c` constant                |
-| rebind      | `05` | `<sid+n> f6 69 10 ff 00`         | re-issues bind with an incremented sid (increment differs by fw)      |
+| info        | `03` | `<local_secs:4> <mv_LE> <flags>` | device-health: local clock, **battery_mV in payload bytes 4-5**       |
+| subsystem   | `01` | `00 55 00 01 00 00 00`           | device-info: **fw version u16 LE in bytes 1-2** (`0x55`=85 → fw0085), 1 station |
+| magic1      | `00` | echoes `01 <mesh-addr> 00000000` | configure-device write-ack: set-mesh-device-id                        |
+| magic2      | `00` | echoes `00 <hub-mesh-addr> 0…`   | configure-device write-ack: set-server-bridge-id; hub mesh id varies by network topology |
+| rebind      | `05` | `<utc_secs:4> <tz_mins:2> 00`    | utc-time written again; the value moves only because the clock advanced |
+
+The phone also sends `85/09 00` ("heartbeat") before rebind. That writes
+active-programs = 0, disabling every program stored on the timer, so this
+integration omits it.
 
 After the rebind ack the device emits **spontaneous pushes** unprompted (count
 varies per connection). On fw0041 devices these pushes are byte-for-byte
@@ -190,9 +193,9 @@ identical to the subsystem ack (`00 29 00 01 00 00 00`) — a "current
 device-state snapshot" broadcast rather than new information.
 
 Firmware differences observed between an fw0085 device and two fw0041 devices:
-the bind trailing byte (`00` vs `ff`), the sid increment on rebind, the
-subsystem firmware byte (`0x55` vs `0x29`), and heartbeat byte 5 (`0xfb` vs
-`0x95`). All are firmware-stable, none are battery.
+the bind trailing byte (`00` vs `ff`), the subsystem firmware byte (`0x55` vs
+`0x29`), and the constant trailing bytes on every reply (`7f fb 7c` vs
+`7f 95 7c`, likely buffer filler). All are firmware-stable, none are battery.
 
 ---
 
@@ -301,7 +304,7 @@ Confirmed on both firmwares (fw0085 and fw0041).
 
 ## Firmware version is a decimal byte
 
-The SUBSYSTEM ack (`seq=0x01`) carries the firmware version in **payload byte 1,
+The DEVICE_INFO ack (`seq=0x01`, logged as "subsystem") carries the firmware version in **payload byte 1,
 as a plain decimal byte** (not hex-coded, not ASCII):
 
 ```
@@ -313,12 +316,12 @@ Confirmed stable across repeat probes of the same device and consistent across
 three devices. Two other bytes track firmware and are explicitly **not** battery
 or any per-device varying property:
 
-- **Subsystem byte 1** — firmware version (above).
-- **Heartbeat byte 5** — `0xfb` (=251) on fw0085, `0x95` (=149) on fw0041. Exact
-  meaning unknown, but constant within a firmware.
+- **Device-info byte 1** — firmware version (above).
+- **Reply trailing bytes** — `7f fb 7c` on fw0085, `7f 95 7c` on fw0041, after
+  the body of every reply. Likely buffer filler; constant within a firmware.
 
-Everything that genuinely varies session-to-session (bind/rebind sid bytes, INFO
-bytes 0-1) is a session-derived counter, not a device property. The only
+Everything that genuinely varies session-to-session (bind/rebind and INFO bytes
+0-3) is the timer's clock, not a device property. The only
 per-device fields that are both stable across probes and meaningful are the
 firmware byte and the battery voltage.
 
