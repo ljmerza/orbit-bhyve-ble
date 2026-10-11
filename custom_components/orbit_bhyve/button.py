@@ -26,6 +26,8 @@ from .const import DOMAIN
 from .coordinator import BHyveDeviceCoordinator
 from .devices import BHyveHubDevice
 from .devices.protobuf import BHyveProtobufDevice
+from .firmware import recovery_supported
+from .recovery import async_start_recovery
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -52,6 +54,9 @@ async def async_setup_entry(
         # but harmless, so expose it on the whole family for a consistent card.
         if isinstance(coord.device, BHyveProtobufDevice):
             entities.append(BHyveIdentifyButton(coord))
+        # Bootloader recovery is only verified on HT25-0000 (see firmware.py).
+        if recovery_supported(coord.device.hardware):
+            entities.append(BHyveRecoverFirmwareButton(coord, entry))
     async_add_entities(entities)
 
 
@@ -150,3 +155,34 @@ class BHyveIdentifyButton(CoordinatorEntity[BHyveDeviceCoordinator], ButtonEntit
             return
         _LOGGER.info("%s: identify requested via button", device.mac)
         await device.identify()
+
+
+class BHyveRecoverFirmwareButton(CoordinatorEntity[BHyveDeviceCoordinator], ButtonEntity):
+    """Re-send the official firmware to a timer stuck in its bootloader.
+
+    Runs in the background with progress in a persistent notification. Refuses
+    any timer that isn't in its bootloader, so pressing it on a working one only
+    costs a connect. See recovery.py and docs/firmware-recovery.md."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Recover firmware"
+    _attr_icon = "mdi:restore-alert"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator, entry: ConfigEntry):
+        super().__init__(coordinator)
+        self._entry = entry
+        device = coordinator.device
+        self._attr_unique_id = f"{device.unique_id}_recover_firmware"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, device.cloud_id)},
+            "name": device.name,
+            "manufacturer": "Orbit Irrigation",
+            "model": device.hardware,
+            "sw_version": device.firmware,
+            "connections": {("mac", device.mac)} if device.mac else set(),
+        }
+
+    async def async_press(self) -> None:
+        _LOGGER.info("%s: firmware recovery requested via button", self.coordinator.device.mac)
+        async_start_recovery(self.hass, self._entry, self.coordinator)

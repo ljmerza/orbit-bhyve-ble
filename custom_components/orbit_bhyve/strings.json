@@ -92,6 +92,14 @@
         "config_entry_id": {"name": "Account", "description": "Which B-Hyve account to refresh. Omit to refresh every configured account."}
       }
     },
+    "recover_firmware": {
+      "name": "Recover firmware (HT25-0000)",
+      "description": "Re-send the official firmware to an HT25-0000 hose timer stuck in its bootloader (blinking white) after a failed update. Works on a timer that is no longer on your account. Refuses any timer that is not in its bootloader, and only sends an image matching a known-good hash. Runs in the background; progress appears as a notification. Only verified on HT25-0000 with fw0085.",
+      "fields": {
+        "address": {"name": "Bluetooth address", "description": "The stuck timer's MAC address."},
+        "config_entry_id": {"name": "Account", "description": "Which saved B-Hyve login downloads the firmware. Omit to use the first one."}
+      }
+    },
     "set_program": {
       "name": "Set watering program",
       "description": "Create or replace a watering program (slots A–D) on a B-Hyve valve (HT34A / HT25G2).",

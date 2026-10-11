@@ -135,6 +135,35 @@ class OrbitCloudClient:
             f"returned 200 (last status: {last_status})"
         )
 
+    async def get_firmware_update(self, hardware_version: str) -> Any:
+        """Firmware metadata + a temporary download URL (the app's OTA-v1 path)."""
+        url = f"{CLOUD_API_BASE}/device_updates/hardware_version/{hardware_version}"
+        try:
+            async with self._session.get(
+                url,
+                headers=self._headers(),
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                if resp.status == 401:
+                    raise CloudAuthError("session expired")
+                resp.raise_for_status()
+                return await resp.json()
+        except aiohttp.ClientError as err:
+            raise CloudConnectionError(str(err)) from err
+
+    async def download(self, url: str) -> bytes:
+        """Fetch a signed URL. It carries its own auth, so don't send the Orbit key."""
+        try:
+            async with self._session.get(
+                url,
+                headers={"User-Agent": CLOUD_USER_AGENT},
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                resp.raise_for_status()
+                return await resp.read()
+        except aiohttp.ClientError as err:
+            raise CloudConnectionError(str(err)) from err
+
     async def discover(self, email: str, password: str) -> list[dict[str, Any]]:
         """One-shot: login, list devices, fetch keys, return joined records.
 

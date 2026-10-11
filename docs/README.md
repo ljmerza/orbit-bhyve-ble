@@ -32,6 +32,7 @@ both families (see `custom_components/orbit_bhyve/connection.py`).
 | Doc | What it covers |
 |-----|----------------|
 | [`findings/d7-47-protocol.md`](findings/d7-47-protocol.md) | The `0x10`/mesh-address binary protocol: frame layout, command catalog, init sequence, status/battery decode. |
+| [`firmware-recovery.md`](firmware-recovery.md) | Recovering an HT25 stuck in its bootloader (blinking white) after a failed update: the unencrypted bootloader protocol and the recovery CLI. |
 
 ## How it was reverse-engineered
 

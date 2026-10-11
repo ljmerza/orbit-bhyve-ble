@@ -25,6 +25,7 @@ from .coordinator import BHyveDeviceCoordinator
 from .devices import BHyveHubDevice
 from .devices.base import FaultStatus
 from .devices.protobuf import BHyveProtobufDevice
+from .firmware import recovery_supported
 
 
 async def async_setup_entry(
@@ -50,6 +51,10 @@ async def async_setup_entry(
             if getattr(coord.device, "has_flow", False):
                 entities.append(BHyveLeakBinarySensor(coord))
                 entities.append(BHyveNoFlowBinarySensor(coord))
+        elif recovery_supported(coord.device.hardware):
+            # Mesh HT25s don't report the #16.#7 fault block; their Problem
+            # sensor covers the one fault we can see: stuck in the bootloader.
+            entities.append(BHyveBootloaderProblemBinarySensor(coord))
     async_add_entities(entities)
 
 
@@ -149,6 +154,33 @@ class BHyveProblemBinarySensor(_BHyveFaultSensorBase):
             "station_faults": list(faults.station_faults),
             "accessory_fault_flags": faults.accessory_fault_flags,
         }
+
+
+class BHyveBootloaderProblemBinarySensor(_BHyveBinarySensorBase):
+    """Problem sensor for mesh HT25s: on when the last connect found the timer
+    stuck in its bootloader after a failed firmware update. Mesh polls are
+    passive by default, so this only updates when something actually connects
+    (Sync, watering, or the live status poll option)."""
+
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.device.unique_id}_problem"
+        self._attr_name = "Problem"
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.device.connection.in_bootloader
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        if self.is_on:
+            reason = "Stuck in bootloader after a failed firmware update - press Recover firmware"
+        else:
+            reason = "No faults"
+        return {"reason": reason}
 
 
 class BHyveLeakBinarySensor(_BHyveFaultSensorBase):
