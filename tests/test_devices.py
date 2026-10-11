@@ -986,7 +986,7 @@ def test_sync_button_forces_connect_on_mesh():
     # Regression (ljmerza PR #24 feedback): #24 dropped the forced connect from
     # the Sync button and routed it through refresh_state, which on mesh is
     # passive (no BLE) — so the button became a no-op there (never refreshed
-    # battery/state). async_manual_sync must force a fresh connect (the 8-step
+    # battery/state). async_manual_sync must force a fresh connect (the 7-step
     # init that refreshes battery/state via _observe_plaintext) and tear it down.
     dev = object.__new__(BHyveHT25Device)  # bypass HA-heavy __init__
     dev.mac = "44:67:55:52:94:A1"
