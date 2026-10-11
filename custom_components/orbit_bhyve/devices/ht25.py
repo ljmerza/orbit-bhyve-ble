@@ -420,7 +420,7 @@ class BHyveHT25Device(BHyveBleDeviceBase):
 
     async def _connect_refresh(self) -> None:
         """Force a fresh ephemeral connect purely for its init replies: the
-        8-step init's status (seq 0x02) and info (seq 0x03) responses refresh
+        7-step init's status (seq 0x02) and info (seq 0x03) responses refresh
         watering state and battery via _observe_plaintext. Disconnect first so
         the init actually re-runs (a pooled session would skip it), and
         disconnect afterwards so we don't hold the device's single session."""
@@ -556,7 +556,7 @@ class BHyveHT25Device(BHyveBleDeviceBase):
 
         Runs inside start_watering's _api_lock on the session START just used,
         so it neither races the coordinator refresh that valve.async_open_valve
-        fires nor pays a second connect and 8-step init. A failure here costs
+        fires nor pays a second connect and 7-step init. A failure here costs
         this run's flow data, never the run itself.
         """
         self.reset_gen1_flow()
@@ -627,7 +627,7 @@ class BHyveHT25Device(BHyveBleDeviceBase):
     async def async_unload(self) -> None:
         # hass.async_create_task is NOT tied to the config entry. An orphaned
         # renewal task survives unload and keeps reconnecting, re-running the
-        # 8-step init and re-subscribing every 240 s against a device this
+        # 7-step init and re-subscribing every 240 s against a device this
         # integration no longer owns — observed on hardware, where only a full
         # HA restart stopped it.
         self._end_gen1_flow()

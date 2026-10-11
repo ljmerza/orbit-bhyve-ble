@@ -179,7 +179,7 @@ class BHyveBleConnection:
 
     def set_post_handshake_hook(self, hook: PostHandshakeHook | None) -> None:
         """Run a per-device-class init sequence right after the AES handshake.
-        Used by HT25 for its 8-step bind-status-info dance."""
+        Used by HT25 for its 7-step bind-status-info dance."""
         self._post_handshake_hook = hook
 
     def set_plaintext_observer(self, observer: PlaintextObserver | None) -> None:

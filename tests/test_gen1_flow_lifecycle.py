@@ -258,7 +258,7 @@ def test_async_unload_cancels_the_renewal_task():
 
     hass.async_create_task is not tied to the config entry, so before the
     async_unload override a renewal task survived an integration reload and kept
-    reconnecting, re-running the 8-step init and re-subscribing every 240 s
+    reconnecting, re-running the 7-step init and re-subscribing every 240 s
     against a device the integration no longer owned. Only a full HA restart
     stopped it.
     """
