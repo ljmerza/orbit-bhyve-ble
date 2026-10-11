@@ -233,6 +233,20 @@ class FaultStatus:
         return tuple(reasons)
 
 
+@dataclass(frozen=True)
+class DeviceInfoReport:
+    """Decoded #23 DeviceInfo, the reply to a #22 getDeviceInfo (app schema
+    OrbitPbApi_DeviceInfo). Protobuf omits empty and zero fields, so any of these
+    can be None."""
+
+    fw_version: str | None = None              # #3 fwVersion
+    hw_version: str | None = None              # #2 hwVersion
+    num_stations: int | None = None            # #1 numStations
+    bootloader_version: int | None = None      # #11 bootloaderVersion
+    ble_bootloader_version: int | None = None  # #14 bleBootloaderVersion
+    ble_app_version: int | None = None         # #15 bleAppVersion
+
+
 @dataclass
 class DeviceState:
     is_watering: bool = False
@@ -241,6 +255,8 @@ class DeviceState:
     flow_total: int | None = None  # #59.#3 raw cumulative counter (transient; feeds flow_gpm)
     flow_gpm: float | None = None  # instantaneous flow rate from read_flow's slope (Gen2)
     flow_gpm_device: float | None = None  # #59.#4 device-reported gpm float (unconfirmed on HW)
+    flow_hz: int | None = None  # #59.#1 flow frequency (Hz) from the last #59
+    flow_volume_gal: float | None = None  # #59.#5 device-reported cycle gallons (unconfirmed on HW)
     flow_lpm_gen1: float | None = None
     water_used_gen1_l: float | None = None
     started_at: datetime | None = None
@@ -267,6 +283,16 @@ class DeviceState:
     # the requested duration (HT25A fw0098): HA sends the stop at the requested
     # time instead of relying on the device's own timer.
     duration_enforced_by_host: bool = False
+    # Last #23 DeviceInfo (protobuf family), read on an idle poll about daily.
+    device_info: DeviceInfoReport | None = None
+    device_info_at: datetime | None = None
+    # #16.#17 rain sensor status ("disabled"/"not_raining"/"raining"); None until
+    # the device reports a rain sensor (most never do).
+    rain_sensor: str | None = None
+    # #16.#14.#2 device-reported battery percent and #16.#14.#4 externallyPowered.
+    # Beside, not instead of, the chemistry-aware battery_pct from mV.
+    battery_pct_device: int | None = None
+    externally_powered: bool | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 

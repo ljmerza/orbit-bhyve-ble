@@ -2,7 +2,7 @@
 
 Covers BHyveHT25Device.apply_gen1_flow_frame — the RX side of the undocumented
 0x89 flow subscription — plus reset_gen1_flow and the subscribe-frame builder.
-Frame guards, the device-side elapsed clock, u16 counter wrap and the
+Frame guards, the device-side elapsed clock, the u24 volume field and the
 counts/litre calibration are all exercised with synthetic frames. No hardware
 or Home Assistant required.
 
@@ -47,7 +47,7 @@ def _f(
     routing: int = ROUTING,
     ctr: int = 0x8B,
 ) -> bytes:
-    """[mesh:2][push_ctr:1][seq:1][routing:1][rate u16][elapsed u16][cum u16].
+    """[mesh:2][push_ctr:1][seq:1][routing:1][rate u16][elapsed u16][cum u24].
 
     `ctr` is a push message counter cycling 0x80-0xBF, shared across flow,
     status and battery pushes. It is NOT a type byte and the decode must not
@@ -60,7 +60,7 @@ def _f(
         + bytes([ctr, seq, routing])
         + rate.to_bytes(2, "little")
         + elapsed.to_bytes(2, "little")
-        + (cum & 0xFFFF).to_bytes(2, "little")
+        + cum.to_bytes(3, "little")
     )
 
 
@@ -68,7 +68,8 @@ def _f(
 
 def test_short_frame_is_rejected():
     dev = _dev()
-    assert dev.apply_gen1_flow_frame(_f(9, 100)[:10]) is False
+    # 11 bytes: the old u16-volume shape, one byte short of the u24 field.
+    assert dev.apply_gen1_flow_frame(_f(9, 100)[:11]) is False
     assert dev.state.water_used_gen1_l is None
 
 
@@ -176,25 +177,37 @@ def test_run_end_zeroes_rate_and_preserves_total():
     assert dev.state.water_used_gen1_l == pytest.approx(1.0)
 
 
-# --- counter wrap ---------------------------------------------------------
+# --- 24-bit volume ---------------------------------------------------------
 
-def test_counter_wrap_is_carried():
-    # u16 wraps at 65536 ticks — about 27 min on a 40 tick/s zone, well inside
-    # the supported program length.
+def test_volume_is_read_as_u24():
+    # instantaneous-flow water-volume-ticks is u24 (pt[9:12]) per the app's
+    # spec. A u16 read would see 70000 as 4464 and need a wrap carry.
     dev = _dev()
-    dev.apply_gen1_flow_frame(_f(100, 65500))
-    dev.apply_gen1_flow_frame(_f(103, 40))
-    assert dev.state.water_used_gen1_l == pytest.approx((65536 + 40) / CAL, abs=0.01)
+    dev.apply_gen1_flow_frame(_f(600, 69_888))
+    dev.apply_gen1_flow_frame(_f(603, 70_000))
+    assert dev.state.water_used_gen1_l == pytest.approx(70_000 / CAL, abs=0.01)
+    assert dev.state.flow_lpm_gen1 == pytest.approx(112 / 3 * 60 / CAL, abs=0.1)
 
 
-def test_implausible_counter_jump_reanchors():
-    # A drop too large to be a real wrap at any reachable flow rate is a
-    # corrupt/desynced frame. Re-anchor rather than booking 65536 phantom
-    # ticks (~585 L at this calibration) permanently.
+def test_high_byte_of_volume_is_not_dropped():
+    # Byte-level pin: cum bytes 70 11 01 = 0x011170 = 70000.
+    dev = _dev()
+    frame = MESH + bytes([0x8B, SEQ_FLOW, ROUTING]) + bytes.fromhex("0000" "5802" "701101")
+    assert dev.apply_gen1_flow_frame(frame) is True
+    assert dev.state.water_used_gen1_l == pytest.approx(70_000 / CAL, abs=0.01)
+
+
+def test_backwards_counter_reanchors():
+    # A u24 counter can't wrap inside a program, so a decrease while elapsed
+    # advances is a corrupt/desynced frame: no rate, no phantom volume.
     dev = _dev()
     dev.apply_gen1_flow_frame(_f(100, 60000))
     dev.apply_gen1_flow_frame(_f(103, 10))
     assert dev.state.water_used_gen1_l == pytest.approx(10 / CAL, abs=0.01)
+    assert dev.state.flow_lpm_gen1 is None
+    # The next good sample rates off the new anchor.
+    dev.apply_gen1_flow_frame(_f(106, 10 + CAL))
+    assert dev.state.flow_lpm_gen1 == pytest.approx(20.0)
 
 
 def test_new_run_reanchors_instead_of_accumulating():

@@ -17,7 +17,7 @@ import struct
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 
-from .base import FaultStatus, ProgramSummary
+from .base import DeviceInfoReport, FaultStatus, ProgramSummary
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -49,6 +49,13 @@ RX_F_RD_ENABLED = 4       #   #16.#13.#4: rain-delay flag (knobunc: delayType en
                           #     any nonzero value = a delay is set). Often absent on a bare clear.
 RX_F_STATUS_BATT = 14     #   #16.#14: battery block { #3 = mV }
 RX_F_BATT_MV = 3          #   battery millivolts (#16.#14.#3 or #46.#3)
+RX_F_BATT_PCT = 2         #   #16.#14.#2 / #46.#2 batteryLevelPercent (device's own gauge; app schema,
+                          #     not yet observed populated)
+RX_F_BATT_EXTERNAL = 4    #   #16.#14.#4 / #46.#4 externallyPowered (bool; omitted when false)
+RX_F_STATUS_SENSORS = 17  #   #16.#17: sensors { repeated #1 SensorInfo { #1 type, #2 rainSensor
+                          #     { #1 status }, #3 sensorId } } (app schema; not yet observed)
+_SI_RAIN = 2              #     SensorInfo.#2 rainSensor
+RAIN_SENSOR_STATES = {0: "disabled", 1: "not_raining", 2: "raining"}  # RainSensor.Status
 RX_F_BATTERY_REPORT = 46  # standalone battery report { #3 = mV }
 RX_F_WATERING = 59        # flow sensor data (knobunc: FlowSensorData). Gen2 only; XD emits none.
 RX_F_WATERING_ACTIVE = 1  #   #59.#1: knobunc currentFlowRateFrequency_Hz — ~0 when no water moving,
@@ -56,9 +63,18 @@ RX_F_WATERING_ACTIVE = 1  #   #59.#1: knobunc currentFlowRateFrequency_Hz — ~0
 RX_F_FLOW_TOTAL = 3       #   #59.#3: knobunc currentCycleVolumeTicks — CUMULATIVE per-run counter (gpm
                           #     = its slope).
 RX_F_FLOW_RATE_GPM = 4    #   #59.#4: knobunc currentFlowRateGpm — float32 (wire 5). Never yet observed
-                          #     populated on fw0111, so it feeds only the disabled-by-default
-                          #     "Flow rate (device)" sensor to gather field confirmation; the primary
-                          #     gauge stays the #59.#3 slope (read_flow).
+                          #     populated on fw0111. Like the app, read_flow prefers it over the
+                          #     #59.#3 slope when present (protobuf._pick_flow_gpm); it also feeds
+                          #     the disabled-by-default "Flow rate (device)" sensor.
+RX_F_FLOW_VOLUME_GAL = 5  #   #59.#5: currentCycleVolumeGal — float32 (wire 5), app schema. Not yet
+                          #     observed populated; preferred over #3 ticks when present.
+
+# App flow math (B-hyve app `ht_hz->gpm` / `ht_ticks->gallons`, decompiled bundle
+# L981000-981012; static analysis, not hardware-verified). The app prefers the
+# device's own #59.#4 gpm and falls back to this line from the #59.#1 frequency.
+APP_GPM_PER_HZ = 0.1310135205953254
+APP_GPM_OFFSET = 0.3840268315690179
+APP_GAL_PER_TICK = 0.00228498  # ~437.6 ticks/gal; our bucket calibration measured ~433
 RX_F_WATERING_STATUS = 30  # WateringStatus notification { #1 = status enum } — the "stop ack"
 RX_F_WSTATUS_CODE = 1      #   #30.#1: 1=complete, 2=inProgress, 3=pumpDelay, 4=stationComplete,
                            #   5=stationDelay, 6=programPreDelay, 7=programPostDelay
@@ -99,6 +115,15 @@ _PRG_BUDGET = 10         # #19.#10 seasonal budget %
 _PRG_NAME = 17           # #19.#17 name (UTF-8)
 RX_F_ACTIVE_PROGRAMS = 20  # #20 setActivePrograms { #1 activeProgramFlags bitmask }
 _AP_FLAGS = 1              # #20.#1 activeProgramFlags
+
+# --- #23 DeviceInfo (reply to #22 getDeviceInfo; app schema, not HW-verified) ---
+RX_F_DEVICE_INFO = 23
+_DI_NUM_STATIONS = 1       # #23.#1 numStations (int32)
+_DI_HW_VERSION = 2         # #23.#2 hwVersion (string)
+_DI_FW_VERSION = 3         # #23.#3 fwVersion (string)
+_DI_BOOTLOADER = 11        # #23.#11 bootloaderVersion
+_DI_BLE_BOOTLOADER = 14    # #23.#14 bleBootloaderVersion
+_DI_BLE_APP = 15           # #23.#15 bleAppVersion
 
 
 def _crc16_ccitt(data: bytes, init: int = 0) -> int:
@@ -213,6 +238,53 @@ class DeviceStatus(NamedTuple):
     next_start_flags: int | None = None    # #16.#9 nextStartProgramFlags (slot bitmask, A=bit0)
     next_start_epoch: int | None = None    # #16.#10 nextStartTimeSecEpochUTC
     faults: FaultStatus | None = None      # #16.#7 faultStatus; None = block absent
+    flow_hz: int | None = None             # #59.#1 Hz; 0 when a #59 omits it, None = no #59
+    flow_volume_gal: float | None = None   # #59.#5 device-reported cycle gallons (unconfirmed)
+    rain_sensor: str | None = None         # #16.#17 rain sensor status (RAIN_SENSOR_STATES); None = not reported
+    battery_pct_device: int | None = None  # #16.#14.#2 / #46.#2 device-reported battery percent
+    externally_powered: bool | None = None  # #16.#14.#4 / #46.#4; None = no battery block
+
+
+def _rain_sensor_status(sensors: bytes) -> str | None:
+    """The rain-sensor status from a #16.#17 sensors block, or None if it lists no
+    rain sensor. A rainSensor block with its status omitted is 0 = disabled."""
+    for num, _wire, entry in pb_parse(sensors) or ():
+        if num != 1 or not isinstance(entry, (bytes, bytearray)):
+            continue
+        ef = pb_parse(entry)
+        rain = _pb_field(ef, _SI_RAIN)
+        if isinstance(rain, (bytes, bytearray)):
+            return RAIN_SENSOR_STATES.get(_pb_field(pb_parse(rain), 1) or 0)
+    return None
+
+
+def app_flow_gpm(device_gpm: float | None, hz: int | None) -> float | None:
+    """The app's flow rate: the device's #59.#4 gpm when populated, otherwise its
+    linear fit from the #59.#1 frequency (0 Hz -> 0 gpm). None when neither is
+    known (no #59 seen)."""
+    if device_gpm is not None:
+        return device_gpm
+    if hz is None:
+        return None
+    if hz <= 0:
+        return 0.0
+    return round(APP_GPM_PER_HZ * hz + APP_GPM_OFFSET, 2)
+
+
+def flow_gallons(
+    volume_gal: float | None, ticks: int | None, counts_per_gallon: float | None = None
+) -> float | None:
+    """Cycle volume: the device's #59.#5 gallons when populated, otherwise #59.#3
+    ticks converted with `counts_per_gallon` (the user's Flow calibration option,
+    so the volume and the slope gauge agree); the app's fixed 0.00228498 gal/tick
+    when no calibration is given."""
+    if volume_gal is not None:
+        return volume_gal
+    if ticks is None:
+        return None
+    if counts_per_gallon and counts_per_gallon > 0:
+        return round(ticks / counts_per_gallon, 3)
+    return round(ticks * APP_GAL_PER_TICK, 3)
 
 
 def extract_status(protobuf: bytes) -> DeviceStatus:
@@ -223,6 +295,7 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
     run_state = battery_mv = is_watering = seconds_remaining = None
     active_station = rd_minutes = rd_expiry = rd_active = None
     controller_mode = next_start_flags = next_start_epoch = faults = None
+    rain_sensor = None
 
     device_clock = _pb_field(top, RX_F_CLOCK)     # #7 wrapper field
     status = _pb_field(top, RX_F_STATUS)          # #16 submessage
@@ -265,6 +338,9 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
                 | ((_pb_field(ff, _FLT_STATIONS_HI) or 0) << 32),
                 accessory_fault_flags=_pb_field(ff, _FLT_ACCESSORY) or 0,
             )
+        sens = _pb_field(sfields, RX_F_STATUS_SENSORS)   # #16.#17
+        if isinstance(sens, (bytes, bytearray)):
+            rain_sensor = _rain_sensor_status(sens)
         rd = _pb_field(sfields, RX_F_STATUS_RAINDELAY)   # #16.#13
         if isinstance(rd, (bytes, bytearray)):
             rdf = pb_parse(rd)
@@ -289,6 +365,19 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
 
     if battery_mv is None:                         # standalone #46.#3
         battery_mv = _pb_subfield(top, RX_F_BATTERY_REPORT, RX_F_BATT_MV)
+
+    # Device-reported percent + external power from the same BatteryStatus block
+    # (#16.#14, else a standalone #46). Protobuf omits a false #4, so a present
+    # block without it means battery-powered.
+    battery_pct_device = externally_powered = None
+    batt = _pb_path(top, RX_F_STATUS, RX_F_STATUS_BATT)
+    if not isinstance(batt, (bytes, bytearray)):
+        batt = _pb_field(top, RX_F_BATTERY_REPORT)
+    if isinstance(batt, (bytes, bytearray)):
+        bf = pb_parse(batt)
+        pct = _pb_field(bf, RX_F_BATT_PCT)
+        battery_pct_device = pct if isinstance(pct, int) and 0 <= pct <= 100 else None
+        externally_powered = bool(_pb_field(bf, RX_F_BATT_EXTERNAL))
 
     # ONLY #16.#1 run_state drives is_watering — it is authoritative for whether
     # the valve is open. #59.#1 ("water currently flowing") deliberately does NOT
@@ -315,6 +404,15 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
     raw_gpm = _pb_subfield(top, RX_F_WATERING, RX_F_FLOW_RATE_GPM)
     if isinstance(raw_gpm, (bytes, bytearray)) and len(raw_gpm) == 4:
         flow_rate_gpm = round(struct.unpack("<f", bytes(raw_gpm))[0], 2)
+    # #59.#1 frequency and #59.#5 cycle gallons, for the app's flow math. Protobuf
+    # omits a zero #1, so a present #59 without it means 0 Hz.
+    flow_hz = flow_volume_gal = None
+    if isinstance(_pb_field(top, RX_F_WATERING), (bytes, bytearray)):
+        hz = _pb_subfield(top, RX_F_WATERING, RX_F_WATERING_ACTIVE)
+        flow_hz = hz if isinstance(hz, int) else 0
+        raw_gal = _pb_subfield(top, RX_F_WATERING, RX_F_FLOW_VOLUME_GAL)
+        if isinstance(raw_gal, (bytes, bytearray)) and len(raw_gal) == 4:
+            flow_volume_gal = round(struct.unpack("<f", bytes(raw_gal))[0], 3)
 
     return DeviceStatus(
         run_state=run_state,
@@ -332,6 +430,38 @@ def extract_status(protobuf: bytes) -> DeviceStatus:
         next_start_flags=next_start_flags,
         next_start_epoch=next_start_epoch,
         faults=faults,
+        flow_hz=flow_hz,
+        flow_volume_gal=flow_volume_gal,
+        rain_sensor=rain_sensor,
+        battery_pct_device=battery_pct_device,
+        externally_powered=externally_powered,
+    )
+
+
+def extract_device_info(protobuf: bytes) -> DeviceInfoReport | None:
+    """Decode a #23 DeviceInfo message, or None if `protobuf` doesn't carry one."""
+    blob = _pb_field(pb_parse(protobuf), RX_F_DEVICE_INFO)
+    if not isinstance(blob, (bytes, bytearray)):
+        return None
+    f = pb_parse(blob)
+    if f is None:
+        return None
+
+    def _str(num):
+        v = _pb_field(f, num)
+        return v.decode(errors="replace") if isinstance(v, (bytes, bytearray)) else None
+
+    def _int(num):
+        v = _pb_field(f, num)
+        return v if isinstance(v, int) else None
+
+    return DeviceInfoReport(
+        fw_version=_str(_DI_FW_VERSION),
+        hw_version=_str(_DI_HW_VERSION),
+        num_stations=_int(_DI_NUM_STATIONS),
+        bootloader_version=_int(_DI_BOOTLOADER),
+        ble_bootloader_version=_int(_DI_BLE_BOOTLOADER),
+        ble_app_version=_int(_DI_BLE_APP),
     )
 
 
@@ -473,6 +603,18 @@ def apply_status_plaintext(device, pt: bytes) -> None:
     if st.battery_mv is not None and 1500 <= st.battery_mv <= 4000:
         device.battery_mv = st.battery_mv  # battery_pct is a chemistry-aware property
 
+    # Device's own battery gauge / external power (#16.#14.#2/#4) — shown beside,
+    # not instead of, the chemistry-aware mV gauge above.
+    if st.battery_pct_device is not None:
+        device.state.battery_pct_device = st.battery_pct_device
+    if st.externally_powered is not None:
+        device.state.externally_powered = st.externally_powered
+
+    # Rain sensor status (#16.#17). Kept when a status omits the block, like the
+    # fault report below; the Rain sensor entity is created once this is set.
+    if st.rain_sensor is not None:
+        device.state.rain_sensor = st.rain_sensor
+
     # Raw cumulative flow counter (#59.#3) — record whenever a #59 carries it,
     # regardless of the flow-active flag, so read_flow can sample its slope even
     # across a momentary #59.#1=0. It's transient; the gauge value is flow_gpm.
@@ -483,6 +625,12 @@ def apply_status_plaintext(device, pt: bytes) -> None:
     # "Flow rate (device)" sensor; not yet observed populated on hardware.
     if st.flow_rate_gpm is not None:
         device.state.flow_gpm_device = st.flow_rate_gpm
+    # #59.#1 Hz / #59.#5 gallons — inputs to the app-style flow math
+    # (app_flow_gpm / flow_gallons).
+    if st.flow_hz is not None:
+        device.state.flow_hz = st.flow_hz
+    if st.flow_volume_gal is not None:
+        device.state.flow_volume_gal = st.flow_volume_gal
 
     if st.is_watering is not None:
         device.state.is_watering = st.is_watering
@@ -518,6 +666,8 @@ def apply_status_plaintext(device, pt: bytes) -> None:
             device.state.flow_total = None
             device.state.flow_gpm = 0.0  # valve closed → no flow
             device.state.flow_gpm_device = None
+            device.state.flow_hz = None
+            device.state.flow_volume_gal = None
             device.state.started_at = None
             device.state.expected_off_at = None
 

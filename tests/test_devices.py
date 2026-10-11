@@ -415,8 +415,17 @@ def test_flow_subscribe_pb_round_trips_and_matches_capture():
     frame = pb._build_message(pb._FLOW_SUBSCRIBE_PB)
     assert rx.decode_inner(frame) == pb._FLOW_SUBSCRIBE_PB
     sub = rx.pb_parse(rx._pb_field(rx.pb_parse(pb._FLOW_SUBSCRIBE_PB), 57))
-    assert rx._pb_field(sub, 1) == 1000   # intervalMs (app capture)
-    assert rx._pb_field(sub, 2) == 2      # type (app capture)
+    assert rx._pb_field(sub, 1) == 1000   # sendDataIntervalMilliSec (app capture)
+    assert rx._pb_field(sub, 2) == 10     # sendDataDurationSec: covers read_flow's ~4.8 s window
+
+
+def test_flow_subscribe_and_unsubscribe_byte_refs():
+    # #57 #2 is sendDataDurationSec (app schema). Subscribe streams for 10 s;
+    # the unsubscribe keeps interval 0 (the HW-verified cancel) unchanged.
+    assert pb._FLOW_SUBSCRIBE_PB == bytes.fromhex("ca030508e807100a")
+    assert pb._FLOW_UNSUBSCRIBE_PB == bytes.fromhex("ca030408001002")
+    unsub = rx.pb_parse(rx._pb_field(rx.pb_parse(pb._FLOW_UNSUBSCRIBE_PB), 57))
+    assert rx._pb_field(unsub, 1) == 0
 
 
 def test_read_flow_noop_on_flowless_device():
@@ -954,10 +963,15 @@ class _SyncConn:
         self.ensure_connected_calls = 0
         self.disconnects = 0
         self._connected = False
+        self.sent: list[bytes] = []
 
     async def ensure_connected(self):
         self.ensure_connected_calls += 1
         self._connected = True
+
+    async def send(self, plaintext, *, drain_ms=1500):
+        self.sent.append(plaintext)
+        return []
 
     async def disconnect(self):
         self.disconnects += 1
@@ -976,12 +990,15 @@ def test_sync_button_forces_connect_on_mesh():
     # init that refreshes battery/state via _observe_plaintext) and tear it down.
     dev = object.__new__(BHyveHT25Device)  # bypass HA-heavy __init__
     dev.mac = "44:67:55:52:94:A1"
+    dev.mesh_device_id = 0x8A5B
     dev.state = DeviceState()
     conn = _SyncConn()
     dev.connection = conn
     asyncio.run(dev.async_manual_sync())
     assert conn.ensure_connected_calls == 1   # forced a fresh connect
     assert conn.disconnects >= 1              # torn down afterwards (ephemeral)
+    # ...and reads the last run (msg 12) and the button run time (msg 7).
+    assert [f.hex() for f in conn.sent] == ["5b8a1c0c4000", "5b8a17074000"]
 
 
 def test_manual_sync_is_noop_for_protobuf():
@@ -1003,6 +1020,7 @@ def test_manual_sync_marks_connected_on_success():
     # refresh runs — reading the live socket then would read False.
     dev = object.__new__(BHyveHT25Device)
     dev.mac = "44:67:55:52:94:A1"
+    dev.mesh_device_id = 0x8A5B
     dev.state = DeviceState(consecutive_timeouts=3)
     dev.connection = _SyncConn()
     asyncio.run(dev.async_manual_sync())

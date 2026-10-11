@@ -144,6 +144,24 @@
           "watering": "Watering",
           "mesh_offline": "Mesh offline"
         }
+      },
+      "firmware_version": {
+        "name": "Firmware version"
+      },
+      "last_run_water_used": {
+        "name": "Last run water used"
+      },
+      "rain_sensor": {
+        "state": {
+          "disabled": "Disabled",
+          "not_raining": "Not raining",
+          "raining": "Raining"
+        }
+      }
+    },
+    "number": {
+      "button_run_time": {
+        "name": "Button run time"
       }
     }
   }
