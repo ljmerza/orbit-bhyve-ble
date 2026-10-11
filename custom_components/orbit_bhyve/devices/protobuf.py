@@ -254,6 +254,16 @@ def _build_set_timer_mode_pb(mode: int) -> bytes:
     return _pb_field_bytes(14, _pb_field_varint(1, mode) + _pb_field_bytes(2, b""))
 
 
+def _build_run_program_pb(slot: int) -> bytes:
+    """Run a stored program now: #14 timerMode { #1=2 manualMode, #2 manualModeParams
+    { #2 activeProgramFlags } } — the app's "water program" (`:change-mode` manual
+    with program flags; it drops the empty stationInfo). The flag is A=bit0
+    (1 << (slot-1)): the app builds it with `vec->bitwise` over "abcdefg", the same
+    convention as #20 and #16.#9. NOT hardware-verified (app static analysis only)."""
+    params = _pb_field_varint(2, 1 << (slot - 1))
+    return _pb_field_bytes(14, _pb_field_varint(1, 2) + _pb_field_bytes(2, params))
+
+
 def _build_program_pb(spec: ProgramSpec) -> bytes:
     """#19 setProgramSchedule from a ProgramSpec (a full, runnable program)."""
     body = _pb_field_varint(1, spec.slot)
@@ -1021,6 +1031,63 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 # asymmetric with enable. Reconstructing from last-known flags reports the
                 # unverified toggle as unconfirmed instead — the safe direction.
                 return bool(self._enable_mask(mask2) & bit) == on
+            finally:
+                await self.connection.disconnect()
+
+    def _program_run_sec(self, slot: int) -> int:
+        """Expected length of a run of `slot` from its last-read #19 body: the sum
+        of its zone run times, scaled UP (never down) by its seasonal budget, so a
+        host-side stop never cuts the run short whichever way the device applies
+        the budget. 0 when the program is unknown or empty."""
+        sch = self.state.programs.get(slot)
+        if sch is None or sch.empty:
+            return 0
+        total = sum(sec or 0 for _sid, sec in sch.zones)
+        return max(total, total * (sch.budget or 100) // 100)
+
+    @_ble_write_guard
+    async def run_program(self, slot: int) -> bool:
+        """Start a stored program now (#14 manualMode + activeProgramFlags), like
+        the app's "water program". Returns True once a #16 status reports watering.
+
+        A class whose device ignores manual run times (HT25A: duration_honored is
+        False) gets the host-side stop at the program's expected length, as for a
+        manual run. If that firmware ignores the program flag and runs its 1800 s
+        default instead, the run still ends on time. Without a known program length
+        there is no bound, so those classes refuse the run."""
+        letter = SLOT_LETTERS.get(slot, str(slot))
+        run_sec = self._program_run_sec(slot)
+        if not self.duration_honored and run_sec <= 0:
+            _LOGGER.warning(
+                "%s: %s run program %s refused — no stored run time to time the run from the host",
+                self.mac, self.log_label, letter,
+            )
+            return False
+        async with self._api_lock:
+            if self.connection is None:
+                return False
+            try:
+                notifs = await self.connection.send(
+                    _build_message(_build_run_program_pb(slot)), drain_ms=2000
+                )
+                self._stamp_command(f"run program {letter}", len(notifs))
+                if not self.state.is_watering:
+                    # Same settle-then-read as start_watering: the reply may not
+                    # carry a #16.
+                    await asyncio.sleep(1.0)
+                    await self.refresh_status()
+                if not self.state.is_watering:
+                    _LOGGER.warning(
+                        "%s: %s run program %s not confirmed", self.mac, self.log_label, letter
+                    )
+                    return False
+                now = datetime.now(timezone.utc)
+                self.state.started_at = now
+                if not self.duration_honored:
+                    self.state.expected_off_at = now + timedelta(seconds=run_sec)
+                    self._arm_host_stop(run_sec)
+                _LOGGER.debug("%s: %s run program %s confirmed", self.mac, self.log_label, letter)
+                return True
             finally:
                 await self.connection.disconnect()
 

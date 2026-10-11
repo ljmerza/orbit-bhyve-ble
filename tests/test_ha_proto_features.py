@@ -6,13 +6,19 @@ directly, so no running Home Assistant is needed.
 """
 from __future__ import annotations
 
+import asyncio
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 
 pytest.importorskip("homeassistant")
 
-from orbit_bhyve.devices.base import DeviceState  # noqa: E402
+from homeassistant.exceptions import HomeAssistantError  # noqa: E402
+
+from orbit_bhyve.button import BHyveRunProgramButton  # noqa: E402
+from orbit_bhyve.coordinator import BHyveDeviceCoordinator  # noqa: E402
+from orbit_bhyve.devices.base import DeviceState, ProgramSummary  # noqa: E402
 from orbit_bhyve.sensor import BHyveDeviceFlowRateSensor  # noqa: E402
 
 
@@ -55,3 +61,48 @@ def test_device_flow_sensor_unknown_without_flow_data():
     sensor = BHyveDeviceFlowRateSensor(_coord(_device()))
     assert sensor.native_value is None
     assert sensor.extra_state_attributes["source"] is None
+
+
+# --- Run program buttons -----------------------------------------------------
+
+def _write_coord(device, ok: bool, calls: list):
+    async def async_request_refresh():
+        calls.append(("refresh",))
+
+    coord = SimpleNamespace(
+        device=device, data=None, last_update_success=True,
+        async_request_refresh=async_request_refresh,
+    )
+    coord.async_confirm_write = partial(BHyveDeviceCoordinator.async_confirm_write, coord)
+    return coord
+
+
+def test_run_program_button_available_only_for_stored_slots():
+    device = _device(programs={
+        1: ProgramSummary(slot=1, empty=False, zones=((0, 60),)),
+        2: ProgramSummary(slot=2, empty=True),
+    })
+    coord = _write_coord(device, True, [])
+    assert BHyveRunProgramButton(coord, "A").available is True
+    assert BHyveRunProgramButton(coord, "B").available is False   # empty slot
+    assert BHyveRunProgramButton(coord, "C").available is False   # never read
+    assert BHyveRunProgramButton(coord, "A").unique_id == "garden_run_program_a"
+
+
+@pytest.mark.parametrize("ok", [True, False])
+def test_run_program_button_press_runs_slot_and_surfaces_failure(ok):
+    calls: list = []
+    device = _device()
+
+    async def run_program(slot):
+        calls.append(("run", slot))
+        return ok
+
+    device.run_program = run_program
+    button = BHyveRunProgramButton(_write_coord(device, ok, calls), "C")
+    if ok:
+        asyncio.run(button.async_press())
+    else:
+        with pytest.raises(HomeAssistantError):
+            asyncio.run(button.async_press())
+    assert calls == [("run", 3), ("refresh",)]

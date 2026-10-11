@@ -13,10 +13,10 @@ import struct
 
 import pytest
 
-from orbit_bhyve.devices import BHyveHT25G2Device
+from orbit_bhyve.devices import BHyveHT25ADevice, BHyveHT25G2Device, BHyveHT34ADevice
 from orbit_bhyve.devices import protobuf as pb
 from orbit_bhyve.devices import status as rx
-from orbit_bhyve.devices.base import DeviceState
+from orbit_bhyve.devices.base import DeviceState, ProgramSummary
 
 
 def _f32(field: int, value: float) -> bytes:
@@ -145,3 +145,103 @@ def test_read_flow_falls_back_to_slope_without_device_gpm():
     asyncio.run(dev.read_flow())
     assert dev.state.flow_gpm == 0.0
     assert dev.state.flow_hz == 30
+
+
+# --- run program now (#14 manualMode + activeProgramFlags) ------------------
+
+@pytest.mark.parametrize(
+    "slot,expected",
+    [
+        (1, "7206080212021001"),  # A = bit0
+        (2, "7206080212021002"),  # B = bit1
+        (3, "7206080212021004"),
+        (4, "7206080212021008"),  # D = bit3
+    ],
+)
+def test_run_program_builder_byte_refs(slot, expected):
+    assert pb._build_run_program_pb(slot).hex() == expected
+    # Shape: #14 { #1 manualMode=2, #2 manualModeParams { #2 activeProgramFlags } }
+    tm = rx.pb_parse(rx._pb_field(rx.pb_parse(pb._build_run_program_pb(slot)), 14))
+    assert rx._pb_field(tm, 1) == 2
+    assert rx._pb_field(rx.pb_parse(rx._pb_field(tm, 2)), 2) == 1 << (slot - 1)
+
+
+def _stored(slot, zones, budget=100):
+    return ProgramSummary(slot=slot, empty=False, enabled=True, zones=zones, budget=budget)
+
+
+def test_run_program_confirms_via_status():
+    dev = _make_gen2(is_watering=False)
+    dev.connection = _FakeConn(dev, pb._build_message(_status_msg(4)))
+    assert asyncio.run(dev.run_program(2)) is True
+    assert dev.connection.sent[0] == pb._build_message(pb._build_run_program_pb(2))
+    assert dev.state.is_watering is True
+    assert dev.state.duration_enforced_by_host is False  # Gen2 times programs itself
+    assert dev.connection.disconnects == 1
+
+
+def test_run_program_not_confirmed_returns_false():
+    dev = _make_gen2(is_watering=False)
+    dev.connection = _FakeConn(dev, pb._build_message(_status_msg(1)))
+    assert asyncio.run(dev.run_program(1)) is False
+
+
+def _make_ht25a(**state_kwargs):
+    dev = object.__new__(BHyveHT25ADevice)
+    dev.mac = "AA:BB:CC:DD:EE:01"
+    dev.hardware, dev.firmware = "HT25A-0001", "0098"
+    dev.state = DeviceState(**state_kwargs)
+    dev.flow_counts_per_gallon = 433
+    return dev
+
+
+def test_run_program_on_ht25a_times_the_run_from_the_host():
+    # HT25A ignores manual run times, so the program's own length is enforced
+    # from the host, exactly like a manual run on that class.
+    dev = _make_ht25a(is_watering=False, programs={1: _stored(1, ((0, 600),))})
+    dev.connection = _FakeConn(dev, pb._build_message(_status_msg(4)))
+
+    async def run():
+        ok = await dev.run_program(1)
+        armed = dev._host_stop_handle is not None
+        dev._cancel_host_stop()
+        return ok, armed
+
+    ok, armed = asyncio.run(run())
+    assert ok is True and armed is True
+    assert dev.state.duration_enforced_by_host is True
+    left = (dev.state.expected_off_at - dev.state.started_at).total_seconds()
+    assert left == 600
+
+
+def test_run_program_on_ht25a_refuses_without_known_length():
+    dev = _make_ht25a(is_watering=False)  # no program read yet
+    dev.connection = _FakeConn(dev, pb._build_message(_status_msg(4)))
+    assert asyncio.run(dev.run_program(1)) is False
+    assert dev.connection.sent == []  # nothing went out
+
+
+def test_program_run_sec_scales_up_by_budget_never_down():
+    dev = _make_gen2(programs={
+        1: _stored(1, ((0, 300), (1, 300)), budget=150),
+        2: _stored(2, ((0, 300),), budget=50),
+        3: ProgramSummary(slot=3, empty=True),
+    })
+    assert dev._program_run_sec(1) == 900
+    assert dev._program_run_sec(2) == 300
+    assert dev._program_run_sec(3) == 0
+    assert dev._program_run_sec(4) == 0
+
+
+def test_run_program_returns_false_on_ble_error():
+    from bleak.exc import BleakError
+
+    class _Broken(_FakeConn):
+        async def send(self, frame, drain_ms=1500):
+            raise BleakError("Not connected")
+
+    dev = object.__new__(BHyveHT34ADevice)
+    dev.mac = "AA:BB:CC:DD:EE:02"
+    dev.state = DeviceState()
+    dev.connection = _Broken(dev)
+    assert asyncio.run(dev.run_program(1)) is False
