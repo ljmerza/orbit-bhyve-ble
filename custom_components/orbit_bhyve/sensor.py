@@ -526,7 +526,7 @@ class BHyveGen1WaterUsedSensor(_BHyveGen1FlowSensorBase, _RestoreLastValueSensor
     - RestoreSensor carries the last value across a restart, so a restart
       mid-run doesn't blip the total to nothing before the next sample lands.
 
-    The value comes straight from the counter (with a wrap carry) rather than
+    The value comes straight from the device's u24 counter rather than
     from summing deltas, which is what removes the old first-sample undercount
     — the counter starts at zero each run, so the first sample's ticks are real
     water and were previously discarded as a baseline.

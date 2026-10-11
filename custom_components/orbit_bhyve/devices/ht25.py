@@ -39,12 +39,6 @@ SEQ_FLOW_END = 0x0C
 SEQ_FLOW_SUBSCRIBE = 0x0E  # outbound subscribe request
 TYPE_FLOW_SUBSCRIBE = 0x89
 
-# Plausibility ceiling for a counter wrap, in ticks/second. Fastest observed on
-# hardware is 57 (a 25 L/min zone during ramp-up); 200 is deliberately generous
-# and exists only to reject a corrupt frame that would otherwise be booked as a
-# 65536-tick wrap — about 575 L, permanently.
-GEN1_MAX_TICKS_PER_SEC = 200
-
 # The device stops sampling ~300 s after a subscribe regardless of the sample
 # count requested, so a long program needs the subscription renewed. 240 s
 # leaves 60 s of margin and sustained a gapless 20.6-minute stream on hardware.
@@ -419,8 +413,6 @@ class BHyveHT25Device(BHyveBleDeviceBase):
     def reset_gen1_flow(self) -> None:
         self._gen1_last_elapsed = None
         self._gen1_last_cum = None
-        self._gen1_last_total = None
-        self._gen1_wraps = 0
         self.state.flow_lpm_gen1 = None
         self.state.water_used_gen1_l = None
 
@@ -428,7 +420,10 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         """Decode one flow sample into rate + cumulative volume.
 
         Frame: [mesh:2][push_ctr:1][seq:1][routing:1][rate u16][elapsed u16]
-        [cumulative u16], little-endian throughout.
+        [cumulative u24], little-endian throughout. The volume is u24 per the
+        app's instantaneous-flow spec ({flow-freq-hz u16, run-time-secs u16,
+        water-volume-ticks u24}), so there is no 16-bit wrap to carry. Decoded
+        from the spec: no hardware run has yet passed 65535 ticks to show it.
 
         pt[2] is a message counter cycling 0x80-0xBF, shared across flow, status
         and battery pushes — it is NOT a type byte, and the 0x40 reply bit is
@@ -450,14 +445,14 @@ class BHyveHT25Device(BHyveBleDeviceBase):
             # touching mesh_address, which raises rather than returning None.
             return False
         if (
-            len(pt) < 11
+            len(pt) < 12
             or pt[0:2] != self.mesh_address
             or pt[3] != SEQ_FLOW
             or pt[4] != D747_ROUTING
         ):
             return False
         elapsed = struct.unpack("<H", pt[7:9])[0]
-        cum = struct.unpack("<H", pt[9:11])[0]
+        cum = int.from_bytes(pt[9:12], "little")
 
         if elapsed == 0:
             # Run over. The device keeps sampling with every field zeroed for as
@@ -471,45 +466,31 @@ class BHyveHT25Device(BHyveBleDeviceBase):
 
         prev_elapsed = getattr(self, "_gen1_last_elapsed", None)
         prev_cum = getattr(self, "_gen1_last_cum", None)
-        prev_total = getattr(self, "_gen1_last_total", None)
         dt = None if prev_elapsed is None else elapsed - prev_elapsed
 
-        if dt is None or dt <= 0:
-            # First sample of a run, or elapsed went backwards — which only
-            # happens across a run boundary, since elapsed survives a
-            # re-subscribe. Anchor here instead of booking the whole counter.
-            self._gen1_wraps = 0
-        elif cum < prev_cum:
-            implied = (65536 - prev_cum) + cum
-            if implied > GEN1_MAX_TICKS_PER_SEC * dt:
-                # Far too large to be a real wrap at any flow rate this hardware
-                # can produce. Treat as a corrupt or desynced frame and
-                # re-anchor, rather than permanently booking 65536 phantom
-                # ticks (~575 L).
-                _LOGGER.debug(
-                    "%s: implausible flow counter %s->%s over %ss; re-anchoring",
-                    self.mac, prev_cum, cum, dt,
-                )
-                self._gen1_wraps = 0
-                dt = None
-            else:
-                # Genuine u16 wrap. Reachable inside a supported program: ~27
-                # min on a 40 tick/s zone, against a 1440-minute maximum.
-                self._gen1_wraps = getattr(self, "_gen1_wraps", 0) + 1
+        if dt is not None and dt > 0 and cum < prev_cum:
+            # A u24 counter can't wrap inside any program this hardware runs
+            # (16.7M ticks is ~150,000 L at 112 counts/L), so a decrease while
+            # the device clock advances is a corrupt or desynced frame. Anchor
+            # here rather than booking a rate off it.
+            _LOGGER.debug(
+                "%s: flow counter went backwards %s->%s over %ss; re-anchoring",
+                self.mac, prev_cum, cum, dt,
+            )
+            dt = None
 
-        total = self._gen1_wraps * 65536 + cum
-
-        if dt is not None and prev_total is not None and total >= prev_total:
+        # dt <= 0 is the first sample of a new run (elapsed counts from START
+        # and survives a re-subscribe), so it only anchors.
+        if dt is not None and dt > 0:
             # inc == 0 is a legitimate reading (valve open, meter static) and
             # must produce a rate of 0.0, not a held stale value.
-            inc = total - prev_total
+            inc = cum - prev_cum
             self.state.flow_lpm_gen1 = round(
                 inc / dt * 60.0 / self.flow_counts_per_litre, 1
             )
-        self.state.water_used_gen1_l = round(total / self.flow_counts_per_litre, 2)
+        self.state.water_used_gen1_l = round(cum / self.flow_counts_per_litre, 2)
         self._gen1_last_elapsed = elapsed
         self._gen1_last_cum = cum
-        self._gen1_last_total = total
         self._notify_state_changed()
         return True
 
