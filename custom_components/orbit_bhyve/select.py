@@ -1,7 +1,7 @@
 """Select platform — rain-delay presets and battery chemistry.
 
 The rain-delay select is a single SelectEntity per protobuf-family device
-(HT34A/HT25G2) that exposes the rain delay as a coarse dropdown of hour/day
+(HT34A/HT25G2) or mesh HT25 that exposes the rain delay as a coarse dropdown of hour/day
 presets. Each pick is exactly ONE BLE write, which is the point: unlike a number
 stepper/slider (one write per click/drag) there is no ambiguity about when the
 value is sent, and no queue of unintended intermediate writes fighting the
@@ -31,6 +31,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import BHyveDeviceCoordinator
+from .devices import BHyveHT25Device
 from .devices.base import BATTERY_CHEMISTRIES
 from .devices.protobuf import BHyveProtobufDevice
 
@@ -84,8 +85,11 @@ async def async_setup_entry(
         # key-less records have no battery to gauge.
         if coord.device.connection is not None:
             entities.append(BHyveBatteryChemistrySelect(coord))
-        # Rain delay is a protobuf-family (HT34A/HT25G2) capability.
+        # Protobuf-family (HT34A/HT25G2) rain delay.
         if isinstance(coord.device, BHyveProtobufDevice):
+            entities.append(BHyveRainDelaySelect(coord))
+        # Mesh (HT25) rain delay, written over the d7-47 mesh messages.
+        if isinstance(coord.device, BHyveHT25Device) and coord.device.connection is not None:
             entities.append(BHyveRainDelaySelect(coord))
     async_add_entities(entities)
 

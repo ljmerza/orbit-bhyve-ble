@@ -144,6 +144,17 @@
           "watering": "Watering",
           "mesh_offline": "Mesh offline"
         }
+      },
+      "firmware_version": {
+        "name": "Firmware version"
+      },
+      "last_run_water_used": {
+        "name": "Last run water used"
+      }
+    },
+    "number": {
+      "button_run_time": {
+        "name": "Button run time"
       }
     }
   }

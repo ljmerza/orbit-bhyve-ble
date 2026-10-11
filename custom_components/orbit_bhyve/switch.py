@@ -15,6 +15,9 @@ One mesh-family switch alongside them:
 - **Flow measurement** (HT25, config category) — per-device opt-in for Gen1
   flow measurement, default off. Pure HA-side config: it sends nothing to the
   device, it only decides whether the next run subscribes to flow samples.
+
+Mesh HT25s also get **Automatic watering**, driven by the mesh device-control
+set-run-mode message instead of #14.
 """
 from __future__ import annotations
 
@@ -30,6 +33,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import BHyveDeviceCoordinator
+from .devices import BHyveHT25Device
 from .devices.base import PROGRAM_SLOTS, UI_SLOTS
 from .devices.protobuf import BHyveProtobufDevice
 
@@ -49,6 +53,10 @@ async def async_setup_entry(
         # record has no BLE session to measure over.
         if coord.device.has_flow_gen1 and coord.device.connection is not None:
             entities.append(BHyveGen1FlowSwitch(coord))
+        # Mesh (HT25) automatic watering: device-control set-run-mode over the
+        # d7-47 mesh messages. Programs aren't exposed for mesh timers.
+        if isinstance(coord.device, BHyveHT25Device) and coord.device.connection is not None:
+            entities.append(BHyveAutomaticWateringSwitch(coord))
         if not isinstance(coord.device, BHyveProtobufDevice):
             continue
         entities.append(BHyveAutomaticWateringSwitch(coord))

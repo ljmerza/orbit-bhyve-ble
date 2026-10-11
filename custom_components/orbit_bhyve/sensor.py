@@ -40,6 +40,7 @@ from .devices.base import (
     ProgramSummary,
     accumulate_gallons,
 )
+from .devices import BHyveHT25Device
 from .devices.protobuf import BHyveProtobufDevice
 
 _WEEKDAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
@@ -105,6 +106,12 @@ async def async_setup_entry(
         if device.has_flow_gen1:
             entities.append(BHyveGen1FlowRateSensor(coord))
             entities.append(BHyveGen1WaterUsedSensor(coord))
+        # Mesh (HT25) settings and diagnostics decoded from the d7-47 replies.
+        if isinstance(device, BHyveHT25Device):
+            entities.append(BHyveRainDelayEndsSensor(coord))
+            entities.append(BHyveMeshFirmwareSensor(coord))
+            if device.has_flow_gen1:
+                entities.append(BHyveLastRunWaterSensor(coord))
     async_add_entities(entities)
 
 
@@ -526,7 +533,7 @@ class BHyveGen1WaterUsedSensor(_BHyveGen1FlowSensorBase, _RestoreLastValueSensor
     - RestoreSensor carries the last value across a restart, so a restart
       mid-run doesn't blip the total to nothing before the next sample lands.
 
-    The value comes straight from the counter (with a wrap carry) rather than
+    The value comes straight from the device's u24 counter rather than
     from summing deltas, which is what removes the old first-sample undercount
     — the counter starts at zero each run, so the first sample's ticks are real
     water and were previously discarded as a baseline.
@@ -597,4 +604,75 @@ class BHyveProgramSummarySensor(_BHyveDeviceSensorBase):
                 {"zone": sid + 1, "minutes": round(sec / 60, 2)} for sid, sec in summary.zones
             ],
             "budget": summary.budget,
+        }
+
+
+class BHyveMeshFirmwareSensor(_RestoreLastValueSensor):
+    """Mesh HT25 firmware as the device reports it: the device-info reply to
+    the init's read on every connect. Formatted like the cloud record ("0085").
+    Hardware version, device type and station count ride along."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_translation_key = "firmware_version"
+    _attr_icon = "mdi:chip"
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.device.unique_id}_firmware_version"
+        self._attr_name = "Firmware version"
+
+    @property
+    def native_value(self) -> str | None:
+        info = self.coordinator.device.mesh_device_info
+        if info is None:
+            return self._restored_value
+        return f"{info.firmware_version:04d}"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        info = self.coordinator.device.mesh_device_info
+        if info is None:
+            return None
+        return {
+            "hardware_version": info.hardware_version,
+            "device_type": info.device_type_name or info.device_type,
+            "stations": info.stations,
+        }
+
+
+class BHyveLastRunWaterSensor(_RestoreLastValueSensor):
+    """Water used by the last run (litres), from last-water-cycle-info: pushed
+    by the device when a run ends on an open session (e.g. Flow measurement on)
+    and read on Sync / the live status poll. Uses the per-device Flow
+    calibration. No state class: one value per run, not a meter."""
+
+    _attr_device_class = SensorDeviceClass.WATER
+    _attr_native_unit_of_measurement = UnitOfVolume.LITERS
+    _attr_translation_key = "last_run_water_used"
+    _attr_icon = "mdi:water-check"
+    _attr_suggested_display_precision = 2
+
+    def __init__(self, coordinator: BHyveDeviceCoordinator):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.device.unique_id}_last_run_water_l"
+        self._attr_name = "Last run water used"
+
+    @property
+    def native_value(self) -> float | None:
+        device = self.coordinator.device
+        run = device.last_run
+        if run is None:
+            return self._restored_value
+        return round(run.water_volume_ticks / device.flow_counts_per_litre, 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        run = self.coordinator.device.last_run
+        if run is None:
+            return None
+        return {
+            "run_time_secs": run.run_time_secs,
+            # program u3: 0 = a manual run, 1-7 = programs A-G.
+            "program": "manual" if run.program == 0 else "ABCDEFG"[run.program - 1],
+            "water_volume_ticks": run.water_volume_ticks,
         }

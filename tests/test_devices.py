@@ -954,10 +954,15 @@ class _SyncConn:
         self.ensure_connected_calls = 0
         self.disconnects = 0
         self._connected = False
+        self.sent: list[bytes] = []
 
     async def ensure_connected(self):
         self.ensure_connected_calls += 1
         self._connected = True
+
+    async def send(self, plaintext, *, drain_ms=1500):
+        self.sent.append(plaintext)
+        return []
 
     async def disconnect(self):
         self.disconnects += 1
@@ -976,12 +981,15 @@ def test_sync_button_forces_connect_on_mesh():
     # init that refreshes battery/state via _observe_plaintext) and tear it down.
     dev = object.__new__(BHyveHT25Device)  # bypass HA-heavy __init__
     dev.mac = "44:67:55:52:94:A1"
+    dev.mesh_device_id = 0x8A5B
     dev.state = DeviceState()
     conn = _SyncConn()
     dev.connection = conn
     asyncio.run(dev.async_manual_sync())
     assert conn.ensure_connected_calls == 1   # forced a fresh connect
     assert conn.disconnects >= 1              # torn down afterwards (ephemeral)
+    # ...and reads the last run (msg 12) and the button run time (msg 7).
+    assert [f.hex() for f in conn.sent] == ["5b8a1c0c4000", "5b8a17074000"]
 
 
 def test_manual_sync_is_noop_for_protobuf():
@@ -1003,6 +1011,7 @@ def test_manual_sync_marks_connected_on_success():
     # refresh runs — reading the live socket then would read False.
     dev = object.__new__(BHyveHT25Device)
     dev.mac = "44:67:55:52:94:A1"
+    dev.mesh_device_id = 0x8A5B
     dev.state = DeviceState(consecutive_timeouts=3)
     dev.connection = _SyncConn()
     asyncio.run(dev.async_manual_sync())
