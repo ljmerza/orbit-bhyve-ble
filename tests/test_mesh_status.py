@@ -49,6 +49,41 @@ def _active_payload(remaining_sec: int, duration_sec: int) -> bytes:
 IDLE_PAYLOAD = bytes.fromhex("01ffffffff0000")  # captured idle shape
 
 
+def test_program_run_status_is_watering():
+    # A run started by a program carries it in bits 4-6 of the status byte
+    # (0x14 = watering, program A); only the low nibble is the status.
+    dev = _dev()
+    payload = bytes([0x14]) + _active_payload(299, 300)[1:]
+    dev._observe_plaintext(_status_frame(payload))
+    assert dev.state.is_watering is True
+    assert dev.state.seconds_remaining == 299
+
+
+def test_program_run_with_station_bits_keeps_countdown():
+    # Station sits in bits 7-13 (pt[5] bit 7 + pt[6] bits 0-5); the countdown
+    # (bits 14-29) must not pick it up.
+    dev = _dev()
+    counts = 120 * 64 | 0x3F  # station high bits set in pt[6]'s low 6 bits
+    payload = (
+        bytes([0x80 | 0x70 | 0x04])  # station bit 0, program 7, watering
+        + (counts & 0xFFFF).to_bytes(2, "little")
+        + bytes([0x40 | ((counts >> 16) & 0x3F)])
+        + (600).to_bytes(2, "little")
+        + b"\x00"
+    )
+    dev._observe_plaintext(_status_frame(payload))
+    assert dev.state.is_watering is True
+    assert dev.state.seconds_remaining == 120
+
+
+def test_program_run_ends_on_idle():
+    dev = _dev()
+    dev._observe_plaintext(_status_frame(bytes([0x24]) + _active_payload(10, 60)[1:]))
+    assert dev.state.is_watering is True
+    dev._observe_plaintext(_status_frame(IDLE_PAYLOAD))
+    assert dev.state.is_watering is False
+
+
 def test_active_status_decodes_countdown():
     dev = _dev()
     before = datetime.now(timezone.utc)

@@ -482,11 +482,14 @@ class BHyveBleDeviceBase(abc.ABC):
             if 1500 <= mv <= 4000:  # out-of-band => malformed; don't poison state
                 self.battery_mv = mv  # battery_pct is a chemistry-aware property
         elif seq == 0x02 and len(pt) >= 6:
-            # Status reply/push: payload[0] (pt[5]) is the watering mode —
-            # 0x04 = watering, 0x01 = idle. Authoritative device state, used to
-            # confirm an actuation actually took and — via the active-run
-            # payload — to sync a run HA didn't start (app/hub/schedule).
-            mode = pt[5]
+            # Status reply/push: the low nibble of payload[0] (pt[5]) is the
+            # device status — 0x4 = watering, 0x1 = idle. While watering, bits
+            # 4-6 carry the program (0 manual, 1-7 = A-G; app mesh spec), so a
+            # program run reads e.g. 0x14 and must be masked. Authoritative
+            # device state, used to confirm an actuation actually took and —
+            # via the active-run payload — to sync a run HA didn't start
+            # (app/hub/schedule).
+            mode = pt[5] & 0x0F
             was_watering = self.state.is_watering
             if mode == 0x04:
                 self.state.is_watering = True
