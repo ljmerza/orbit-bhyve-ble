@@ -45,6 +45,10 @@ CONF_DEVICES = "devices"
 # the user is looking at, never to a device being permanently hidden.
 CONF_KNOWN_CLOUD_IDS = "known_cloud_ids"
 CONF_INCLUDE = "include"
+# True on an entry set up without the Orbit cloud (import or manual entry). It
+# has no email/password, and its device list only changes through Reconfigure.
+CONF_LOCAL = "local"
+CONF_IMPORT = "devices_import"
 CONF_DEFAULT_DURATION = "default_duration_sec"
 CONF_IDLE_DISCONNECT = "idle_disconnect_sec"
 CONF_POLL_IDLE = "poll_idle_sec"
@@ -104,3 +108,6 @@ DEFAULT_FLOW_COUNTS_PER_GALLON = 433
 # Sibling of "devices" under entry.data:
 #   "known_cloud_ids": list[str] — see CONF_KNOWN_CLOUD_IDS. Absent on entries
 #   created before the reconfigure flow existed; readers must tolerate None.
+#   "local": True — see CONF_LOCAL. Its records may lack the cloud-only fields
+#   (mesh_id, bridge_device_id, battery_*), and a cloud_id of "local_<mac>"
+#   stands in for one that never came from the cloud.

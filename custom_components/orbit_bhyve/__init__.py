@@ -21,6 +21,8 @@ from homeassistant.exceptions import (
     ConfigEntryNotReady,
     HomeAssistantError,
     ServiceValidationError,
+    Unauthorized,
+    UnknownUser,
 )
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
@@ -32,6 +34,7 @@ from .const import (
     CONF_FLOW_COUNTS_PER_GALLON,
     CONF_IDLE_DISCONNECT,
     CONF_HUB_MESH_OVERRIDES,
+    CONF_LOCAL,
     CONF_MESH_STATUS_POLL,
     CONF_PASSWORD,
     CONF_POLL_IDLE,
@@ -356,6 +359,11 @@ def _register_services(hass: HomeAssistant) -> None:
                 raise ServiceValidationError(
                     f"No orbit_bhyve config entry matches {sorted(wanted_ids)}"
                 )
+            if all(e.data.get(CONF_LOCAL) for e in entries):
+                raise ServiceValidationError(
+                    "That entry was set up without an Orbit account, so there is "
+                    "nothing to refresh from — add timers with Reconfigure instead"
+                )
         for entry in entries:
             await async_refresh_entry(hass, entry)
 
@@ -615,6 +623,41 @@ def _register_services(hass: HomeAssistant) -> None:
         schema=vol.Schema({
             vol.Required("device_id"): vol.All(cv.ensure_list, [cv.string]),
             vol.Optional("slot"): vol.In(list(PROGRAM_SLOTS)),
+        }),
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    async def export_devices(call: ServiceCall) -> ServiceResponse:
+        # The response holds every network key, which is full control of every
+        # timer on the account, so admins only — the same check
+        # async_register_admin_service does, which can't return a response.
+        if call.context.user_id:
+            user = await hass.auth.async_get_user(call.context.user_id)
+            if user is None:
+                raise UnknownUser(context=call.context)
+            if not user.is_admin:
+                raise Unauthorized(context=call.context)
+        entries = hass.config_entries.async_entries(DOMAIN)
+        wanted = call.data.get("config_entry_id")
+        if wanted:
+            entries = [e for e in entries if e.entry_id in set(wanted)]
+        return {
+            "entries": [
+                {
+                    "entry_id": e.entry_id,
+                    "title": e.title,
+                    "devices": [dict(r) for r in e.data.get(CONF_DEVICES, [])],
+                }
+                for e in entries
+            ]
+        }
+
+    hass.services.async_register(
+        DOMAIN,
+        "export_devices",
+        export_devices,
+        schema=vol.Schema({
+            vol.Optional("config_entry_id"): vol.All(cv.ensure_list, [cv.string]),
         }),
         supports_response=SupportsResponse.ONLY,
     )
