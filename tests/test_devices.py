@@ -816,6 +816,40 @@ def test_ctr_selfheal_ignores_bad_continuation_frame():
     assert hass.jobs == []                  # no disconnect scheduled
 
 
+def test_selfheal_disconnect_never_orphans_a_link_opened_while_it_waits():
+    # The self-heal disconnect runs unlocked. If an open lands while it is waiting
+    # on the old link, the new client must survive it - nulling it without closing
+    # it leaves the device's one BLE connection held by a link nothing references.
+    conn = _make_conn()
+
+    class _Client:
+        def __init__(self):
+            self.closed = False
+            self.gate = asyncio.Event()
+
+        async def stop_notify(self, *_a):
+            pass
+
+        async def disconnect(self):
+            await self.gate.wait()
+            self.closed = True
+
+    old, new = _Client(), _Client()
+
+    async def go():
+        conn._client, conn._handshaken, conn._iv = old, True, b"\x00" * 12
+        heal = asyncio.create_task(conn.disconnect())
+        await asyncio.sleep(0)               # heal is now waiting on the old link
+        assert conn._client is None and not conn._handshaken
+        conn._client, conn._handshaken, conn._iv = new, True, b"\x01" * 12   # a reopen
+        old.gate.set()
+        await heal
+    asyncio.run(go())
+    assert old.closed, "the old link was never closed"
+    assert conn._client is new and conn._handshaken and conn._iv == b"\x01" * 12, \
+        "the disconnect nulled a session opened after it started"
+
+
 def test_ctr_selfheal_skipped_for_mesh_replies():
     # Regression (ljmerza PR #24 feedback): mesh d7-47 replies use a
     # [mesh:2][type][seq][routing] shape, NOT the protobuf inner-message header,

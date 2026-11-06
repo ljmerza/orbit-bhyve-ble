@@ -362,20 +362,25 @@ class BHyveBleConnection:
         if self._idle_timer is not None:
             self._idle_timer.cancel()
             self._idle_timer = None
-        if self._client is not None:
-            try:
-                await self._client.stop_notify(READ_CHAR)
-            except Exception:
-                pass
-            try:
-                await self._client.disconnect()
-            except Exception:
-                pass
-        self._client = None
+        # Take the client and clear the session BEFORE the first await. The CTR
+        # self-heal schedules this unlocked, so an open can run while it waits on
+        # the old link; clearing afterwards nulled that NEW client without closing
+        # it, and the device (one BLE connection) stopped advertising behind a
+        # proxy slot nothing referenced, until the proxy dropped it.
+        client, self._client = self._client, None
         self._handshaken = False
         self._iv = None
         self._last_rx_frame = None
         self._notif_pt.clear()
+        if client is not None:
+            try:
+                await client.stop_notify(READ_CHAR)
+            except Exception:
+                pass
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
     def hold_open(self, max_sec: float) -> None:
         """Keep this session open past the idle timeout until release().
