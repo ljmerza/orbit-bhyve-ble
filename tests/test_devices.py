@@ -896,6 +896,65 @@ def test_ensure_connected_does_not_multiply_retries(monkeypatch):
     assert calls["connect"] == OPEN_MAX_ATTEMPTS  # 3, never 9
 
 
+def test_a_missing_characteristic_clears_the_gatt_cache_before_the_retry(monkeypatch):
+    # HA reuses a device's cached GATT table on every connect. If that table lacks
+    # our characteristic, only clearing it lets the next attempt re-discover; any
+    # other failure leaves the cache alone.
+    import sys
+    import types as _types
+
+    from bleak.exc import BleakCharacteristicNotFoundError
+
+    from orbit_bhyve import connection as conn_mod
+
+    for name in ("homeassistant", "homeassistant.components",
+                 "homeassistant.components.bluetooth"):
+        monkeypatch.setitem(sys.modules, name, _types.ModuleType(name))
+    monkeypatch.setattr(sys.modules["homeassistant.components.bluetooth"],
+                        "async_ble_device_from_address", lambda *a, **k: object(),
+                        raising=False)
+
+    cleared = []
+
+    class _Client:
+        is_connected = True
+
+        async def clear_cache(self):
+            cleared.append(self)
+            return True
+
+        async def disconnect(self):
+            pass
+
+        async def stop_notify(self, *_a):
+            pass
+
+    async def _establish(*_a, **_k):
+        return _Client()
+
+    async def _no_sleep(*_a, **_k):
+        pass
+
+    monkeypatch.setattr(conn_mod, "establish_connection", _establish)
+    monkeypatch.setattr(conn_mod.asyncio, "sleep", _no_sleep)
+
+    conn = _make_conn()
+    tries = {"n": 0}
+
+    async def _handshake():
+        tries["n"] += 1
+        if tries["n"] == 1:
+            raise BleakCharacteristicNotFoundError("00006c73-fe32-4f58-8b78-98e42b2c047f")
+        if tries["n"] == 2:
+            raise conn_mod.BleHandshakeError("a plain handshake failure")
+        conn._handshaken = True
+    monkeypatch.setattr(conn, "_handshake", _handshake)
+
+    asyncio.run(conn.ensure_connected())
+    assert tries["n"] == 3
+    assert len(cleared) == 1, "only the missing-characteristic failure clears the cache"
+
+
 # --- stale pooled session self-heals on actuation (connection.py) ----------
 
 def test_send_actuation_reopens_when_pooled_bind_refresh_fails():
