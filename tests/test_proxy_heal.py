@@ -50,6 +50,9 @@ def _stub_bluetooth(monkeypatch, scanner_devices=None, ble_device=None):
         monkeypatch.setattr(sys.modules[_BT], "async_scanner_devices_by_address", _lookup, raising=False)
     monkeypatch.setattr(sys.modules[_BT], "async_ble_device_from_address",
                         lambda *a, **k: ble_device, raising=False)
+    # _open falls back to a lookup by advertised name; nothing is advertising here.
+    monkeypatch.setattr(sys.modules[_BT], "async_discovered_service_info",
+                        lambda *a, **k: [], raising=False)
     return calls
 
 

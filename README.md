@@ -29,6 +29,7 @@ when the WAN goes down.
 | 4-port XD         | `HT34-0001`    | `0058`           | ⚠️ Shares the XD protobuf protocol; not tested here |
 | 2-port XD         | `HT32A-0001`   | `0107`           | ✅ Actuated end-to-end (shares the HT34A XD protobuf protocol) |
 | Hose-tap timer    | `HT31-0001`    | `0058`           | ✅ Actuated end-to-end (shares the HT34A XD protobuf protocol) |
+| Sprinkler controller (mains, multi-station) | `WT25G2-0001` | `0096` | ✅ Actuated end-to-end on 12 stations. A separate product line from the `HT` hose timers; shares the XD protobuf protocol, station count comes from the cloud record |
 
 > ⚠️ **Do NOT update your B-Hyve device firmware.** This integration was
 > reverse-engineered against the firmware versions above. A firmware update

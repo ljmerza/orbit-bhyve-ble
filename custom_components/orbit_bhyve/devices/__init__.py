@@ -13,6 +13,7 @@ from .ht25_fw0085 import BHyveHT25Fw0085Device
 from .ht25a import BHyveHT25ADevice
 from .ht25g2 import BHyveHT25G2Device
 from .ht34a import BHyveHT34ADevice
+from .wt25g2 import BHyveWT25G2Device
 
 __all__ = [
     "BHyveBleDeviceBase",
@@ -24,6 +25,7 @@ __all__ = [
     "BHyveHT25ADevice",
     "BHyveHT25G2Device",
     "BHyveHT34ADevice",
+    "BHyveWT25G2Device",
     "resolve_device_class",
     "build_device",
 ]
@@ -32,6 +34,13 @@ __all__ = [
 def resolve_device_class(*, hardware: str, firmware: str, type_: str) -> type[BHyveBleDeviceBase]:
     if type_ == "bridge":
         return BHyveHubDevice
+    if (hardware or "").startswith("WT25"):
+        # WT is the mains-powered multi-station sprinkler controller line
+        # (type=sprinkler_timer), unrelated to the HT hose timers despite the
+        # similar model strings. It uses the XD protobuf protocol; see wt25g2.py.
+        # WT25-0001 (Gen1) routes here too, untested, as HT32A/HT34 do for XD.
+        # WT24 is not matched: an older generation with an unknown protocol.
+        return BHyveWT25G2Device
     if (hardware or "").startswith("HT25"):
         # Mesh d7-47 hose timers are the only HT25 devices ever observed
         # reporting the "-0000" hardware suffix — treat that as the

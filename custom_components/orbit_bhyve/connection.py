@@ -26,8 +26,8 @@ import struct
 from collections.abc import Awaitable, Callable
 
 from bleak import BleakClient
-from bleak.exc import BleakError
-from bleak_retry_connector import establish_connection
+from bleak.exc import BleakCharacteristicNotFoundError, BleakError
+from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from .const import AES_CHAR, READ_CHAR, WRITE_CHAR
@@ -109,6 +109,39 @@ def heal_proxy_address_type(hass, mac: str) -> None:
         _LOGGER.debug("%s: address-type check skipped", mac, exc_info=True)
 
 
+def advertised_name_for(cloud_mac: str) -> str:
+    """The BLE local name a B-Hyve advertises, derived from its CLOUD mac.
+
+    Orbit builds the name from the last three octets of the address the cloud
+    reports: 44:67:55:0A:1B:2C -> "bhyve_0A1B2C".
+    """
+    return "bhyve_" + cloud_mac.replace(":", "").replace("-", "")[-6:].upper()
+
+
+def match_advertised(cloud_mac: str, infos) -> str | None:
+    """Find the BLE address of the device advertising this cloud MAC's name.
+
+    On a BLE-only hose timer the cloud MAC is the BLE address. A Wi-Fi-capable
+    controller (the WT25 sprinkler line) has two radios and the cloud reports the
+    Wi-Fi MAC, so a direct lookup finds nothing: e.g. cloud 44:67:55:0A:1B:2C
+    advertises over BLE as 44:67:55:1A:1B:2C. `_open` calls this when the direct
+    lookup fails and caches the result in `_ble_address`.
+
+    No address offset is inferred. The match is on the advertised local name,
+    which the device derives from the last three octets of the cloud MAC. Two
+    devices advertising the same name resolve by iteration order; the handshake
+    does not use the network key, so it cannot reject the wrong one. The CTR-desync
+    self-heal catches that case and drops the cached address.
+
+    `infos` is any iterable of objects with `.name` and `.address`.
+    """
+    want = advertised_name_for(cloud_mac).lower()
+    for info in infos:
+        if (getattr(info, "name", None) or "").lower() == want:
+            return getattr(info, "address", None)
+    return None
+
+
 class BHyveBleConnection:
     """One per physical device. Reused across commands within an idle window."""
 
@@ -123,6 +156,7 @@ class BHyveBleConnection:
         reply_header: bytes | None = None,
         idle_disconnect_sec: int = 60,
         gatt_settle_ms: int = 300,
+        split_writes: bool = False,
     ):
         self.hass = hass
         self.mac = mac
@@ -137,7 +171,12 @@ class BHyveBleConnection:
         self._reply_header = reply_header
         self._idle_sec = idle_disconnect_sec
         self._gatt_settle_ms = gatt_settle_ms
+        # Split a message longer than one ATT write across frames (see _split).
+        # Only the WT line needs it; the HT families accept the long write.
+        self._split_writes = split_writes
 
+        # Resolved lazily when the cloud MAC is not the BLE MAC (see match_advertised).
+        self._ble_address: str | None = None
         self._client: BleakClient | None = None
         self._iv: bytes | None = None
         self._tx_ctr: int = 0
@@ -148,10 +187,14 @@ class BHyveBleConnection:
         # order — parallel to _notif_buf. send_stream() concatenates these into one
         # CTR stream so a multi-frame reply (a #19 program body that spans frames)
         # can be reassembled. Populated in _on_notify right after a successful
-        # decrypt; cleared with _notif_buf before every write.
+        # decrypt; cleared by _reset_rx() before every write.
         self._notif_pt: list[bytes] = []
         self._notif_event = asyncio.Event()  # set on every notification; drives _drain
         self._last_rx_frame: bytes | None = None  # last raw RX frame, for de-dup
+        # Partial inner message being reassembled from a multi-frame reply (only the
+        # first frame carries the inner header). Reset by _reset_rx() with the rest
+        # of the RX state.
+        self._assembly = bytearray()
         self._handshaken = False
         self._post_handshake_hook: PostHandshakeHook | None = None
         self._plaintext_observer: PlaintextObserver | None = None
@@ -208,20 +251,47 @@ class BHyveBleConnection:
         except (BleHandshakeError, asyncio.TimeoutError) as err:
             raise BleHandshakeError(f"{self.mac}: handshake failed: {err}") from err
 
+    def _resolve_by_advertised_name(self):
+        """Second chance when the cloud MAC is not the BLE MAC — see match_advertised."""
+        from homeassistant.components.bluetooth import (
+            async_ble_device_from_address,
+            async_discovered_service_info,
+        )
+
+        address = match_advertised(self.mac, async_discovered_service_info(self.hass,
+                                                                          connectable=True))
+        if address is None:
+            return None
+        ble_device = async_ble_device_from_address(self.hass, address, connectable=True)
+        if ble_device is not None and address != self._ble_address:
+            _LOGGER.info(
+                "%s: cloud MAC is not on the air; using BLE address %s, matched by the "
+                "advertised name %s (a Wi-Fi-capable model advertises on a different "
+                "radio than the cloud reports)",
+                self.mac, address, advertised_name_for(self.mac),
+            )
+            self._ble_address = address
+        return ble_device
+
     async def _open(self) -> None:
         from homeassistant.components.bluetooth import async_ble_device_from_address
 
-        heal_proxy_address_type(self.hass, self.mac)
-        ble_device = async_ble_device_from_address(self.hass, self.mac, connectable=True)
+        address = self._ble_address or self.mac
+        heal_proxy_address_type(self.hass, address)
+        ble_device = async_ble_device_from_address(self.hass, address, connectable=True)
         if ble_device is None:
-            raise BleNotConnectable(f"{self.mac}: not in range of any connectable BLE adapter")
+            ble_device = self._resolve_by_advertised_name()
+        if ble_device is None:
+            raise BleNotConnectable(
+                f"{self.mac}: not in range of any connectable BLE adapter "
+                f"(and nothing is advertising as {advertised_name_for(self.mac)})")
 
         last_err: Exception | None = None
         for attempt in range(1, OPEN_MAX_ATTEMPTS + 1):
             try:
                 _LOGGER.debug("%s: connecting (attempt %d/%d)", self.mac, attempt, OPEN_MAX_ATTEMPTS)
                 self._client = await establish_connection(
-                    BleakClient, ble_device, self.mac, max_attempts=3
+                    BleakClientWithServiceCache, ble_device, self.mac, max_attempts=3
                 )
                 _LOGGER.debug("%s: connected", self.mac)
                 if self._gatt_settle_ms > 0:
@@ -244,6 +314,8 @@ class BHyveBleConnection:
                 _LOGGER.debug(
                     "%s: open attempt %d/%d failed: %s", self.mac, attempt, OPEN_MAX_ATTEMPTS, err
                 )
+                if isinstance(err, BleakCharacteristicNotFoundError):
+                    await self._clear_services_cache()
                 await self.disconnect()  # clean slate so the retry gets a fresh GATT window
                 if attempt < OPEN_MAX_ATTEMPTS:
                     await asyncio.sleep(0.5)  # space out retries on a marginal link
@@ -257,12 +329,29 @@ class BHyveBleConnection:
             f"{self.mac}: open failed after {OPEN_MAX_ATTEMPTS} attempts: {last_err}"
         )
 
+    async def _clear_services_cache(self) -> None:
+        """Drop the cached GATT table so the next connect re-discovers it.
+
+        Home Assistant caches a device's services by address, across every proxy,
+        and reuses them on connect ("Cached services hit"). A table cached without
+        our characteristics fails every later open with "Characteristic ... was not
+        found" until HA restarts, however many times the link is retried.
+        """
+        client = self._client
+        if client is None or not hasattr(client, "clear_cache"):
+            return
+        try:
+            await client.clear_cache()
+            _LOGGER.info("%s: characteristic missing from the cached GATT table; cache cleared", self.mac)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("%s: clearing the GATT cache failed: %s", self.mac, err)
+
     async def _handshake(self) -> None:
         """Subscribe + AES handshake. Bounded by a timeout in _open() because
         these GATT reads/writes are what stall on a weak link. The
         post-handshake hook and open-retry are driven by _open()."""
         # Subscribe BEFORE writing — device may stay silent otherwise.
-        self._notif_buf.clear()
+        self._reset_rx()
         self._last_rx_frame = None  # fresh CTR stream — don't dedup across sessions
         await self._client.start_notify(READ_CHAR, self._on_notify)
 
@@ -282,6 +371,22 @@ class BHyveBleConnection:
         self._handshaken = True
         self.in_bootloader = False
         _LOGGER.debug("%s: handshake ok, iv=%s tx_ctr=0x%08x", self.mac, self._iv.hex(), self._tx_ctr)
+
+    def _reset_rx(self) -> None:
+        """Clear the RX state at an exchange boundary — before a write, after a drain.
+
+        The raw frames, their plaintexts and the partial inner message are cleared
+        together so a fragment of one exchange is never joined to the next, and a
+        bad-header frame still reaches the CTR self-heal.
+
+        `disconnect()` does not call this: it can run inside another coroutine's
+        drain, and must leave `_notif_buf` for the in-flight `send()`.
+        `_last_rx_frame` de-dups within a session, so it is cleared only by the
+        handshake and disconnect.
+        """
+        self._notif_buf.clear()
+        self._notif_pt.clear()
+        self._assembly = bytearray()
 
     def _on_notify(self, _sender, data) -> None:
         """Bleak notification callback. Buffers the raw frame for the
@@ -316,28 +421,42 @@ class BHyveBleConnection:
             # continuation frame — a long reply's continuation blocks legitimately
             # don't carry the inner-message header but ARE part of the stream.
             self._notif_pt.append(pt)
-            if (
-                self._reply_header is not None
-                and len(pt) >= 4
-                and pt[:4] != self._reply_header
-            ):
-                # Only the FIRST frame of a reply must start with the inner-message
-                # header. A long reply that CTR-streams as consecutive 16-byte blocks
-                # (each its own outer frame) has continuation frames that legitimately
-                # do NOT — none of the capabilities wired today produce those, but
-                # Program reads (#19, Phase 4) will. _notif_buf is cleared before each
-                # write, so len<=1 means this is the reply's first frame: a bad header
-                # there is a real CTR desync → self-heal. A bad header on a later frame
-                # is a continuation (or a mid-stream desync we recover on the next
-                # reply), so don't tear the session down under it. (Full multi-frame
-                # reassembly in the observer is deferred to the Programs phase.)
-                if len(self._notif_buf) <= 1:
-                    _LOGGER.warning(
-                        "%s: CTR desync detected (bad header %s) — scheduling disconnect to self-heal",
-                        self.mac, pt[:4].hex(),
-                    )
-                    self.hass.add_job(self.disconnect)
-                return
+            # A plaintext shorter than a header (e.g. the small ack ahead of #16) is
+            # passed to the observer without a header check, unless it continues a
+            # reply in flight: the last frame of a multi-frame reply can be 3 bytes.
+            if self._reply_header is not None and (len(pt) >= 4 or self._assembly):
+                # Reassemble multi-frame replies before handing them to the observer:
+                # decode_inner() needs the whole inner message (header, length, CRC)
+                # in one buffer. A WT25G2 #16 status is 83 bytes across six frames.
+                # A single-frame reply completes on its first frame.
+                if len(pt) >= 4 and pt[:4] == self._reply_header:
+                    self._assembly = bytearray(pt)
+                elif self._assembly:
+                    self._assembly.extend(pt)
+                else:
+                    # A bad header with no reply in flight. _notif_buf is cleared
+                    # before each write, so len<=1 means this is the exchange's first
+                    # frame: a real CTR desync → self-heal. A later bad frame is a
+                    # continuation or a mid-stream desync recovered on the next reply.
+                    if len(self._notif_buf) <= 1:
+                        _LOGGER.warning(
+                            "%s: CTR desync detected (bad header %s) — scheduling disconnect to self-heal",
+                            self.mac, pt[:4].hex(),
+                        )
+                        # A desync is also what a wrong device resolved by advertised
+                        # name looks like, so drop the cached address.
+                        self._ble_address = None
+                        self.hass.add_job(self.disconnect)
+                    return
+
+                # Whole message = header(4) + length byte pt[4] + crc(2).
+                if len(self._assembly) < 5:
+                    return
+                need = self._assembly[4] + 6
+                if len(self._assembly) < need:
+                    return                      # wait for the continuation frames
+                pt = bytes(self._assembly[:need])
+                self._assembly = bytearray()
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning(
                 "%s: CTR desync detected (decrypt failed: %s) — scheduling disconnect to self-heal",
@@ -362,20 +481,28 @@ class BHyveBleConnection:
         if self._idle_timer is not None:
             self._idle_timer.cancel()
             self._idle_timer = None
-        if self._client is not None:
-            try:
-                await self._client.stop_notify(READ_CHAR)
-            except Exception:
-                pass
-            try:
-                await self._client.disconnect()
-            except Exception:
-                pass
-        self._client = None
+        # Take the client and clear the session BEFORE the first await. The CTR
+        # self-heal schedules this unlocked, so an open can run while it waits on
+        # the old link; clearing afterwards nulled that NEW client without closing
+        # it, and the device (one BLE connection) stopped advertising behind a
+        # proxy slot nothing referenced, until the proxy dropped it.
+        client, self._client = self._client, None
         self._handshaken = False
         self._iv = None
         self._last_rx_frame = None
         self._notif_pt.clear()
+        # Not _reset_rx(): this can run inside an in-flight drain, and _notif_buf
+        # holds the frames send() is about to return.
+        self._assembly = bytearray()
+        if client is not None:
+            try:
+                await client.stop_notify(READ_CHAR)
+            except Exception:
+                pass
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
     def hold_open(self, max_sec: float) -> None:
         """Keep this session open past the idle timeout until release().
@@ -477,12 +604,54 @@ class BHyveBleConnection:
         pt, self._rx_ctr = self._aes_xor(self._rx_ctr, ct)
         return pt
 
+    @property
+    def max_write_len(self) -> int:
+        """Bytes that fit in ONE ATT write: negotiated MTU minus the 3-byte header."""
+        mtu = getattr(self._client, "mtu_size", None) if self._client else None
+        return (mtu - 3) if isinstance(mtu, int) and mtu > 3 else 20
+
     async def _write_locked(self, plaintext: bytes) -> None:
         """Encrypt + write. Caller MUST already hold self._lock and have
         an established connection. Used by send()/send_raw() and by the
         post-handshake hook (which runs inside _open() inside the lock)."""
-        frame = self.encrypt(plaintext)
         assert self._client is not None
+        # On a split_writes link a message longer than one ATT write is split across
+        # frames, the same way the device sends long replies: a WT25G2 rejects ATT
+        # long writes (Request Not Supported at MTU 23), which through a proxy
+        # surfaces as "Not connected". A message that fits goes out as one frame,
+        # and every other family keeps the single (long) write.
+        pieces = self._split(plaintext) if self._split_writes else [plaintext]
+        for piece in pieces:
+            try:
+                await self._write_frame(self.encrypt(piece))
+            except Exception:
+                if len(pieces) > 1:
+                    # A partial split write leaves _tx_ctr ahead of the device and
+                    # nothing on the RX side trips the self-heal, so disconnect: the
+                    # next open re-handshakes. A full disconnect, because the device
+                    # accepts one BLE connection and an abandoned link can block the
+                    # reconnect.
+                    await self.disconnect()
+                raise
+
+    def _split(self, plaintext: bytes) -> list[bytes]:
+        """Cut a message into pieces that each fit one ATT write.
+
+        A frame is [magic][len] + ciphertext + [trailer:2], so the ciphertext
+        budget is four bytes under the write limit, and never more than 255 because
+        `len` is a single byte.
+
+        The budget is rounded down to a whole AES block, because encrypt/decrypt
+        advance the CTR counter by whole blocks per frame; an unaligned piece would
+        leave the two sides at different keystream offsets. At MTU 23 (budget 16)
+        and MTU 247 (budget 240) this changes nothing.
+        """
+        budget = max(1, min(self.max_write_len - 4, 255))
+        if budget >= 16:                  # never round a tiny link up past its limit
+            budget -= budget % 16
+        return [plaintext[i:i + budget] for i in range(0, len(plaintext), budget)] or [b""]
+
+    async def _write_frame(self, frame: bytes) -> None:
         # WRITE_CHAR (6c72) uses a Write Request (response=True). Over some
         # transports (notably the ESPHome Bluetooth proxy), the ATT Write
         # Response is never relayed back, so a plain response=True write blocks
@@ -522,12 +691,11 @@ class BHyveBleConnection:
     async def _write_and_drain(self, plaintext: bytes, drain_ms: int) -> list[bytes]:
         """Write a command and collect its reply. Caller MUST hold self._lock and
         have an established, initialised session."""
-        self._notif_buf.clear()
-        self._notif_pt.clear()
+        self._reset_rx()
         await self._write_locked(plaintext)
         await self._drain(drain_ms)
         received = list(self._notif_buf)
-        self._notif_buf.clear()
+        self._reset_rx()
         self._arm_idle_timer()
         return received
 
@@ -551,13 +719,11 @@ class BHyveBleConnection:
         (#16/#30/#59) are untouched — they still flow through send()/the observer."""
         async with self._lock:
             await self.ensure_connected()
-            self._notif_buf.clear()
-            self._notif_pt.clear()
+            self._reset_rx()
             await self._write_locked(plaintext)
             await self._drain(drain_ms)
             stream = b"".join(self._notif_pt)
-            self._notif_buf.clear()
-            self._notif_pt.clear()
+            self._reset_rx()
             self._arm_idle_timer()
             return stream
 
@@ -566,6 +732,7 @@ class BHyveBleConnection:
         sequences where the caller batches drain after the last step."""
         async with self._lock:
             await self.ensure_connected()
+            self._reset_rx()
             await self._write_locked(plaintext)
 
     async def send_actuation(self, plaintext: bytes, *, drain_ms: int = 1500) -> list[bytes]:
@@ -599,12 +766,11 @@ class BHyveBleConnection:
             else:
                 # Cold — ensure_connected() retries the open and runs the hook.
                 await self.ensure_connected()
-            self._notif_buf.clear()
-            self._notif_pt.clear()
+            self._reset_rx()
             await self._write_locked(plaintext)
             await self._drain(drain_ms)
             received = list(self._notif_buf)
-            self._notif_buf.clear()
+            self._reset_rx()
             self._arm_idle_timer()
             return received
 
