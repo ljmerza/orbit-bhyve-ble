@@ -26,8 +26,8 @@ import struct
 from collections.abc import Awaitable, Callable
 
 from bleak import BleakClient
-from bleak.exc import BleakError
-from bleak_retry_connector import establish_connection
+from bleak.exc import BleakCharacteristicNotFoundError, BleakError
+from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from .const import AES_CHAR, READ_CHAR, WRITE_CHAR
@@ -221,7 +221,7 @@ class BHyveBleConnection:
             try:
                 _LOGGER.debug("%s: connecting (attempt %d/%d)", self.mac, attempt, OPEN_MAX_ATTEMPTS)
                 self._client = await establish_connection(
-                    BleakClient, ble_device, self.mac, max_attempts=3
+                    BleakClientWithServiceCache, ble_device, self.mac, max_attempts=3
                 )
                 _LOGGER.debug("%s: connected", self.mac)
                 if self._gatt_settle_ms > 0:
@@ -244,6 +244,8 @@ class BHyveBleConnection:
                 _LOGGER.debug(
                     "%s: open attempt %d/%d failed: %s", self.mac, attempt, OPEN_MAX_ATTEMPTS, err
                 )
+                if isinstance(err, BleakCharacteristicNotFoundError):
+                    await self._clear_services_cache()
                 await self.disconnect()  # clean slate so the retry gets a fresh GATT window
                 if attempt < OPEN_MAX_ATTEMPTS:
                     await asyncio.sleep(0.5)  # space out retries on a marginal link
@@ -256,6 +258,23 @@ class BHyveBleConnection:
         raise BleHandshakeError(
             f"{self.mac}: open failed after {OPEN_MAX_ATTEMPTS} attempts: {last_err}"
         )
+
+    async def _clear_services_cache(self) -> None:
+        """Drop the cached GATT table so the next connect re-discovers it.
+
+        Home Assistant caches a device's services by address, across every proxy,
+        and reuses them on connect ("Cached services hit"). A table cached without
+        our characteristics fails every later open with "Characteristic ... was not
+        found" until HA restarts, however many times the link is retried.
+        """
+        client = self._client
+        if client is None or not hasattr(client, "clear_cache"):
+            return
+        try:
+            await client.clear_cache()
+            _LOGGER.info("%s: characteristic missing from the cached GATT table; cache cleared", self.mac)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("%s: clearing the GATT cache failed: %s", self.mac, err)
 
     async def _handshake(self) -> None:
         """Subscribe + AES handshake. Bounded by a timeout in _open() because
