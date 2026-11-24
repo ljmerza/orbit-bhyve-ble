@@ -217,6 +217,7 @@ class BHyveBleConnection:
             raise BleNotConnectable(f"{self.mac}: not in range of any connectable BLE adapter")
 
         last_err: Exception | None = None
+        bootloader_rechecked = False
         for attempt in range(1, OPEN_MAX_ATTEMPTS + 1):
             try:
                 _LOGGER.debug("%s: connecting (attempt %d/%d)", self.mac, attempt, OPEN_MAX_ATTEMPTS)
@@ -227,6 +228,16 @@ class BHyveBleConnection:
                 if self._gatt_settle_ms > 0:
                     await asyncio.sleep(self._gatt_settle_ms / 1000.0)
                 if is_bootloader(self._client):
+                    # A cached GATT table that lost the AES characteristic looks
+                    # exactly like the bootloader. Clear it and recheck once on a
+                    # fresh discovery before believing it.
+                    if not bootloader_rechecked:
+                        bootloader_rechecked = True
+                        await self._clear_services_cache()
+                        await self.disconnect()
+                        if attempt < OPEN_MAX_ATTEMPTS:
+                            _LOGGER.debug("%s: bootloader table seen, rechecking", self.mac)
+                            continue
                     # No AES characteristic to handshake with; retrying can't help.
                     self.in_bootloader = True
                     await self.disconnect()
