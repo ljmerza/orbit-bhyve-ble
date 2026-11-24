@@ -415,7 +415,9 @@ def test_is_bootloader():
     assert not fw.is_bootloader(object())  # no service table: never break a connect
 
 
-def test_connection_raises_bootloader_mode_without_retrying(monkeypatch):
+def test_connection_rechecks_the_bootloader_once_then_raises(monkeypatch):
+    # A cached GATT table without the AES characteristic looks like the
+    # bootloader, so the first sighting clears the cache and reconnects once.
     import sys
     import types as _types
 
@@ -430,7 +432,7 @@ def test_connection_raises_bootloader_mode_without_retrying(monkeypatch):
         lambda *a, **k: object(),
         raising=False,
     )
-    calls = {"connect": 0}
+    calls = {"connect": 0, "clear": 0}
 
     async def _fake_establish(*_a, **_k):
         calls["connect"] += 1
@@ -439,8 +441,13 @@ def test_connection_raises_bootloader_mode_without_retrying(monkeypatch):
 
         async def _noop(*_a):
             pass
+
+        async def _clear():
+            calls["clear"] += 1
+            return True
         client.disconnect = _noop
         client.stop_notify = _noop
+        client.clear_cache = _clear
         return client
 
     async def _no_sleep(*_a, **_k):
@@ -452,7 +459,62 @@ def test_connection_raises_bootloader_mode_without_retrying(monkeypatch):
 
     with pytest.raises(conn_mod.BleBootloaderMode):
         asyncio.run(conn.ensure_connected())
-    assert calls["connect"] == 1
+    assert calls == {"connect": 2, "clear": 1}
     assert conn.in_bootloader is True
     # Still a BleHandshakeError, so existing handlers keep catching it.
     assert issubclass(conn_mod.BleBootloaderMode, conn_mod.BleHandshakeError)
+
+
+def test_a_stale_cached_table_is_not_mistaken_for_the_bootloader(monkeypatch):
+    # The first connect gets a cached table missing the AES characteristic. Once
+    # the cache is cleared, discovery returns the full table and the open goes on.
+    import sys
+    import types as _types
+
+    from orbit_bhyve import connection as conn_mod
+    from orbit_bhyve.const import AES_CHAR, NETWORK_CHAR
+
+    for name in ("homeassistant", "homeassistant.components",
+                 "homeassistant.components.bluetooth"):
+        monkeypatch.setitem(sys.modules, name, _types.ModuleType(name))
+    monkeypatch.setattr(
+        sys.modules["homeassistant.components.bluetooth"],
+        "async_ble_device_from_address",
+        lambda *a, **k: object(),
+        raising=False,
+    )
+    calls = {"connect": 0, "clear": 0}
+
+    async def _fake_establish(*_a, **_k):
+        calls["connect"] += 1
+        if calls["clear"]:
+            client = _client_with_chars(AES_CHAR, WRITE_CHAR, READ_CHAR, NETWORK_CHAR)
+        else:
+            client = _client_with_chars(WRITE_CHAR, READ_CHAR)
+        client.is_connected = True
+
+        async def _noop(*_a):
+            pass
+
+        async def _clear():
+            calls["clear"] += 1
+            return True
+        client.disconnect = _noop
+        client.stop_notify = _noop
+        client.clear_cache = _clear
+        return client
+
+    async def _no_sleep(*_a, **_k):
+        pass
+
+    monkeypatch.setattr(conn_mod, "establish_connection", _fake_establish)
+    monkeypatch.setattr(conn_mod.asyncio, "sleep", _no_sleep)
+    conn = conn_mod.BHyveBleConnection(None, "AA:BB:CC:DD:EE:FF", "00" * 16)
+
+    async def _handshake():
+        conn._handshaken = True
+    monkeypatch.setattr(conn, "_handshake", _handshake)
+
+    asyncio.run(conn.ensure_connected())
+    assert calls == {"connect": 2, "clear": 1}
+    assert conn.in_bootloader is False
